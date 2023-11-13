@@ -1,0 +1,5 @@
+name: coralogix-opentelemetry-python
+CX_PRODUCT: tracing
+deployable_type: library
+enabled: false
+lifecycle_status: development
