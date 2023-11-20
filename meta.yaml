@@ -1,5 +1,8 @@
 name: coralogix-opentelemetry-python
 CX_PRODUCT: tracing
 deployable_type: library
-enabled: false
-lifecycle_status: development
+code_language: python
+enabled: true
+lifecycle_status: production
+tests: true
+test_dockerfile: Dockerfile

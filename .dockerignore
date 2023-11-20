@@ -1,0 +1,5 @@
+platform/
+*Dockerfile
+meta.yaml
+.git
+.github
