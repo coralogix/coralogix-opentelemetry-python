@@ -1,3 +1,4 @@
+import logging
 from typing import Optional, Sequence
 
 from opentelemetry.context import Context
@@ -16,6 +17,8 @@ from coralogix_opentelemetry.trace.common import (
     CoralogixAttributes,
     CoralogixTraceState,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class CoralogixTransactionSampler(Sampler):
@@ -41,40 +44,48 @@ class CoralogixTransactionSampler(Sampler):
         result = self._base_sampler.should_sample(
             parent_context, trace_id, name, kind, attributes, links, trace_state
         )
-        span_context = CoralogixTransactionSampler._span_context(parent_context)
-        trace_state = CoralogixTransactionSampler._get_trace_state(
-            span_context, trace_state
-        )
-
-        # if distributed transaction exists, use it,
-        # if not this is the first span and thus the root of the distributed transaction
-        distributed_transaction = (
-            trace_state.get(CoralogixTraceState.DISTRIBUTED_TRANSACTION_IDENTIFIER)
-            or name
-        )
-
-        # if span is remote, then start a new transaction, else try to use existing transaction
-        transaction = (
-            name
-            if span_context and span_context.is_remote
-            else (trace_state.get(CoralogixTraceState.TRANSACTION_IDENTIFIER) or name)
-        )
-
-        trace_state = (
-            (result.trace_state or TraceState())
-            .add(CoralogixTraceState.TRANSACTION_IDENTIFIER, transaction)
-            .add(
-                CoralogixTraceState.DISTRIBUTED_TRANSACTION_IDENTIFIER,
-                distributed_transaction,
+        try:
+            span_context = CoralogixTransactionSampler._span_context(parent_context)
+            trace_state = CoralogixTransactionSampler._get_trace_state(
+                span_context, trace_state
             )
-        )
 
-        new_attributes = dict(result.attributes or {})  # for mypy
-        new_attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER] = transaction
-        new_attributes[
-            CoralogixAttributes.DISTRIBUTED_TRANSACTION_IDENTIFIER
-        ] = distributed_transaction
-        return SamplingResult(result.decision, new_attributes, trace_state)
+            # if distributed transaction exists, use it,
+            # if not this is the first span and thus the root of the distributed transaction
+            distributed_transaction = (
+                trace_state.get(CoralogixTraceState.DISTRIBUTED_TRANSACTION_IDENTIFIER)
+                or name
+            )
+
+            # if span is remote, then start a new transaction, else try to use existing transaction
+            transaction = (
+                name
+                if span_context and span_context.is_remote
+                else (
+                    trace_state.get(CoralogixTraceState.TRANSACTION_IDENTIFIER) or name
+                )
+            )
+
+            trace_state = (
+                (result.trace_state or TraceState())
+                .add(CoralogixTraceState.TRANSACTION_IDENTIFIER, transaction)
+                .add(
+                    CoralogixTraceState.DISTRIBUTED_TRANSACTION_IDENTIFIER,
+                    distributed_transaction,
+                )
+            )
+
+            new_attributes = dict(result.attributes or {})  # for mypy
+            new_attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER] = transaction
+            new_attributes[
+                CoralogixAttributes.DISTRIBUTED_TRANSACTION_IDENTIFIER
+            ] = distributed_transaction
+            return SamplingResult(result.decision, new_attributes, trace_state)
+        except Exception:
+            logger.exception(
+                "CoralogixTransactionSampler failed, returning original sampler result"
+            )
+            return result
 
     @staticmethod
     def _get_trace_state(

@@ -2,7 +2,7 @@ from typing import Optional, Sequence, Mapping
 
 import opentelemetry.trace
 import pytest
-from opentelemetry.sdk.resources import Attributes
+from opentelemetry.util.types import Attributes
 from opentelemetry.sdk.trace import TracerProvider, ReadableSpan
 from opentelemetry.sdk.trace.sampling import Decision, SamplingResult, Sampler
 from opentelemetry.trace import (
