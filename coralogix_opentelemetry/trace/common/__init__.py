@@ -1,8 +1,11 @@
+from enum import Enum
+
+
 def _attribute_to_trace_state(attribute_name: str) -> str:
     return attribute_name.replace(".", "_")
 
 
-class CoralogixAttributes:
+class CoralogixAttributes(str, Enum):
     TRANSACTION_IDENTIFIER = "cgx.transaction"
     DISTRIBUTED_TRANSACTION_IDENTIFIER = "cgx.transaction.distributed"
 
