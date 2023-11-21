@@ -1,1 +1,1 @@
-pip install poetry && poetry install
+pip install poetry && poetry install && poetry run autohooks activate

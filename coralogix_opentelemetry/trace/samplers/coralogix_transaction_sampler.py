@@ -2,7 +2,6 @@ import logging
 from typing import Optional, Sequence
 
 from opentelemetry.context import Context
-from opentelemetry.sdk._configuration import _import_sampler, _get_sampler
 from opentelemetry.sdk.trace.sampling import Sampler, SamplingResult, ALWAYS_ON
 from opentelemetry.trace import (
     SpanKind,
@@ -26,9 +25,6 @@ class CoralogixTransactionSampler(Sampler):
         if base_sampler is not None:
             self._base_sampler = base_sampler
             return
-        sampler_name = _get_sampler()
-        if sampler_name is not None:
-            base_sampler = _import_sampler(sampler_name)
         self._base_sampler = base_sampler or ALWAYS_ON
 
     def should_sample(
