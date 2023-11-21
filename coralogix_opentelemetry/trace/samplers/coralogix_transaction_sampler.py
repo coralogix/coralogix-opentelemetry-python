@@ -45,7 +45,7 @@ class CoralogixTransactionSampler(Sampler):
             parent_context, trace_id, name, kind, attributes, links, trace_state
         )
         try:
-            span_context = CoralogixTransactionSampler._span_context(parent_context)
+            span_context = CoralogixTransactionSampler._get_span_context(parent_context)
             trace_state = CoralogixTransactionSampler._get_trace_state(
                 span_context, trace_state
             )
@@ -98,11 +98,12 @@ class CoralogixTransactionSampler(Sampler):
         return trace_state or TraceState()
 
     @staticmethod
-    def _span_context(parent_context: Optional[Context]) -> Optional[SpanContext]:  # type: ignore
+    def _get_span_context(parent_context: Optional[Context]) -> Optional[SpanContext]:
         if parent_context:
             current_span = get_current_span(parent_context)
             if current_span:
                 return current_span.get_span_context()
+        return None
 
     def get_description(self) -> str:
         return "CoralogixTransactionSampler"
