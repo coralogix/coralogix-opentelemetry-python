@@ -1,1 +1,1 @@
-flake8 . && black . && mypy --config-file mypy.ini .
+flake8 . && black . --check && isort --check-only && mypy --config-file mypy.ini .

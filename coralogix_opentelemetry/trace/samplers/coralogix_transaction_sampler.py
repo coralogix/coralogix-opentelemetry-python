@@ -2,13 +2,13 @@ import logging
 from typing import Optional, Sequence
 
 from opentelemetry.context import Context
-from opentelemetry.sdk.trace.sampling import Sampler, SamplingResult, ALWAYS_ON
+from opentelemetry.sdk.trace.sampling import ALWAYS_ON, Sampler, SamplingResult
 from opentelemetry.trace import (
-    SpanKind,
     Link,
+    SpanContext,
+    SpanKind,
     TraceState,
     get_current_span,
-    SpanContext,
 )
 from opentelemetry.util.types import Attributes
 
@@ -64,8 +64,8 @@ class CoralogixTransactionSampler(Sampler):
 
             trace_state = (
                 (result.trace_state or TraceState())
-                .add(CoralogixTraceState.TRANSACTION_IDENTIFIER, transaction)
-                .add(
+                .update(CoralogixTraceState.TRANSACTION_IDENTIFIER, transaction)
+                .update(
                     CoralogixTraceState.DISTRIBUTED_TRANSACTION_IDENTIFIER,
                     distributed_transaction,
                 )

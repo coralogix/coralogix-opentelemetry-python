@@ -1,19 +1,19 @@
-from typing import Optional, Sequence, Mapping
+from typing import Mapping, Optional, Sequence
 
 import opentelemetry.trace
 import pytest
-from opentelemetry.util.types import Attributes
-from opentelemetry.sdk.trace import TracerProvider, ReadableSpan
-from opentelemetry.sdk.trace.sampling import Decision, SamplingResult, Sampler
-from opentelemetry.trace import (
-    SpanKind,
-    Link,
-    TraceState,
-    SpanContext,
-    NonRecordingSpan,
-)
-from pytest_mock import MockerFixture
 from opentelemetry.context.context import Context
+from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
+from opentelemetry.sdk.trace.sampling import Decision, Sampler, SamplingResult
+from opentelemetry.trace import (
+    Link,
+    NonRecordingSpan,
+    SpanContext,
+    SpanKind,
+    TraceState,
+)
+from opentelemetry.util.types import Attributes
+from pytest_mock import MockerFixture
 
 from coralogix_opentelemetry.trace.common import CoralogixAttributes
 from coralogix_opentelemetry.trace.samplers import CoralogixTransactionSampler
@@ -41,17 +41,6 @@ def mapping_contains(subset: Mapping, superset: Mapping) -> bool:
     return set(subset.items()).issubset(set(superset.items()))
 
 
-#     function getRemoteContext(context: Context): Context {
-#         const spanContext = opentelemetry.trace.getSpanContext(context);
-#     if (!spanContext) {
-#     return context;
-#     }
-#     const newSpanContext = {
-#     ...spanContext,
-#     isRemote: true,
-#     };
-#     return opentelemetry.trace.setSpanContext(context, newSpanContext);
-# }
 def get_remote_context(context: Context) -> Context:
     span = opentelemetry.trace.get_current_span(context)
     if not span.is_recording():
@@ -273,7 +262,7 @@ def test_new_transaction_after_remote_span_context() -> None:
         ), "span3 must created a transaction attribute"
         assert (
             span4.attributes
-            and span3.attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER] == "three"
+            and span4.attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER] == "three"
         ), "span4 must have transaction attribute from parent"
     span4.end()
     span3.end()
@@ -389,7 +378,7 @@ def test_distributed_transaction_is_the_same_after_remote_span_context() -> None
         ), "span3 must have distributed transaction attribute from parent"
         assert (
             span4.attributes
-            and span3.attributes[CoralogixAttributes.DISTRIBUTED_TRANSACTION_IDENTIFIER]
+            and span4.attributes[CoralogixAttributes.DISTRIBUTED_TRANSACTION_IDENTIFIER]
             == "one"
         ), "span4 must have distributed transaction attribute from parent"
     span4.end()

@@ -1,1 +1,1 @@
-pip install poetry && poetry install --no-dev
+pip install poetry && poetry install --no-dev && poetry build
