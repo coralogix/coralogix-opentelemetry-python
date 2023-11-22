@@ -1,1 +1,1 @@
-flake8 . && black . --check && isort --check-only && mypy --config-file mypy.ini .
+poetry run flake8 . && poetry run  black . --check && poetry run mypy . --config-file mypy.ini

@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "coralogix-opentelemetry"
-version = "0.1.2"
+version = "0.1.0"
 description = "coralogix extentions for opentelemetry"
 authors = ["Nimrod Avni <nimrod@coralogix.com>"]
 readme = "README.md"
@@ -18,7 +18,6 @@ twine = "^4.0.2"
 pytest = "^7.4.3"
 flake8 = "5.0.4"
 pytest-mock = "^3.12.0"
-isort = "^5.12.0"
 
 [build-system]
 requires = ["poetry-core"]

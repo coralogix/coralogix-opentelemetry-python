@@ -1,6 +1,10 @@
 import logging
 from typing import Optional, Sequence
 
+from coralogix_opentelemetry.trace.common import (
+    CoralogixAttributes,
+    CoralogixTraceState,
+)
 from opentelemetry.context import Context
 from opentelemetry.sdk.trace.sampling import ALWAYS_ON, Sampler, SamplingResult
 from opentelemetry.trace import (
@@ -11,11 +15,6 @@ from opentelemetry.trace import (
     get_current_span,
 )
 from opentelemetry.util.types import Attributes
-
-from coralogix_opentelemetry.trace.common import (
-    CoralogixAttributes,
-    CoralogixTraceState,
-)
 
 logger = logging.getLogger(__name__)
 

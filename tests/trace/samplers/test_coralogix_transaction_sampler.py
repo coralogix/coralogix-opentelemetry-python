@@ -2,6 +2,8 @@ from typing import Mapping, Optional, Sequence
 
 import opentelemetry.trace
 import pytest
+from coralogix_opentelemetry.trace.common import CoralogixAttributes
+from coralogix_opentelemetry.trace.samplers import CoralogixTransactionSampler
 from opentelemetry.context.context import Context
 from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
 from opentelemetry.sdk.trace.sampling import Decision, Sampler, SamplingResult
@@ -14,9 +16,6 @@ from opentelemetry.trace import (
 )
 from opentelemetry.util.types import Attributes
 from pytest_mock import MockerFixture
-
-from coralogix_opentelemetry.trace.common import CoralogixAttributes
-from coralogix_opentelemetry.trace.samplers import CoralogixTransactionSampler
 
 test_parent_context: Optional[Context] = None
 test_trace_id: int = 1
