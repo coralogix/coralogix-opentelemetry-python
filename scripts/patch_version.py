@@ -8,12 +8,12 @@ def run() -> None:
         raise Exception("usage: patch_version.py <patch> <branch>")
     _, patch, branch = sys.argv
     if branch == "master":
-        print("not patching master breach")
+        print("not patching master branch")
         return
 
     with open("pyproject.toml", "r") as py_project:
         content = tomlkit.load(py_project)
-        content["tool"]["poetry"][  # type: ignore #
+        content["tool"]["poetry"][  # type: ignore
             "version"
         ] = f'{content["tool"]["poetry"]["version"]}-{patch}'  # type: ignore
     if content is None:
