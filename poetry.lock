@@ -920,6 +920,17 @@ files = [
 ]
 
 [[package]]
+name = "tomlkit"
+version = "0.12.3"
+description = "Style preserving TOML library"
+optional = false
+python-versions = ">=3.7"
+files = [
+    {file = "tomlkit-0.12.3-py3-none-any.whl", hash = "sha256:b0a645a9156dc7cb5d3a1f0d4bab66db287fcb8e0430bdd4664a095ea16414ba"},
+    {file = "tomlkit-0.12.3.tar.gz", hash = "sha256:75baf5012d06501f07bee5bf8e801b9f343e7aac5a92581f20f80ce632e6b5a4"},
+]
+
+[[package]]
 name = "twine"
 version = "4.0.2"
 description = "Collection of utilities for publishing packages on PyPI"
@@ -1065,4 +1076,4 @@ testing = ["big-O", "jaraco.functools", "jaraco.itertools", "more-itertools", "p
 [metadata]
 lock-version = "2.0"
 python-versions = "^3.8"
-content-hash = "942ad9ac4a0ea9e2d613ad85cb7959981d2d6619007c44e186414b7c8a972f50"
+content-hash = "cea68309f7bcef28086f88f7442a7004f1d035d14fd2a36bc32024d1d3943222"
