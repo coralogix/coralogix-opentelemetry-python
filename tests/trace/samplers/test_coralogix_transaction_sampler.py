@@ -170,9 +170,6 @@ def test_transaction_attribute_propagated() -> None:
     span2 = tracer.start_span("two", context=context)
     context = opentelemetry.trace.set_span_in_context(span2, context)
     span3 = tracer.start_span("three", context=context)
-    span3.end()
-    span2.end()
-    span1.end()
     if (
         isinstance(span1, ReadableSpan)
         and isinstance(span2, ReadableSpan)
@@ -194,6 +191,9 @@ def test_transaction_attribute_propagated() -> None:
         assert span1.is_recording(), "span1 must be recording"
         assert span2.is_recording(), "span2 must be recording"
         assert span3.is_recording(), "span3 must be recording"
+    span3.end()
+    span2.end()
+    span1.end()
 
 
 def test_transaction_attribute_propagated_even_when_not_sampling() -> None:
