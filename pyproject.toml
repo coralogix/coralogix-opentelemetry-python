@@ -1,0 +1,28 @@
+[tool.poetry]
+name = "coralogix-opentelemetry"
+version = "0.1.0"
+description = "coralogix extentions for opentelemetry"
+authors = ["Nimrod Avni <nimrod@coralogix.com>"]
+readme = "README.md"
+packages = [{ include = "coralogix_opentelemetry" }]
+
+[tool.poetry.dependencies]
+python = "^3.8"
+opentelemetry-api = "^1.0.0"
+opentelemetry-sdk = "^1.0.0"
+
+[tool.poetry.group.dev.dependencies]
+black = "^23.11.0"
+mypy = "^1.7.0"
+twine = "^4.0.2"
+pytest = "^7.4.3"
+flake8 = "5.0.4"
+pytest-mock = "^3.12.0"
+tomlkit = "^0.12.3"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry.scripts]
+patch_version = 'scripts.patch_version:run'

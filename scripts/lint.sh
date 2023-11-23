@@ -1,0 +1,1 @@
+poetry run flake8 . && poetry run  black . --check && poetry run mypy . --config-file mypy.ini
