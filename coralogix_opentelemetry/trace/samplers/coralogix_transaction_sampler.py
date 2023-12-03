@@ -53,13 +53,13 @@ class CoralogixTransactionSampler(Sampler):
             )
 
             # if span is remote, then start a new transaction, else try to use existing transaction
-            transaction = (
-                name
-                if span_context and span_context.is_remote
-                else (
-                    trace_state.get(CoralogixTraceState.TRANSACTION_IDENTIFIER) or name
-                )
+            existing_transaction = trace_state.get(
+                CoralogixTraceState.TRANSACTION_IDENTIFIER
             )
+            starts_transaction = existing_transaction is None or (
+                span_context and span_context.is_remote
+            )
+            transaction = name if starts_transaction else (existing_transaction or name)
 
             trace_state = (
                 (result.trace_state or TraceState())
@@ -75,6 +75,8 @@ class CoralogixTransactionSampler(Sampler):
             new_attributes[
                 CoralogixAttributes.DISTRIBUTED_TRANSACTION_IDENTIFIER
             ] = distributed_transaction
+            if starts_transaction:
+                new_attributes[CoralogixAttributes.TRANSACTION_ROOT] = True
             return SamplingResult(result.decision, new_attributes, trace_state)
         except Exception:
             logger.exception(

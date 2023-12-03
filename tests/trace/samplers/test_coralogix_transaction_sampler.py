@@ -384,3 +384,101 @@ def test_distributed_transaction_is_the_same_after_remote_span_context() -> None
     span3.end()
     span2.end()
     span1.end()
+
+
+def test_transaction_root_attribute_add_to_creator() -> None:
+    sampler = CoralogixTransactionSampler()
+    tracer_provider = TracerProvider(sampler=sampler)
+    tracer = tracer_provider.get_tracer("default")
+    context = None
+    span1 = tracer.start_span("one", context=context)
+    context = opentelemetry.trace.set_span_in_context(span1, context)
+    span2 = tracer.start_span("two", context=context)
+    context = opentelemetry.trace.set_span_in_context(span2, context)
+    span3 = tracer.start_span("three", context=context)
+    if (
+        isinstance(span1, ReadableSpan)
+        and isinstance(span2, ReadableSpan)
+        and isinstance(span3, ReadableSpan)
+    ):
+        assert (
+            span1.attributes
+            and span1.attributes[CoralogixAttributes.TRANSACTION_ROOT] is True
+        ), "span1 must have transaction root attribute"
+        assert (
+            span2.attributes is None
+            or CoralogixAttributes.TRANSACTION_ROOT not in span2.attributes
+        ), "span2 must not have transaction root attribute"
+        assert (
+            span3.attributes is None
+            or CoralogixAttributes.TRANSACTION_ROOT not in span3.attributes
+        ), "span3 must not have transaction root attribute"
+    else:
+        assert isinstance(span1, ReadableSpan), "span1 must be instance of Span"
+        assert isinstance(span2, ReadableSpan), "span2 must be instance of Span"
+        assert isinstance(span3, ReadableSpan), "span3 must be instance of Span"
+    span3.end()
+    span2.end()
+    span1.end()
+
+
+def test_transaction_root_attribute_add_after_remote() -> None:
+    sampler = CoralogixTransactionSampler()
+    tracer_provider = TracerProvider(sampler=sampler)
+    tracer = tracer_provider.get_tracer("default")
+    context = None
+    span1 = tracer.start_span("one", context=context)
+    context = opentelemetry.trace.set_span_in_context(span1, context)
+    span2 = tracer.start_span("two", context=context)
+    context = opentelemetry.trace.set_span_in_context(span2, context)
+    context = get_remote_context(context)
+    span3 = tracer.start_span("three", context=context)
+    context = opentelemetry.trace.set_span_in_context(span3, context)
+    span4 = tracer.start_span("four", context=context)
+    if (
+        isinstance(span1, ReadableSpan)
+        and isinstance(span2, ReadableSpan)
+        and isinstance(span3, ReadableSpan)
+        and isinstance(span4, ReadableSpan)
+    ):
+        assert (
+            span1.attributes
+            and span1.attributes[CoralogixAttributes.TRANSACTION_ROOT] is True
+        ), "span1 must have transaction root attribute"
+        assert (
+            span2.attributes is None
+            or CoralogixAttributes.TRANSACTION_ROOT not in span2.attributes
+        ), "span2 must not have transaction root attribute"
+        assert (
+            span3.attributes
+            and span3.attributes[CoralogixAttributes.TRANSACTION_ROOT] is True
+        ), "span3 must have transaction root attribute"
+        assert (
+            span4.attributes is None
+            or CoralogixAttributes.TRANSACTION_ROOT not in span4.attributes
+        ), "span4 must not have transaction root attribute"
+    span4.end()
+    span3.end()
+    span2.end()
+    span1.end()
+
+
+def test_transaction_root_span_with_same_name_should_not_be_transaction_root() -> None:
+    sampler = CoralogixTransactionSampler()
+    tracer_provider = TracerProvider(sampler=sampler)
+    tracer = tracer_provider.get_tracer("default")
+    context = None
+    span1 = tracer.start_span("one", context=context)
+    context = opentelemetry.trace.set_span_in_context(span1, context)
+    span2 = tracer.start_span("one", context=context)
+    if isinstance(span1, ReadableSpan) and isinstance(span2, ReadableSpan):
+        assert (
+            span1.attributes
+            and span1.attributes[CoralogixAttributes.TRANSACTION_ROOT] is True
+        ), "span1 must have transaction root attribute"
+        assert (
+            span2.attributes is None
+            or CoralogixAttributes.TRANSACTION_ROOT not in span2.attributes
+        ), "span2 must not have transaction root attribute"
+    span2.end()
+    span1.end()
