@@ -8,6 +8,7 @@ def _attribute_to_trace_state(attribute_name: str) -> str:
 class CoralogixAttributes(str, Enum):
     TRANSACTION_IDENTIFIER = "cgx.transaction"
     DISTRIBUTED_TRANSACTION_IDENTIFIER = "cgx.transaction.distributed"
+    TRANSACTION_ROOT = "cgx.transaction.root"
 
 
 class CoralogixTraceState:
