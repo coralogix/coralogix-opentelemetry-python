@@ -96,10 +96,9 @@ class CoralogixTransactionSampler(Sampler):
 
     @staticmethod
     def _get_span_context(parent_context: Optional[Context]) -> Optional[SpanContext]:
-        if parent_context:
-            current_span = get_current_span(parent_context)
-            if current_span:
-                return current_span.get_span_context()
+        current_span = get_current_span(parent_context)
+        if current_span:
+            return current_span.get_span_context()
         return None
 
     def get_description(self) -> str:

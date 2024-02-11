@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "coralogix-opentelemetry"
-version = "0.1.2"
+version = "0.1.3"
 description = "coralogix extentions for opentelemetry"
 authors = ["Nimrod Avni <nimrod@coralogix.com>"]
 readme = "README.md"
