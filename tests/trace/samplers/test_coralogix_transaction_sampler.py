@@ -16,6 +16,7 @@ from opentelemetry.trace import (
 )
 from opentelemetry.util.types import Attributes
 from pytest_mock import MockerFixture
+from opentelemetry import trace
 
 test_parent_context: Optional[Context] = None
 test_trace_id: int = 1
@@ -194,6 +195,42 @@ def test_transaction_attribute_propagated() -> None:
     span3.end()
     span2.end()
     span1.end()
+
+
+def test_transaction_attribute_propagated_when_not_passing_context() -> None:
+    sampler = CoralogixTransactionSampler()
+    tracer_provider = TracerProvider(sampler=sampler)
+    tracer = tracer_provider.get_tracer("default")
+    with tracer.start_as_current_span("one"):
+        span1 = trace.get_current_span()
+        with tracer.start_as_current_span("two"):
+            span2 = trace.get_current_span()
+            with tracer.start_as_current_span("three"):
+                span3 = trace.get_current_span()
+                if (
+                    isinstance(span1, ReadableSpan)
+                    and isinstance(span2, ReadableSpan)
+                    and isinstance(span3, ReadableSpan)
+                ):
+                    assert (
+                        span1.attributes
+                        and span1.attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER]
+                        == "one"
+                    ), "span1 must created a transaction attribute"
+                    assert (
+                        span2.attributes
+                        and span2.attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER]
+                        == "one"
+                    ), "span2 must have transaction attribute from parent"
+                    assert (
+                        span3.attributes
+                        and span3.attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER]
+                        == "one"
+                    ), "span3 must have transaction attribute from parent"
+                else:
+                    assert span1.is_recording(), "span1 must be recording"
+                    assert span2.is_recording(), "span2 must be recording"
+                    assert span3.is_recording(), "span3 must be recording"
 
 
 def test_transaction_attribute_propagated_even_when_not_sampling() -> None:
