@@ -12,7 +12,7 @@ from typing import Dict, List, Optional, Sequence, Set, Tuple, Union
 
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import ReadableSpan
-from opentelemetry.trace import Status, StatusCode, format_span_id
+from opentelemetry.trace import SpanContext, Status, StatusCode, format_span_id
 
 # Default max spans kept in one local transaction waterfall.
 DEFAULT_MAX_TXN_TRACE_NODES = 256
@@ -94,8 +94,7 @@ def _order_kept(
     return [
         span
         for span in original
-        if span.context is not None
-        and format_span_id(span.context.span_id) in kept_ids
+        if span.context is not None and format_span_id(span.context.span_id) in kept_ids
     ]
 
 
@@ -133,7 +132,7 @@ def _nearest_kept_parent_context(
     *,
     by_id: Dict[str, ReadableSpan],
     kept_ids: Set[str],
-):
+) -> Optional[SpanContext]:
     parent = span.parent
     while parent is not None and parent.is_valid:
         parent_id = format_span_id(parent.span_id)
@@ -147,7 +146,9 @@ def _nearest_kept_parent_context(
     return None
 
 
-def _copy_with_parent(span: ReadableSpan, parent) -> ReadableSpan:
+def _copy_with_parent(
+    span: ReadableSpan, parent: Optional[SpanContext]
+) -> ReadableSpan:
     return ReadableSpan(
         name=span.name,
         context=span.context,

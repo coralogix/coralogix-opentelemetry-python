@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Any, Mapping, Optional, Tuple
 
 from coralogix_opentelemetry.trace.common import CoralogixAttributes
 from opentelemetry.context import Context
 from opentelemetry.trace import SpanKind, get_current_span
+from opentelemetry.util.types import AttributeValue
 
 
 def resolve_transaction(
@@ -35,7 +36,9 @@ def resolve_transaction(
     return transaction, starts
 
 
-def _attr_get(attrs, key: str):
+def _attr_get(
+    attrs: Optional[Mapping[Any, AttributeValue]], key: str
+) -> Optional[AttributeValue]:
     if not attrs:
         return None
     value = attrs.get(key)
@@ -46,8 +49,10 @@ def _attr_get(attrs, key: str):
     return value
 
 
-def _parent_transaction_name(parent_span) -> Optional[str]:
-    attrs = getattr(parent_span, "attributes", None) if parent_span is not None else None
+def _parent_transaction_name(parent_span: Optional[object]) -> Optional[str]:
+    attrs = (
+        getattr(parent_span, "attributes", None) if parent_span is not None else None
+    )
     if not attrs:
         return None
     value = _attr_get(attrs, CoralogixAttributes.TRANSACTION_IDENTIFIER.value)

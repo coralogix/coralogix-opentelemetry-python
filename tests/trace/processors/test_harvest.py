@@ -16,7 +16,7 @@ from opentelemetry.trace import SpanContext, SpanKind, Status, StatusCode, Trace
 def _span(
     name: str, *, span_id: int, start_ns: int, end_ns: int, root: bool = False
 ) -> ReadableSpan:
-    attrs = {CoralogixAttributes.TRANSACTION_ROOT: True} if root else {}
+    attrs = {CoralogixAttributes.TRANSACTION_ROOT.value: True} if root else {}
     return ReadableSpan(
         name=name,
         context=SpanContext(
@@ -40,13 +40,16 @@ def _span(
 def test_heap_keeps_only_slowest_when_capacity_one() -> None:
     heap = RegularTraceHeap(max_traces=1)
     fast = HarvestTrace(
-        duration_ns=100, spans=[_span("fast", span_id=1, start_ns=0, end_ns=100, root=True)]
+        duration_ns=100,
+        spans=[_span("fast", span_id=1, start_ns=0, end_ns=100, root=True)],
     )
     slow = HarvestTrace(
-        duration_ns=500, spans=[_span("slow", span_id=2, start_ns=0, end_ns=500, root=True)]
+        duration_ns=500,
+        spans=[_span("slow", span_id=2, start_ns=0, end_ns=500, root=True)],
     )
     mid = HarvestTrace(
-        duration_ns=200, spans=[_span("mid", span_id=3, start_ns=0, end_ns=200, root=True)]
+        duration_ns=200,
+        spans=[_span("mid", span_id=3, start_ns=0, end_ns=200, root=True)],
     )
 
     assert heap.witness(fast) is True
@@ -61,10 +64,12 @@ def test_heap_keeps_only_slowest_when_capacity_one() -> None:
 def test_heap_rejects_faster_than_current_winner() -> None:
     heap = RegularTraceHeap(max_traces=1)
     slow = HarvestTrace(
-        duration_ns=500, spans=[_span("slow", span_id=1, start_ns=0, end_ns=500, root=True)]
+        duration_ns=500,
+        spans=[_span("slow", span_id=1, start_ns=0, end_ns=500, root=True)],
     )
     fast = HarvestTrace(
-        duration_ns=50, spans=[_span("fast", span_id=2, start_ns=0, end_ns=50, root=True)]
+        duration_ns=50,
+        spans=[_span("fast", span_id=2, start_ns=0, end_ns=50, root=True)],
     )
     assert heap.witness(slow) is True
     assert heap.witness(fast) is False
@@ -74,7 +79,8 @@ def test_heap_rejects_faster_than_current_winner() -> None:
 def test_zero_capacity_never_keeps() -> None:
     heap = RegularTraceHeap(max_traces=0)
     trace = HarvestTrace(
-        duration_ns=500, spans=[_span("slow", span_id=1, start_ns=0, end_ns=500, root=True)]
+        duration_ns=500,
+        spans=[_span("slow", span_id=1, start_ns=0, end_ns=500, root=True)],
     )
     assert heap.witness(trace) is False
     assert heap.drain() == []

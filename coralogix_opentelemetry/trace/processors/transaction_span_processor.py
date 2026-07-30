@@ -63,6 +63,7 @@ from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import ReadableSpan, Span, SpanProcessor
 from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
 from opentelemetry.trace import Status, StatusCode, format_span_id
+from opentelemetry.util.types import AttributeValue
 
 _LOG = logging.getLogger(__name__)
 
@@ -319,7 +320,9 @@ class TransactionSpanProcessor(SpanProcessor):
     def _stop_harvester(self) -> None:
         self._harvest_stop.set()
         if self._harvester is not None:
-            self._harvester.join(timeout=max(30.0, self._harvest_period_millis / 1000.0 + 5.0))
+            self._harvester.join(
+                timeout=max(30.0, self._harvest_period_millis / 1000.0 + 5.0)
+            )
 
     def _harvest_loop(self) -> None:
         period_s = self._harvest_period_millis / 1000.0
@@ -576,9 +579,11 @@ class TransactionSpanProcessor(SpanProcessor):
         for span in annotated:
             attrs = dict(span.attributes or {})
             self_time_sec = attrs.get(SELF_TIME_ATTRIBUTE)
-            if self_time_sec is None:
+            if not isinstance(self_time_sec, (int, float)) or isinstance(
+                self_time_sec, bool
+            ):
                 continue
-            metric_attrs: Dict[str, object] = {METRIC_ATTR_SPAN_NAME: span.name}
+            metric_attrs: Dict[str, AttributeValue] = {METRIC_ATTR_SPAN_NAME: span.name}
             txn = attrs.get(CoralogixAttributes.TRANSACTION_IDENTIFIER)
             if txn is not None:
                 metric_attrs[CoralogixAttributes.TRANSACTION_IDENTIFIER] = str(txn)

@@ -49,7 +49,9 @@ def test_processor_tags_and_self_time_without_sampler() -> None:
     meter_provider = MeterProvider(resource=resource, metric_readers=[reader])
     provider = TracerProvider(resource=resource)
     provider.add_span_processor(
-        TransactionSpanProcessor(exporter, meter_provider=meter_provider, completion_holdback_millis=0)
+        TransactionSpanProcessor(
+            exporter, meter_provider=meter_provider, completion_holdback_millis=0
+        )
     )
     tracer = provider.get_tracer("test")
 
@@ -78,7 +80,7 @@ def test_processor_tags_and_self_time_without_sampler() -> None:
                 names.append(metric.name)
     assert METRIC_SELF_TIME in names
 
-    provider.shutdown()
+    provider.shutdown()  # type: ignore[no-untyped-call]
     meter_provider.shutdown()
 
 
@@ -87,7 +89,9 @@ def test_force_flush_does_not_finalize_incomplete_traces() -> None:
     provider = TracerProvider()
     # max_regular_traces=0 disables harvest sampling so a completed trace is
     # exported immediately (no waiting on the next harvest flush).
-    processor = TransactionSpanProcessor(exporter, max_regular_traces=0, completion_holdback_millis=0)
+    processor = TransactionSpanProcessor(
+        exporter, max_regular_traces=0, completion_holdback_millis=0
+    )
     provider.add_span_processor(processor)
     tracer = provider.get_tracer("test")
 
@@ -96,15 +100,19 @@ def test_force_flush_does_not_finalize_incomplete_traces() -> None:
             pass
         assert exporter.spans == [], "child must stay buffered while parent is live"
         assert processor.force_flush() is True
-        assert exporter.spans == [], "ForceFlush must not finalize incomplete local traces"
+        assert (
+            exporter.spans == []
+        ), "ForceFlush must not finalize incomplete local traces"
 
     assert {span.name for span in exporter.spans} == {"parent", "child"}
-    provider.shutdown()
+    provider.shutdown()  # type: ignore[no-untyped-call]
 
 
 def test_shutdown_waits_for_in_flight_spans() -> None:
     exporter = ListSpanExporter()
-    processor = TransactionSpanProcessor(exporter, max_regular_traces=0, completion_holdback_millis=0)
+    processor = TransactionSpanProcessor(
+        exporter, max_regular_traces=0, completion_holdback_millis=0
+    )
     provider = TracerProvider()
     provider.add_span_processor(processor)
     tracer = provider.get_tracer("test")
@@ -125,7 +133,7 @@ def test_shutdown_waits_for_in_flight_spans() -> None:
     thread.join()
 
     assert {span.name for span in exporter.spans} == {"parent", "child"}
-    provider.shutdown()
+    provider.shutdown()  # type: ignore[no-untyped-call]
 
 
 def test_export_is_serialized_across_concurrent_callers() -> None:
@@ -155,7 +163,9 @@ def test_export_is_serialized_across_concurrent_callers() -> None:
             return None
 
     exporter = BlockingExporter()
-    processor = TransactionSpanProcessor(exporter, max_regular_traces=0, completion_holdback_millis=0)
+    processor = TransactionSpanProcessor(
+        exporter, max_regular_traces=0, completion_holdback_millis=0
+    )
     provider = TracerProvider()
     provider.add_span_processor(processor)
     tracer = provider.get_tracer("test")
@@ -187,12 +197,14 @@ def test_export_is_serialized_across_concurrent_callers() -> None:
     with guard:
         assert max_concurrent == 1
     processor.shutdown()
-    provider.shutdown()
+    provider.shutdown()  # type: ignore[no-untyped-call]
 
 
 def test_shutdown_tracks_post_stop_child_of_in_flight_trace() -> None:
     exporter = ListSpanExporter()
-    processor = TransactionSpanProcessor(exporter, max_regular_traces=0, completion_holdback_millis=0)
+    processor = TransactionSpanProcessor(
+        exporter, max_regular_traces=0, completion_holdback_millis=0
+    )
     provider = TracerProvider()
     provider.add_span_processor(processor)
     tracer = provider.get_tracer("test")
@@ -211,13 +223,15 @@ def test_shutdown_tracks_post_stop_child_of_in_flight_trace() -> None:
     child = tracer.start_span("late-child", context=parent_ctx)
     parent.end()
     time.sleep(0.02)
-    assert exporter.spans == [], "parent must not finalize while post-stop child is live"
+    assert (
+        exporter.spans == []
+    ), "parent must not finalize while post-stop child is live"
     child.end()
     thread.join()
 
     names = {span.name for span in exporter.spans}
     assert names == {"parent", "late-child"}
-    provider.shutdown()
+    provider.shutdown()  # type: ignore[no-untyped-call]
 
 
 def test_processor_records_metrics_even_when_trace_not_harvested() -> None:
@@ -266,7 +280,7 @@ def test_processor_records_metrics_even_when_trace_not_harvested() -> None:
     ]
     assert len(roots) == 1
     assert roots[0].name == "slow"
-    provider.shutdown()
+    provider.shutdown()  # type: ignore[no-untyped-call]
     meter_provider.shutdown()
 
 
@@ -274,7 +288,12 @@ def test_processor_immediate_export_when_max_regular_traces_zero() -> None:
     exporter = ListSpanExporter()
     provider = TracerProvider()
     provider.add_span_processor(
-        TransactionSpanProcessor(exporter, max_regular_traces=0, harvest_period_millis=0, completion_holdback_millis=0)
+        TransactionSpanProcessor(
+            exporter,
+            max_regular_traces=0,
+            harvest_period_millis=0,
+            completion_holdback_millis=0,
+        )
     )
     tracer = provider.get_tracer("test")
 
@@ -282,14 +301,16 @@ def test_processor_immediate_export_when_max_regular_traces_zero() -> None:
         pass
 
     assert any(span.name == "now" for span in exporter.spans)
-    provider.shutdown()
+    provider.shutdown()  # type: ignore[no-untyped-call]
 
 
 def test_processor_trims_to_max_nodes_keeping_root() -> None:
     exporter = ListSpanExporter()
     provider = TracerProvider()
     provider.add_span_processor(
-        TransactionSpanProcessor(exporter, max_nodes=2, max_regular_traces=0, completion_holdback_millis=0)
+        TransactionSpanProcessor(
+            exporter, max_nodes=2, max_regular_traces=0, completion_holdback_millis=0
+        )
     )
     tracer = provider.get_tracer("test")
 
@@ -304,14 +325,17 @@ def test_processor_trims_to_max_nodes_keeping_root() -> None:
     assert "long" in names
     assert "short" not in names
     assert len(exporter.spans) == 2
-    provider.shutdown()
+    provider.shutdown()  # type: ignore[no-untyped-call]
 
 
 def test_shutdown_flushes_pending_harvest_winner() -> None:
     exporter = ListSpanExporter()
     provider = TracerProvider()
     processor = TransactionSpanProcessor(
-        exporter, max_regular_traces=1, harvest_period_millis=3_600_000, completion_holdback_millis=0
+        exporter,
+        max_regular_traces=1,
+        harvest_period_millis=3_600_000,
+        completion_holdback_millis=0,
     )
     provider.add_span_processor(processor)
     tracer = provider.get_tracer("test")
@@ -329,7 +353,9 @@ def test_processor_server_under_local_parent_starts_new_transaction() -> None:
     exporter = ListSpanExporter()
     provider = TracerProvider()
     provider.add_span_processor(
-        TransactionSpanProcessor(exporter, max_regular_traces=0, completion_holdback_millis=0)
+        TransactionSpanProcessor(
+            exporter, max_regular_traces=0, completion_holdback_millis=0
+        )
     )
     tracer = provider.get_tracer("test")
 
@@ -340,22 +366,36 @@ def test_processor_server_under_local_parent_starts_new_transaction() -> None:
 
     provider.force_flush()
     by_name = {span.name: span for span in exporter.spans}
-    assert by_name["parent-flow"].attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER] == "parent-flow"
-    assert by_name["GET /checkout"].attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER] == "GET /checkout"
-    assert by_name["GET /checkout"].attributes[CoralogixAttributes.TRANSACTION_ROOT] is True
+    assert (
+        by_name["parent-flow"].attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER]
+        == "parent-flow"
+    )
+    assert (
+        by_name["GET /checkout"].attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER]
+        == "GET /checkout"
+    )
+    assert (
+        by_name["GET /checkout"].attributes[CoralogixAttributes.TRANSACTION_ROOT]
+        is True
+    )
     assert (
         CoralogixAttributes.DISTRIBUTED_TRANSACTION_IDENTIFIER
         not in by_name["GET /checkout"].attributes
     )
-    assert by_name["child"].attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER] == "GET /checkout"
-    provider.shutdown()
+    assert (
+        by_name["child"].attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER]
+        == "GET /checkout"
+    )
+    provider.shutdown()  # type: ignore[no-untyped-call]
 
 
 def test_nested_server_finalizes_while_outer_still_open() -> None:
     exporter = ListSpanExporter()
     provider = TracerProvider()
     provider.add_span_processor(
-        TransactionSpanProcessor(exporter, max_regular_traces=0, completion_holdback_millis=0)
+        TransactionSpanProcessor(
+            exporter, max_regular_traces=0, completion_holdback_millis=0
+        )
     )
     tracer = provider.get_tracer("test")
 
@@ -366,15 +406,16 @@ def test_nested_server_finalizes_while_outer_still_open() -> None:
                 time.sleep(0.005)
 
         names = {span.name for span in exporter.spans}
-        assert names == {"inner", "db"}, (
-            "nested local transaction must finalize before the outer SERVER ends"
-        )
+        assert names == {
+            "inner",
+            "db",
+        }, "nested local transaction must finalize before the outer SERVER ends"
 
     outer.end()
     provider.force_flush()
     names = {span.name for span in exporter.spans}
     assert "outer" in names
-    provider.shutdown()
+    provider.shutdown()  # type: ignore[no-untyped-call]
 
 
 def test_completion_holdback_keeps_fire_and_forget_child() -> None:
@@ -398,14 +439,20 @@ def test_completion_holdback_keeps_fire_and_forget_child() -> None:
     time.sleep(0.12)
     provider.force_flush()
     assert {span.name for span in exporter.spans} == {"parent", "late-child"}
-    provider.shutdown()
+    provider.shutdown()  # type: ignore[no-untyped-call]
 
 
 def test_select_slowest_protects_all_transaction_roots() -> None:
     from coralogix_opentelemetry.trace.processors.trace_heap import select_slowest_spans
     from opentelemetry.sdk.resources import Resource
     from opentelemetry.sdk.trace import ReadableSpan
-    from opentelemetry.trace import SpanContext, SpanKind, Status, StatusCode, TraceFlags
+    from opentelemetry.trace import (
+        SpanContext,
+        SpanKind,
+        Status,
+        StatusCode,
+        TraceFlags,
+    )
 
     def ctx(span_id: int) -> SpanContext:
         return SpanContext(
@@ -415,13 +462,22 @@ def test_select_slowest_protects_all_transaction_roots() -> None:
             trace_flags=TraceFlags(0x01),
         )
 
-    def span(name: str, span_id: int, start: int, end: int, parent: int | None = None, root=False):
+    def span(
+        name: str,
+        span_id: int,
+        start: int,
+        end: int,
+        parent: int | None = None,
+        root: bool = False,
+    ) -> ReadableSpan:
         return ReadableSpan(
             name=name,
             context=ctx(span_id),
             parent=ctx(parent) if parent is not None else None,
             resource=Resource.create({}),
-            attributes={CoralogixAttributes.TRANSACTION_ROOT: True} if root else {},
+            attributes=(
+                {CoralogixAttributes.TRANSACTION_ROOT.value: True} if root else {}
+            ),
             events=(),
             links=(),
             kind=SpanKind.INTERNAL,
@@ -454,7 +510,13 @@ def _readable(
     end: int = 1,
 ) -> ReadableSpan:
     from opentelemetry.sdk.resources import Resource
-    from opentelemetry.trace import SpanContext, SpanKind, Status, StatusCode, TraceFlags
+    from opentelemetry.trace import (
+        SpanContext,
+        SpanKind,
+        Status,
+        StatusCode,
+        TraceFlags,
+    )
 
     def ctx(sid: int) -> SpanContext:
         return SpanContext(
@@ -464,10 +526,10 @@ def _readable(
             trace_flags=TraceFlags(0x01),
         )
 
-    attrs = {}
+    attrs: dict[str, bool | str] = {}
     if root:
-        attrs[CoralogixAttributes.TRANSACTION_ROOT] = True
-        attrs[CoralogixAttributes.TRANSACTION_IDENTIFIER] = name
+        attrs[CoralogixAttributes.TRANSACTION_ROOT.value] = True
+        attrs[CoralogixAttributes.TRANSACTION_IDENTIFIER.value] = name
     return ReadableSpan(
         name=name,
         context=ctx(span_id),
@@ -549,7 +611,9 @@ def test_nested_and_outer_finalize_separately_when_trace_goes_idle() -> None:
     exporter = ListSpanExporter()
     provider = TracerProvider()
     provider.add_span_processor(
-        TransactionSpanProcessor(exporter, max_regular_traces=0, completion_holdback_millis=0)
+        TransactionSpanProcessor(
+            exporter, max_regular_traces=0, completion_holdback_millis=0
+        )
     )
     tracer = provider.get_tracer("test")
 
@@ -567,7 +631,15 @@ def test_nested_and_outer_finalize_separately_when_trace_goes_idle() -> None:
     assert {r.name for r in roots} == {"outer", "inner"}
     assert len(exporter.spans) == 3
     by_name = {span.name: span for span in exporter.spans}
-    assert by_name["inner"].attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER] == "inner"
-    assert by_name["db"].attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER] == "inner"
-    assert by_name["outer"].attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER] == "outer"
-    provider.shutdown()
+    assert (
+        by_name["inner"].attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER]
+        == "inner"
+    )
+    assert (
+        by_name["db"].attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER] == "inner"
+    )
+    assert (
+        by_name["outer"].attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER]
+        == "outer"
+    )
+    provider.shutdown()  # type: ignore[no-untyped-call]
