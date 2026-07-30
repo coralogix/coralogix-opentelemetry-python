@@ -70,7 +70,9 @@ def test_keeps_longest_and_always_keeps_root() -> None:
     cache = _span("cache", span_id=3, start_ns=10, end_ns=12, parent_span_id=1)  # 2
     db = _span("db", span_id=4, start_ns=20, end_ns=60, parent_span_id=1)  # 40
     http = _span("http", span_id=5, start_ns=70, end_ns=150, parent_span_id=1)  # 80
-    render = _span("render", span_id=6, start_ns=160, end_ns=170, parent_span_id=1)  # 10
+    render = _span(
+        "render", span_id=6, start_ns=160, end_ns=170, parent_span_id=1
+    )  # 10
 
     kept = select_slowest_spans(
         [root, auth, cache, db, http, render],
@@ -83,8 +85,12 @@ def test_keeps_longest_and_always_keeps_root() -> None:
 
 def test_same_name_different_durations_are_separate_nodes() -> None:
     root = _span("root", span_id=1, start_ns=0, end_ns=100)
-    db_slow = _span("db.select", span_id=2, start_ns=10, end_ns=50, parent_span_id=1)  # 40
-    db_fast = _span("db.select", span_id=3, start_ns=55, end_ns=58, parent_span_id=1)  # 3
+    db_slow = _span(
+        "db.select", span_id=2, start_ns=10, end_ns=50, parent_span_id=1
+    )  # 40
+    db_fast = _span(
+        "db.select", span_id=3, start_ns=55, end_ns=58, parent_span_id=1
+    )  # 3
     other = _span("other", span_id=4, start_ns=60, end_ns=70, parent_span_id=1)  # 10
 
     kept = select_slowest_spans(
