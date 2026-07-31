@@ -49,23 +49,49 @@ class RegularTraceHeap:
             return True
         return duration_ns >= self._heap[0].duration_ns
 
-    def witness(self, trace: HarvestTrace) -> bool:
-        """Offer a completed trace. Returns True if it was kept."""
+    def witness(self, trace: HarvestTrace) -> List[ReadableSpan]:
+        """Offer a completed trace. Returns root stubs for any loser (reject/displace)."""
         if self._max_traces <= 0:
-            return False
+            return []
         if len(self._heap) < self._max_traces:
             heapq.heappush(self._heap, trace)
-            return True
+            return []
         if trace.duration_ns <= self._heap[0].duration_ns:
-            return False
-        heapq.heapreplace(self._heap, trace)
-        return True
+            return harvest_stub_spans(trace.spans)
+        displaced = heapq.heapreplace(self._heap, trace)
+        return harvest_stub_spans(displaced.spans)
 
     def drain(self) -> List[HarvestTrace]:
         """Remove and return all kept traces (order not significant)."""
         traces = list(self._heap)
         self._heap.clear()
         return traces
+
+
+def harvest_stub_spans(spans: Sequence[ReadableSpan]) -> List[ReadableSpan]:
+    """Root-only spans for APM presence when a completed tree loses harvest."""
+    if not spans:
+        return []
+    stubs = [
+        span
+        for span in spans
+        if span.attributes
+        and span.attributes.get(CoralogixAttributes.TRANSACTION_ROOT) is True
+    ]
+    if stubs:
+        return stubs
+    best = spans[0]
+    best_dur = 0
+    if best.start_time is not None and best.end_time is not None:
+        best_dur = max(0, best.end_time - best.start_time)
+    for span in spans[1:]:
+        if span.start_time is None or span.end_time is None:
+            continue
+        duration = max(0, span.end_time - span.start_time)
+        if duration > best_dur:
+            best = span
+            best_dur = duration
+    return [best]
 
 
 def root_duration_ns(spans: Sequence[ReadableSpan]) -> int:

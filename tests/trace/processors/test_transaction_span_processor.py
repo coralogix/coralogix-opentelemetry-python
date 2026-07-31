@@ -257,8 +257,9 @@ def test_processor_records_metrics_even_when_trace_not_harvested() -> None:
     with tracer.start_as_current_span("slow", kind=SpanKind.SERVER):
         time.sleep(0.04)
 
-    # Neither trace has been harvested yet; nothing exported.
-    assert exporter.spans == []
+    # Fast loser is stub-exported when displaced by slow; slow waits for harvest.
+    assert len(exporter.spans) == 1
+    assert exporter.spans[0].name == "fast"
 
     meter_provider.force_flush()
     span_names = set()
@@ -278,8 +279,7 @@ def test_processor_records_metrics_even_when_trace_not_harvested() -> None:
         for span in exporter.spans
         if (span.attributes or {}).get(CoralogixAttributes.TRANSACTION_ROOT)
     ]
-    assert len(roots) == 1
-    assert roots[0].name == "slow"
+    assert {span.name for span in roots} == {"fast", "slow"}
     provider.shutdown()  # type: ignore[no-untyped-call]
     meter_provider.shutdown()
 
