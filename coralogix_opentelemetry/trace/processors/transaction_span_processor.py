@@ -532,12 +532,17 @@ class TransactionSpanProcessor(SpanProcessor):
                 spans=list(trimmed),
             )
             with self._lock:
-                if self._shutdown_started or self._exporter_shutdown:
-                    pass
+                shutdown = self._shutdown_started or self._exporter_shutdown
+                if shutdown:
+                    stubs: List[ReadableSpan] = []
                 else:
-                    self._harvest.witness(candidate)
-                    return
-            self._export_spans(trimmed)
+                    stubs = self._harvest.witness(candidate)
+                    if not stubs:
+                        return
+            if shutdown:
+                self._export_spans(trimmed)
+            else:
+                self._export_spans(stubs)
         finally:
             with self._lock:
                 for span in annotated:
