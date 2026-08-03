@@ -64,7 +64,7 @@ def test_keeps_longest_and_always_keeps_root() -> None:
         span_id=1,
         start_ns=0,
         end_ns=200,
-        attrs={CoralogixAttributes.TRANSACTION_ROOT: True},
+        attrs={CoralogixAttributes.TRANSACTION_ROOT.value: True},
     )
     auth = _span("auth", span_id=2, start_ns=1, end_ns=6, parent_span_id=1)  # 5
     cache = _span("cache", span_id=3, start_ns=10, end_ns=12, parent_span_id=1)  # 2
