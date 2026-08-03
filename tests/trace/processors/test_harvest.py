@@ -17,7 +17,7 @@ from opentelemetry.trace import SpanContext, SpanKind, Status, StatusCode, Trace
 def _span(
     name: str, *, span_id: int, start_ns: int, end_ns: int, root: bool = False
 ) -> ReadableSpan:
-    attrs = {CoralogixAttributes.TRANSACTION_ROOT: True} if root else {}
+    attrs = {CoralogixAttributes.TRANSACTION_ROOT.value: True} if root else {}
     return ReadableSpan(
         name=name,
         context=SpanContext(
