@@ -14,7 +14,9 @@ from __future__ import annotations
 import heapq
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
-from coralogix_opentelemetry.trace.processors.defaults import DEFAULT_MAX_TXN_TRACE_NODES
+from coralogix_opentelemetry.trace.processors.defaults import (
+    DEFAULT_MAX_TXN_TRACE_NODES,
+)
 from coralogix_opentelemetry.trace.processors.span_copy import copy_with_parent
 from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.trace import SpanContext, format_span_id

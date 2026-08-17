@@ -64,7 +64,9 @@ def parent_has_transaction_attrs(parent_span: Optional[object]) -> bool:
         return False
     if _attr_get(attrs, CoralogixAttributes.TRANSACTION_ROOT.value) is True:
         return True
-    return _attr_get(attrs, CoralogixAttributes.TRANSACTION_IDENTIFIER.value) is not None
+    return (
+        _attr_get(attrs, CoralogixAttributes.TRANSACTION_IDENTIFIER.value) is not None
+    )
 
 
 def preset_transaction_name(span: Span) -> Optional[str]:

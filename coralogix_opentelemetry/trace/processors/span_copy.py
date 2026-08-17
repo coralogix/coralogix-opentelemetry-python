@@ -10,9 +10,7 @@ from opentelemetry.trace import SpanContext, Status, StatusCode
 from opentelemetry.util.types import AttributeValue
 
 
-def copy_with_parent(
-    span: ReadableSpan, parent: Optional[SpanContext]
-) -> ReadableSpan:
+def copy_with_parent(span: ReadableSpan, parent: Optional[SpanContext]) -> ReadableSpan:
     return ReadableSpan(
         name=span.name,
         context=span.context,

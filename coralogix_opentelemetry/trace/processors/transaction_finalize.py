@@ -23,6 +23,7 @@ METRIC_SELF_DURATION = "cgx.transaction.self_duration"
 SELF_DURATION_ATTRIBUTE = "cgx.transaction.self_duration"
 METRIC_ATTR_SPAN_NAME = "span.name"
 
+
 def annotate_completed_batch(
     spans: Sequence[ReadableSpan],
     *,
