@@ -143,8 +143,8 @@ class TransactionSpanProcessor(SpanProcessor):
 
         with self._lock:
             parent_member = self._membership.get(parent_id) if parent_id else None
-            parent_has_local = parent_member is not None or parent_has_transaction_attrs(
-                parent_span
+            parent_has_local = (
+                parent_member is not None or parent_has_transaction_attrs(parent_span)
             )
 
         starts = starts_new_transaction(
@@ -466,8 +466,7 @@ class TransactionSpanProcessor(SpanProcessor):
             membership_snapshot = {
                 span.context.span_id: self._membership[span.context.span_id]
                 for span in spans
-                if span.context is not None
-                and span.context.span_id in self._membership
+                if span.context is not None and span.context.span_id in self._membership
             }
         annotated = annotate_completed_batch(
             spans,

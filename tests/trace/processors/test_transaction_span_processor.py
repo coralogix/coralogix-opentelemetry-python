@@ -184,7 +184,6 @@ def test_negative_env_falls_back_to_default(monkeypatch) -> None:
     processor.shutdown()
 
 
-
 def test_force_flush_does_not_finalize_incomplete_traces() -> None:
     exporter = ListSpanExporter()
     provider = TracerProvider()
