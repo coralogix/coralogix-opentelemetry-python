@@ -76,7 +76,7 @@ def _annotate_with_self_duration_and_metrics(
         ):
             if batch_child_keys is not None and (start_ns, end_ns) in batch_child_keys:
                 continue
-            child_sid = f"{sid}:prior:{index}"
+            child_sid = "{}:prior:{}".format(sid, index)
             rows.append((child_sid, sid, "_prior_child", start_ns, end_ns))
 
     self_durations = self_duration_by_span_id(rows)
