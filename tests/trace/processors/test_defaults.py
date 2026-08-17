@@ -7,9 +7,10 @@ from coralogix_opentelemetry.trace.processors.defaults import (
     ENV_MAX_NODES,
     env_int,
 )
+from pytest import MonkeyPatch
 
 
-def test_env_int_accepts_zero_and_rejects_negatives(monkeypatch) -> None:
+def test_env_int_accepts_zero_and_rejects_negatives(monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setenv(ENV_MAX_NODES, "0")
     assert env_int(ENV_MAX_NODES, DEFAULT_MAX_TXN_TRACE_NODES) == 0
 
@@ -26,7 +27,7 @@ def test_env_int_accepts_zero_and_rejects_negatives(monkeypatch) -> None:
     )
 
 
-def test_env_int_falls_back_on_invalid(monkeypatch) -> None:
+def test_env_int_falls_back_on_invalid(monkeypatch: MonkeyPatch) -> None:
     monkeypatch.delenv(ENV_MAX_NODES, raising=False)
     assert env_int(ENV_MAX_NODES, 7) == 7
 

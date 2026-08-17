@@ -23,6 +23,7 @@ from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
 from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
 from opentelemetry.trace import SpanKind
+from pytest import MonkeyPatch
 
 
 class ListSpanExporter(SpanExporter):
@@ -149,7 +150,7 @@ def test_start_new_transaction_override_wins_over_span_name() -> None:
 
 
 def test_env_vars_configure_options_when_constructor_omits_them(
-    monkeypatch,
+    monkeypatch: MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("OTEL_CX_TRANSACTION_MAX_NODES", "12")
     monkeypatch.setenv("OTEL_CX_TRANSACTION_MAX_REGULAR_TRACES", "3")
@@ -163,21 +164,21 @@ def test_env_vars_configure_options_when_constructor_omits_them(
     processor.shutdown()
 
 
-def test_constructor_options_override_env(monkeypatch) -> None:
+def test_constructor_options_override_env(monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setenv("OTEL_CX_TRANSACTION_MAX_NODES", "12")
     processor = TransactionSpanProcessor(ListSpanExporter(), max_nodes=99)
     assert processor._max_nodes == 99
     processor.shutdown()
 
 
-def test_invalid_env_falls_back_to_default(monkeypatch) -> None:
+def test_invalid_env_falls_back_to_default(monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setenv("OTEL_CX_TRANSACTION_MAX_NODES", "nope")
     processor = TransactionSpanProcessor(ListSpanExporter())
     assert processor._max_nodes == 256
     processor.shutdown()
 
 
-def test_negative_env_falls_back_to_default(monkeypatch) -> None:
+def test_negative_env_falls_back_to_default(monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setenv("OTEL_CX_TRANSACTION_MAX_NODES", "-1")
     processor = TransactionSpanProcessor(ListSpanExporter())
     assert processor._max_nodes == 256
