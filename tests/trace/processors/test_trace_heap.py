@@ -53,7 +53,9 @@ def test_keeps_all_when_under_max_nodes() -> None:
         _span("root", span_id=1, start_ns=0, end_ns=100),
         _span("a", span_id=2, start_ns=10, end_ns=20, parent_span_id=1),
     ]
-    kept = select_slowest_spans(spans, max_nodes=256, root_span_id="0000000000000001")
+    kept = select_slowest_spans(
+        spans, max_nodes=256, root_span_ids=["0000000000000001"]
+    )
     assert len(kept) == 2
 
 
@@ -77,7 +79,7 @@ def test_keeps_longest_and_always_keeps_root() -> None:
     kept = select_slowest_spans(
         [root, auth, cache, db, http, render],
         max_nodes=3,
-        root_span_id="0000000000000001",
+        root_span_ids=["0000000000000001"],
     )
     names = {span.name for span in kept}
     assert names == {"root", "db", "http"}
@@ -96,7 +98,7 @@ def test_same_name_different_durations_are_separate_nodes() -> None:
     kept = select_slowest_spans(
         [root, db_slow, db_fast, other],
         max_nodes=3,
-        root_span_id="0000000000000001",
+        root_span_ids=["0000000000000001"],
     )
     names = [span.name for span in kept]
     assert names.count("db.select") == 1  # only the slow one fits with root+other
@@ -113,7 +115,7 @@ def test_reparents_when_middle_parent_dropped() -> None:
     kept = select_slowest_spans(
         [root, mid, db],
         max_nodes=2,
-        root_span_id="0000000000000001",
+        root_span_ids=["0000000000000001"],
     )
     assert {span.name for span in kept} == {"root", "db"}
     db_kept = next(span for span in kept if span.name == "db")
@@ -126,5 +128,5 @@ def test_no_root_span_id_uses_all_slots_for_heap() -> None:
     b = _span("b", span_id=2, start_ns=0, end_ns=50)  # 50
     c = _span("c", span_id=3, start_ns=0, end_ns=30)  # 30
 
-    kept = select_slowest_spans([a, b, c], max_nodes=2, root_span_id=None)
+    kept = select_slowest_spans([a, b, c], max_nodes=2, root_span_ids=None)
     assert {span.name for span in kept} == {"b", "c"}

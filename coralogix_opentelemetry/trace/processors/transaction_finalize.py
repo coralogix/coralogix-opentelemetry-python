@@ -1,0 +1,124 @@
+"""Export-time annotation: transaction name + exclusive self-duration + metrics."""
+
+from __future__ import annotations
+
+from typing import Dict, List, Optional, Sequence, Set, Tuple
+
+from coralogix_opentelemetry.trace.common import CoralogixAttributes
+from coralogix_opentelemetry.trace.processors.self_duration import (
+    self_duration_by_span_id,
+)
+from coralogix_opentelemetry.trace.processors.span_copy import copy_with_attributes
+from coralogix_opentelemetry.trace.processors.transaction_naming import (
+    TransactionMembership,
+    resolve_batch_transaction_name,
+    stamp_transaction_attributes,
+)
+from opentelemetry.metrics import Histogram
+from opentelemetry.sdk.trace import ReadableSpan
+from opentelemetry.trace import format_span_id
+from opentelemetry.util.types import AttributeValue
+
+METRIC_SELF_DURATION = "cgx.transaction.self_duration"
+SELF_DURATION_ATTRIBUTE = "cgx.transaction.self_duration"
+METRIC_ATTR_SPAN_NAME = "span.name"
+
+def annotate_completed_batch(
+    spans: Sequence[ReadableSpan],
+    *,
+    child_intervals: Dict[int, List[Tuple[int, int]]],
+    membership: Dict[int, TransactionMembership],
+    self_duration_hist: Histogram,
+) -> List[ReadableSpan]:
+    """Stamp final txn name, exclusive self-duration, and record the histogram.
+
+    Order matters: transaction attrs are stamped first so metric labels see the
+    final ``cgx.transaction`` value (not an early start-time name).
+    """
+    txn_name = resolve_batch_transaction_name(spans, membership)
+    named = stamp_transaction_attributes(spans, txn_name)
+    return _annotate_with_self_duration_and_metrics(
+        named, child_intervals, self_duration_hist
+    )
+
+
+def _annotate_with_self_duration_and_metrics(
+    spans: Sequence[ReadableSpan],
+    child_intervals: Dict[int, List[Tuple[int, int]]],
+    self_duration_hist: Histogram,
+) -> List[ReadableSpan]:
+    direct_child_intervals: Dict[int, Set[Tuple[int, int]]] = {}
+    for span in spans:
+        if (
+            span.parent is None
+            or not span.parent.is_valid
+            or span.start_time is None
+            or span.end_time is None
+        ):
+            continue
+        direct_child_intervals.setdefault(span.parent.span_id, set()).add(
+            (span.start_time, span.end_time)
+        )
+
+    rows: List[tuple] = []
+    for span in spans:
+        if span.context is None or span.start_time is None or span.end_time is None:
+            continue
+        parent_id = ""
+        if span.parent is not None and span.parent.is_valid:
+            parent_id = format_span_id(span.parent.span_id)
+        sid = format_span_id(span.context.span_id)
+        rows.append((sid, parent_id, span.name, span.start_time, span.end_time))
+        batch_child_keys = direct_child_intervals.get(span.context.span_id)
+        for index, (start_ns, end_ns) in enumerate(
+            child_intervals.get(span.context.span_id, [])
+        ):
+            if batch_child_keys is not None and (start_ns, end_ns) in batch_child_keys:
+                continue
+            child_sid = f"{sid}:prior:{index}"
+            rows.append((child_sid, sid, "_prior_child", start_ns, end_ns))
+
+    self_durations = self_duration_by_span_id(rows)
+    annotated = [_copy_with_self_duration(span, self_durations) for span in spans]
+    for span in annotated:
+        attrs = dict(span.attributes or {})
+        self_duration_sec = attrs.get(SELF_DURATION_ATTRIBUTE)
+        if not isinstance(self_duration_sec, (int, float)) or isinstance(
+            self_duration_sec, bool
+        ):
+            continue
+        metric_attrs: Dict[str, AttributeValue] = {METRIC_ATTR_SPAN_NAME: span.name}
+        txn = attrs.get(CoralogixAttributes.TRANSACTION_IDENTIFIER)
+        if txn is not None:
+            metric_attrs[CoralogixAttributes.TRANSACTION_IDENTIFIER] = str(txn)
+        if attrs.get(CoralogixAttributes.TRANSACTION_ROOT):
+            metric_attrs[CoralogixAttributes.TRANSACTION_ROOT] = True
+        self_duration_hist.record(float(self_duration_sec), metric_attrs)
+    return annotated
+
+
+def _copy_with_self_duration(
+    span: ReadableSpan, self_durations: Dict[str, int]
+) -> ReadableSpan:
+    attrs = dict(span.attributes or {})
+    if span.context is not None:
+        sid = format_span_id(span.context.span_id)
+        if sid in self_durations:
+            attrs[SELF_DURATION_ATTRIBUTE] = self_durations[sid] / 1_000_000_000.0
+    return copy_with_attributes(span, attrs)
+
+
+def create_self_duration_histogram(meter_provider: Optional[object]) -> Histogram:
+    from opentelemetry import metrics
+
+    if meter_provider is not None:
+        meter = meter_provider.get_meter("coralogix.opentelemetry.transaction", "0.1.3")
+    else:
+        meter = metrics.get_meter("coralogix.opentelemetry.transaction", "0.1.3")
+    return meter.create_histogram(
+        name=METRIC_SELF_DURATION,
+        unit="s",
+        description=(
+            "Exclusive (self) wall duration per span within a Coralogix transaction"
+        ),
+    )

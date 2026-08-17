@@ -1,4 +1,4 @@
-"""Tests for exclusive self-time and TransactionSpanProcessor."""
+"""Tests for exclusive self-duration and TransactionSpanProcessor."""
 
 from __future__ import annotations
 
@@ -8,11 +8,14 @@ from typing import Sequence
 
 from coralogix_opentelemetry.trace.common import CoralogixAttributes
 from coralogix_opentelemetry.trace.processors import (
-    METRIC_SELF_TIME,
-    SELF_TIME_ATTRIBUTE,
+    METRIC_SELF_DURATION,
+    SELF_DURATION_ATTRIBUTE,
     TransactionSpanProcessor,
+    start_new_transaction,
 )
-from coralogix_opentelemetry.trace.processors.self_time import self_time_by_span_id
+from coralogix_opentelemetry.trace.processors.self_duration import (
+    self_duration_by_span_id,
+)
 from opentelemetry import trace
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import InMemoryMetricReader
@@ -34,15 +37,15 @@ class ListSpanExporter(SpanExporter):
         return None
 
 
-def test_self_time_nested_fixture() -> None:
+def test_self_duration_nested_fixture() -> None:
     spans = [
         ("1", "", "root", 0, 100),
         ("2", "1", "child", 20, 80),
     ]
-    assert self_time_by_span_id(spans) == {"1": 40, "2": 60}
+    assert self_duration_by_span_id(spans) == {"1": 40, "2": 60}
 
 
-def test_processor_tags_and_self_time_without_sampler() -> None:
+def test_processor_tags_and_self_duration_without_sampler() -> None:
     resource = Resource.create({"service.name": "test"})
     exporter = ListSpanExporter()
     reader = InMemoryMetricReader()
@@ -67,10 +70,10 @@ def test_processor_tags_and_self_time_without_sampler() -> None:
     child = by_name["db"]
     assert root.attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER] == "GET /orders"
     assert root.attributes[CoralogixAttributes.TRANSACTION_ROOT] is True
-    assert SELF_TIME_ATTRIBUTE in root.attributes
+    assert SELF_DURATION_ATTRIBUTE in root.attributes
     assert child.attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER] == "GET /orders"
     assert CoralogixAttributes.TRANSACTION_ROOT not in (child.attributes or {})
-    assert SELF_TIME_ATTRIBUTE in child.attributes
+    assert SELF_DURATION_ATTRIBUTE in child.attributes
 
     names = []
     data = reader.get_metrics_data()
@@ -78,10 +81,108 @@ def test_processor_tags_and_self_time_without_sampler() -> None:
         for sm in rm.scope_metrics:
             for metric in sm.metrics:
                 names.append(metric.name)
-    assert METRIC_SELF_TIME in names
+    assert METRIC_SELF_DURATION in names
 
     provider.shutdown()  # type: ignore[no-untyped-call]
     meter_provider.shutdown()
+
+
+def test_transaction_name_uses_final_root_name_after_update_name() -> None:
+    """Express-style rename: early name must not freeze cgx.transaction."""
+    exporter = ListSpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(
+        TransactionSpanProcessor(
+            exporter, max_regular_traces=0, completion_holdback_millis=0
+        )
+    )
+    tracer = provider.get_tracer("test")
+
+    root = tracer.start_span("GET", kind=SpanKind.SERVER)
+    with trace.use_span(root, end_on_exit=False):
+        root.update_name("GET /myroute")
+        with tracer.start_as_current_span("handler"):
+            pass
+    root.end()
+    provider.force_flush()
+
+    by_name = {span.name: span for span in exporter.spans}
+    assert (
+        by_name["GET /myroute"].attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER]
+        == "GET /myroute"
+    )
+    assert (
+        by_name["handler"].attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER]
+        == "GET /myroute"
+    )
+    provider.shutdown()  # type: ignore[no-untyped-call]
+
+
+def test_start_new_transaction_override_wins_over_span_name() -> None:
+    exporter = ListSpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(
+        TransactionSpanProcessor(
+            exporter, max_regular_traces=0, completion_holdback_millis=0
+        )
+    )
+    tracer = provider.get_tracer("test")
+
+    root = tracer.start_span("raw-name", kind=SpanKind.INTERNAL)
+    start_new_transaction(root, "fulfill")
+    with trace.use_span(root, end_on_exit=False):
+        with tracer.start_as_current_span("child"):
+            pass
+    root.end()
+    provider.force_flush()
+
+    by_name = {span.name: span for span in exporter.spans}
+    assert (
+        by_name["raw-name"].attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER]
+        == "fulfill"
+    )
+    assert (
+        by_name["child"].attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER]
+        == "fulfill"
+    )
+    provider.shutdown()  # type: ignore[no-untyped-call]
+
+
+def test_env_vars_configure_options_when_constructor_omits_them(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("OTEL_CX_TRANSACTION_MAX_NODES", "12")
+    monkeypatch.setenv("OTEL_CX_TRANSACTION_MAX_REGULAR_TRACES", "3")
+    monkeypatch.setenv("OTEL_CX_TRANSACTION_HARVEST_PERIOD_MILLIS", "5000")
+    monkeypatch.setenv("OTEL_CX_TRANSACTION_COMPLETION_HOLDBACK_MILLIS", "25")
+    processor = TransactionSpanProcessor(ListSpanExporter())
+    assert processor._max_nodes == 12
+    assert processor._max_regular_traces == 3
+    assert processor._harvest_period_millis == 5000
+    assert processor._completion_holdback_millis == 25
+    processor.shutdown()
+
+
+def test_constructor_options_override_env(monkeypatch) -> None:
+    monkeypatch.setenv("OTEL_CX_TRANSACTION_MAX_NODES", "12")
+    processor = TransactionSpanProcessor(ListSpanExporter(), max_nodes=99)
+    assert processor._max_nodes == 99
+    processor.shutdown()
+
+
+def test_invalid_env_falls_back_to_default(monkeypatch) -> None:
+    monkeypatch.setenv("OTEL_CX_TRANSACTION_MAX_NODES", "nope")
+    processor = TransactionSpanProcessor(ListSpanExporter())
+    assert processor._max_nodes == 256
+    processor.shutdown()
+
+
+def test_negative_env_falls_back_to_default(monkeypatch) -> None:
+    monkeypatch.setenv("OTEL_CX_TRANSACTION_MAX_NODES", "-1")
+    processor = TransactionSpanProcessor(ListSpanExporter())
+    assert processor._max_nodes == 256
+    processor.shutdown()
+
 
 
 def test_force_flush_does_not_finalize_incomplete_traces() -> None:
@@ -170,8 +271,6 @@ def test_export_is_serialized_across_concurrent_callers() -> None:
     provider.add_span_processor(processor)
     tracer = provider.get_tracer("test")
 
-    # End the first span on a worker so MainThread can orchestrate while
-    # export is blocked (on_end calls export synchronously).
     def first_trace() -> None:
         with tracer.start_as_current_span("a", kind=SpanKind.SERVER):
             pass
@@ -186,7 +285,7 @@ def test_export_is_serialized_across_concurrent_callers() -> None:
 
     t2 = threading.Thread(target=second_trace)
     t2.start()
-    time.sleep(0.05)  # second export should be waiting on _export_lock
+    time.sleep(0.05)
     with guard:
         assert concurrent == 1
         assert max_concurrent == 1
@@ -218,7 +317,7 @@ def test_shutdown_tracks_post_stop_child_of_in_flight_trace() -> None:
 
     thread = threading.Thread(target=run_shutdown)
     thread.start()
-    time.sleep(0.05)  # let shutdown set _stopped
+    time.sleep(0.05)
 
     child = tracer.start_span("late-child", context=parent_ctx)
     parent.end()
@@ -235,7 +334,7 @@ def test_shutdown_tracks_post_stop_child_of_in_flight_trace() -> None:
 
 
 def test_processor_records_metrics_even_when_trace_not_harvested() -> None:
-    """Self-time metrics fire for every completed local trace; harvest only gates export."""
+    """Self-duration metrics fire for every completed local trace; harvest only gates export."""
     resource = Resource.create({"service.name": "test"})
     exporter = ListSpanExporter()
     reader = InMemoryMetricReader()
@@ -257,7 +356,6 @@ def test_processor_records_metrics_even_when_trace_not_harvested() -> None:
     with tracer.start_as_current_span("slow", kind=SpanKind.SERVER):
         time.sleep(0.04)
 
-    # Fast loser is stub-exported when displaced by slow; slow waits for harvest.
     assert len(exporter.spans) == 1
     assert exporter.spans[0].name == "fast"
 
@@ -266,7 +364,7 @@ def test_processor_records_metrics_even_when_trace_not_harvested() -> None:
     for rm in reader.get_metrics_data().resource_metrics:
         for sm in rm.scope_metrics:
             for metric in sm.metrics:
-                if metric.name != METRIC_SELF_TIME:
+                if metric.name != METRIC_SELF_DURATION:
                     continue
                 for point in metric.data.data_points:
                     span_names.add(dict(point.attributes).get("span.name"))
@@ -343,7 +441,6 @@ def test_shutdown_flushes_pending_harvest_winner() -> None:
     with tracer.start_as_current_span("root", kind=SpanKind.SERVER):
         pass
 
-    # Harvest winner has not been flushed yet (no periodic harvester, no explicit flush).
     assert exporter.spans == []
     processor.shutdown()
     assert any(span.name == "root" for span in exporter.spans)
@@ -434,8 +531,6 @@ def test_completion_holdback_keeps_fire_and_forget_child() -> None:
 
     child = tracer.start_span("late-child", context=parent_ctx)
     child.end()
-    # Holdback should have been cancelled by late-child on_start; after child
-    # ends the TraceID is idle again — wait past holdback for leftover finalize.
     time.sleep(0.12)
     provider.force_flush()
     assert {span.name for span in exporter.spans} == {"parent", "late-child"}
@@ -563,7 +658,6 @@ def test_stale_cancelled_timer_does_not_pop_replacement() -> None:
         replacement = processor._pending_completions[trace_id]
         assert replacement is not stale
 
-    # Simulate the cancelled timer racing in after a replacement was armed.
     stale.function(*stale.args, **stale.kwargs)
 
     with processor._lock:
@@ -576,11 +670,7 @@ def test_stale_cancelled_timer_does_not_pop_replacement() -> None:
 
 
 def test_extract_completed_roots_deepest_first_excludes_extracted() -> None:
-    """Nested SERVER root extracts before outer; outer must not re-export nested IDs.
-
-    Buffer order deliberately puts the outer root first so buffer-order
-    iteration would let the outer swallow the nested subtree.
-    """
+    """Nested SERVER root extracts before outer; outer must not re-export nested IDs."""
     exporter = ListSpanExporter()
     processor = TransactionSpanProcessor(
         exporter, max_regular_traces=0, completion_holdback_millis=0
@@ -591,7 +681,6 @@ def test_extract_completed_roots_deepest_first_excludes_extracted() -> None:
     child = _readable("db", span_id=3, parent_id=2, start=20, end=50)
 
     with processor._lock:
-        # Outer first — the defect case for buffer-order iteration.
         processor._buffers[trace_id] = [outer, nested, child]
         batches = processor._extract_completed_local_transactions_locked(
             trace_id, flush_leftover=True

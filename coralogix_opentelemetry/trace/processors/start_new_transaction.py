@@ -1,4 +1,9 @@
-"""Override the local transaction name on an in-flight span (processor path)."""
+"""Override the local transaction name on an in-flight span (processor path).
+
+Sets ``cgx.transaction`` + ``cgx.transaction.root`` immediately as an explicit
+override. ``TransactionSpanProcessor`` treats a pre-set ``cgx.transaction`` as
+``override_name`` at export finalize (it wins over the root's final span name).
+"""
 
 from __future__ import annotations
 

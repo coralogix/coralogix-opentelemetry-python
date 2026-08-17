@@ -3,19 +3,28 @@
 Keep at most ``max_nodes`` spans, preferring longer durations. Every
 ``cgx.transaction.root`` is always retained. Dropped parents are re-linked to
 the nearest kept ancestor (or become roots).
+
+Uses ``heapq`` as a **min-heap by duration** among non-root candidates: when
+full, the head is the shortest kept non-root (easiest to displace by a longer
+span). There is no hand-rolled sift; ``heapq`` owns heap maintenance.
 """
 
 from __future__ import annotations
 
 import heapq
-from typing import Dict, List, Optional, Sequence, Set, Tuple, Union
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
-from opentelemetry.sdk.resources import Resource
+from coralogix_opentelemetry.trace.processors.defaults import DEFAULT_MAX_TXN_TRACE_NODES
+from coralogix_opentelemetry.trace.processors.span_copy import copy_with_parent
 from opentelemetry.sdk.trace import ReadableSpan
-from opentelemetry.trace import SpanContext, Status, StatusCode, format_span_id
+from opentelemetry.trace import SpanContext, format_span_id
 
-# Default max spans kept in one local transaction waterfall.
-DEFAULT_MAX_TXN_TRACE_NODES = 256
+__all__ = [
+    "DEFAULT_MAX_TXN_TRACE_NODES",
+    "reparent_to_kept_ancestors",
+    "select_slowest_spans",
+    "span_duration_ns",
+]
 
 
 def span_duration_ns(span: ReadableSpan) -> int:
@@ -28,26 +37,21 @@ def select_slowest_spans(
     spans: Sequence[ReadableSpan],
     *,
     max_nodes: int = DEFAULT_MAX_TXN_TRACE_NODES,
-    root_span_ids: Optional[Union[str, Sequence[str]]] = None,
-    root_span_id: Optional[str] = None,
+    root_span_ids: Optional[Sequence[str]] = None,
 ) -> List[ReadableSpan]:
     """Keep at most ``max_nodes`` spans, preferring longer durations.
 
     Every protected root span id is never evicted. If there are more protected
     roots than ``max_nodes``, all roots are kept. Remaining slots are filled
     with a duration min-heap.
+
+    ``root_span_ids`` must be a sequence of span-id hex strings (never a bare
+    string — a string would be iterated as characters).
     """
     if max_nodes <= 0 or len(spans) <= max_nodes:
         return list(spans)
 
-    protect: Set[str] = set()
-    if root_span_ids is not None:
-        if isinstance(root_span_ids, str):
-            protect.add(root_span_ids)
-        else:
-            protect.update(root_span_ids)
-    if root_span_id is not None:
-        protect.add(root_span_id)
+    protect: Set[str] = set(root_span_ids or ())
 
     roots: List[ReadableSpan] = []
     others: List[ReadableSpan] = []
@@ -64,21 +68,20 @@ def select_slowest_spans(
     if slots == 0:
         return reparent_to_kept_ancestors(_order_kept(spans, roots), all_spans=spans)
 
-    # Min-heap of (duration, tie_break, span). When full, only longer durations
-    # replace the current shortest - min-heap eviction.
-    heap: List[Tuple[int, int, ReadableSpan]] = []
+    # Min-heap of (duration, tie_break, span). Head = shortest kept non-root.
+    shortest_first: List[Tuple[int, int, ReadableSpan]] = []
     for index, span in enumerate(others):
         duration = span_duration_ns(span)
         item = (duration, index, span)
-        if len(heap) < slots:
-            heap.append(item)
-            if len(heap) == slots:
-                heapq.heapify(heap)
+        if len(shortest_first) < slots:
+            shortest_first.append(item)
+            if len(shortest_first) == slots:
+                heapq.heapify(shortest_first)
             continue
-        if duration > heap[0][0]:
-            heapq.heapreplace(heap, item)
+        if duration > shortest_first[0][0]:
+            heapq.heapreplace(shortest_first, item)
 
-    kept = [span for _duration, _index, span in heap]
+    kept = [span for _duration, _index, span in shortest_first]
     kept.extend(roots)
     return reparent_to_kept_ancestors(_order_kept(spans, kept), all_spans=spans)
 
@@ -123,7 +126,7 @@ def reparent_to_kept_ancestors(
         if new_parent is span.parent:
             result.append(span)
         else:
-            result.append(_copy_with_parent(span, new_parent))
+            result.append(copy_with_parent(span, new_parent))
     return result
 
 
@@ -144,22 +147,3 @@ def _nearest_kept_parent_context(
             break
         parent = ancestor.parent
     return None
-
-
-def _copy_with_parent(
-    span: ReadableSpan, parent: Optional[SpanContext]
-) -> ReadableSpan:
-    return ReadableSpan(
-        name=span.name,
-        context=span.context,
-        parent=parent,
-        resource=span.resource if span.resource is not None else Resource.create({}),
-        attributes=dict(span.attributes or {}),
-        events=span.events,
-        links=span.links,
-        kind=span.kind,
-        status=span.status if span.status is not None else Status(StatusCode.UNSET),
-        start_time=span.start_time,
-        end_time=span.end_time,
-        instrumentation_scope=span.instrumentation_scope,
-    )
