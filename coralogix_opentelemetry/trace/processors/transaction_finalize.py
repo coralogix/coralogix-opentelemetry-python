@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple, cast
 
 from coralogix_opentelemetry.trace.common import CoralogixAttributes
 from coralogix_opentelemetry.trace.processors.self_duration import (
@@ -14,7 +14,7 @@ from coralogix_opentelemetry.trace.processors.transaction_naming import (
     resolve_batch_transaction_name,
     stamp_transaction_attributes,
 )
-from opentelemetry.metrics import Histogram
+from opentelemetry.metrics import Histogram, MeterProvider
 from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.trace import format_span_id
 from opentelemetry.util.types import AttributeValue
@@ -109,17 +109,22 @@ def _copy_with_self_duration(
     return copy_with_attributes(span, attrs)
 
 
-def create_self_duration_histogram(meter_provider: Optional[object]) -> Histogram:
+def create_self_duration_histogram(
+    meter_provider: Optional[MeterProvider],
+) -> Histogram:
     from opentelemetry import metrics
 
     if meter_provider is not None:
         meter = meter_provider.get_meter("coralogix.opentelemetry.transaction", "0.1.3")
     else:
         meter = metrics.get_meter("coralogix.opentelemetry.transaction", "0.1.3")
-    return meter.create_histogram(
-        name=METRIC_SELF_DURATION,
-        unit="s",
-        description=(
-            "Exclusive (self) wall duration per span within a Coralogix transaction"
+    return cast(
+        Histogram,
+        meter.create_histogram(
+            name=METRIC_SELF_DURATION,
+            unit="s",
+            description=(
+                "Exclusive (self) wall duration per span within a Coralogix transaction"
+            ),
         ),
     )
