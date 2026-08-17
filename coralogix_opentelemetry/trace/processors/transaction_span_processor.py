@@ -54,8 +54,6 @@ from coralogix_opentelemetry.trace.processors.transaction_extract import (
     extract_completed_local_transactions,
 )
 from coralogix_opentelemetry.trace.processors.transaction_finalize import (
-    METRIC_SELF_DURATION,
-    SELF_DURATION_ATTRIBUTE,
     annotate_completed_batch,
     create_self_duration_histogram,
 )
