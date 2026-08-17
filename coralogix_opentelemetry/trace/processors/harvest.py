@@ -2,6 +2,12 @@
 
 During a harvest window, completed local traces compete by root duration;
 only the winners are exported when the harvest flushes (default capacity 1).
+
+Implementation note: uses ``heapq`` as a **min-heap by duration** (index 0 /
+head = shortest kept trace = easiest to displace when a slower candidate
+arrives). There is no hand-rolled sift-up/sift-down; Python's ``heapq`` owns
+those operations. Capacity ``0`` means “keep nothing” (caller exports another
+way).
 """
 
 from __future__ import annotations
@@ -11,11 +17,20 @@ from dataclasses import dataclass, field
 from typing import List, Sequence
 
 from coralogix_opentelemetry.trace.common import CoralogixAttributes
+from coralogix_opentelemetry.trace.processors.defaults import (
+    DEFAULT_HARVEST_PERIOD_MILLIS,
+    DEFAULT_MAX_REGULAR_TRACES,
+)
 from opentelemetry.sdk.trace import ReadableSpan
 
-# Default harvest capacity and period.
-DEFAULT_MAX_REGULAR_TRACES = 1
-DEFAULT_HARVEST_PERIOD_MILLIS = 60_000
+__all__ = [
+    "DEFAULT_HARVEST_PERIOD_MILLIS",
+    "DEFAULT_MAX_REGULAR_TRACES",
+    "HarvestTrace",
+    "RegularTraceHeap",
+    "harvest_stub_spans",
+    "root_duration_ns",
+]
 
 
 @dataclass(order=True)
@@ -27,44 +42,49 @@ class HarvestTrace:
 
 
 class RegularTraceHeap:
-    """Min-heap of harvest traces by duration; capacity = max regular traces."""
+    """Min-heap of harvest traces by duration; capacity = max regular traces.
+
+    Head (``_heap[0]``) is the shortest kept winner — the first to be displaced
+    when a longer completed local trace arrives.
+    """
 
     def __init__(self, max_traces: int = DEFAULT_MAX_REGULAR_TRACES) -> None:
         if max_traces < 0:
             raise ValueError("max_traces must be >= 0")
         self._max_traces = max_traces
-        self._heap: List[HarvestTrace] = []
+        # Min-heap: shortest duration at head.
+        self._shortest_first: List[HarvestTrace] = []
 
     @property
     def max_traces(self) -> int:
         return self._max_traces
 
     def __len__(self) -> int:
-        return len(self._heap)
+        return len(self._shortest_first)
 
     def is_keeper(self, duration_ns: int) -> bool:
         if self._max_traces <= 0:
             return False
-        if len(self._heap) < self._max_traces:
+        if len(self._shortest_first) < self._max_traces:
             return True
-        return duration_ns >= self._heap[0].duration_ns
+        return duration_ns >= self._shortest_first[0].duration_ns
 
     def witness(self, trace: HarvestTrace) -> List[ReadableSpan]:
         """Offer a completed trace. Returns root stubs for any loser (reject/displace)."""
         if self._max_traces <= 0:
             return []
-        if len(self._heap) < self._max_traces:
-            heapq.heappush(self._heap, trace)
+        if len(self._shortest_first) < self._max_traces:
+            heapq.heappush(self._shortest_first, trace)
             return []
-        if trace.duration_ns <= self._heap[0].duration_ns:
+        if trace.duration_ns <= self._shortest_first[0].duration_ns:
             return harvest_stub_spans(trace.spans)
-        displaced = heapq.heapreplace(self._heap, trace)
+        displaced = heapq.heapreplace(self._shortest_first, trace)
         return harvest_stub_spans(displaced.spans)
 
     def drain(self) -> List[HarvestTrace]:
         """Remove and return all kept traces (order not significant)."""
-        traces = list(self._heap)
-        self._heap.clear()
+        traces = list(self._shortest_first)
+        self._shortest_first.clear()
         return traces
 
 
