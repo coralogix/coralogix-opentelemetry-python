@@ -52,6 +52,7 @@ from coralogix_opentelemetry.trace.processors.harvest import (
 from coralogix_opentelemetry.trace.processors.trace_heap import select_slowest_spans
 from coralogix_opentelemetry.trace.processors.transaction_extract import (
     extract_completed_local_transactions,
+    has_extractable_nested_transaction,
 )
 from coralogix_opentelemetry.trace.processors.transaction_finalize import (
     annotate_completed_batch,
@@ -61,6 +62,7 @@ from coralogix_opentelemetry.trace.processors.transaction_naming import (
     TransactionMembership,
     apply_on_start_root_flag,
     parent_has_transaction_attrs,
+    parent_transaction_from_tracestate,
     preset_transaction_name,
     starts_new_transaction,
 )
@@ -108,6 +110,7 @@ class TransactionSpanProcessor(SpanProcessor):
         self._membership: Dict[int, TransactionMembership] = {}
         self._child_intervals: Dict[int, List[Tuple[int, int]]] = {}
         self._pending_completions: Dict[int, threading.Timer] = {}
+        self._pending_nested_completions: Dict[int, threading.Timer] = {}
         self._stopped = False
         self._exporter_shutdown = False
         self._shutdown_started = False
@@ -141,8 +144,11 @@ class TransactionSpanProcessor(SpanProcessor):
 
         with self._lock:
             parent_member = self._membership.get(parent_id) if parent_id else None
+            inherited_from_ts = parent_transaction_from_tracestate(parent_span)
             parent_has_local = (
-                parent_member is not None or parent_has_transaction_attrs(parent_span)
+                parent_member is not None
+                or parent_has_transaction_attrs(parent_span)
+                or inherited_from_ts is not None
             )
 
         starts = starts_new_transaction(
@@ -169,10 +175,15 @@ class TransactionSpanProcessor(SpanProcessor):
                     if parent_member is not None
                     else (parent_id or span_id)
                 )
+                inherited_name = None
+                # Name from TraceState / attrs without a locally tracked root.
+                if parent_member is None and inherited_from_ts:
+                    inherited_name = inherited_from_ts
                 self._membership[span_id] = TransactionMembership(
                     root_span_id=root_span_id,
                     is_root=False,
                     override_name=None,
+                    inherited_name=inherited_name,
                 )
 
             if self._exporter_shutdown:
@@ -217,6 +228,7 @@ class TransactionSpanProcessor(SpanProcessor):
                 and span.parent.is_valid
                 and span.start_time is not None
                 and span.end_time is not None
+                and self._is_local_parent_locked(trace_id, span.parent.span_id)
             ):
                 self._child_intervals.setdefault(span.parent.span_id, []).append(
                     (span.start_time, span.end_time)
@@ -230,10 +242,9 @@ class TransactionSpanProcessor(SpanProcessor):
 
             still_live = bool(self._live_parents.get(trace_id))
             if still_live:
-                completed_batches = self._extract_completed_local_transactions_locked(
-                    trace_id, flush_leftover=False
-                )
+                completed_batches = self._schedule_nested_completion_locked(trace_id)
             elif self._buffers.get(trace_id):
+                self._cancel_pending_nested_completion_locked(trace_id)
                 completed_batches = self._schedule_completion_locked(trace_id)
             else:
                 completed_batches = []
@@ -376,21 +387,33 @@ class TransactionSpanProcessor(SpanProcessor):
         if timer is not None:
             timer.cancel()
 
+    def _cancel_pending_nested_completion_locked(self, trace_id: int) -> None:
+        timer = self._pending_nested_completions.pop(trace_id, None)
+        if timer is not None:
+            timer.cancel()
+
+    def _is_local_parent_locked(self, trace_id: int, parent_id: int) -> bool:
+        live = self._live_parents.get(trace_id)
+        if live is not None and parent_id in live:
+            return True
+        for span in self._buffers.get(trace_id, []):
+            if span.context is not None and span.context.span_id == parent_id:
+                return True
+        return False
+
     def _flush_pending_completions_locked(self) -> List[List[ReadableSpan]]:
         batches: List[List[ReadableSpan]] = []
         for trace_id in list(self._pending_completions.keys()):
             self._cancel_pending_completion_locked(trace_id)
-            if self._live_parents.get(trace_id):
-                continue
-            batches.extend(
-                self._extract_completed_local_transactions_locked(
-                    trace_id, flush_leftover=True
-                )
-            )
+        for trace_id in list(self._pending_nested_completions.keys()):
+            self._cancel_pending_nested_completion_locked(trace_id)
         for trace_id in list(self._buffers.keys()):
             if self._live_parents.get(trace_id):
-                continue
-            if trace_id in self._pending_completions:
+                batches.extend(
+                    self._extract_completed_local_transactions_locked(
+                        trace_id, flush_leftover=False
+                    )
+                )
                 continue
             batches.extend(
                 self._extract_completed_local_transactions_locked(
@@ -433,6 +456,56 @@ class TransactionSpanProcessor(SpanProcessor):
         timer = threading.Timer(self._completion_holdback_millis / 1000.0, _fire)
         timer.daemon = True
         self._pending_completions[trace_id] = timer
+        timer.start()
+        return []
+
+    def _schedule_nested_completion_locked(
+        self, trace_id: int
+    ) -> List[List[ReadableSpan]]:
+        buffer = self._buffers.get(trace_id, [])
+        live = self._live_parents.get(trace_id, {})
+        if not has_extractable_nested_transaction(buffer=buffer, live=live):
+            self._cancel_pending_nested_completion_locked(trace_id)
+            return []
+        if trace_id in self._pending_nested_completions:
+            return []
+        if self._completion_holdback_millis <= 0:
+            return self._extract_completed_local_transactions_locked(
+                trace_id, flush_leftover=False
+            )
+
+        timer: Optional[threading.Timer] = None
+
+        def _fire() -> None:
+            batches: List[List[ReadableSpan]] = []
+            with self._lock:
+                if self._pending_nested_completions.get(trace_id) is not timer:
+                    return
+                self._pending_nested_completions.pop(trace_id, None)
+                if self._exporter_shutdown:
+                    return
+                if self._live_parents.get(trace_id):
+                    batches = self._extract_completed_local_transactions_locked(
+                        trace_id, flush_leftover=False
+                    )
+                self._pending_finalize += len(batches)
+            for batch in batches:
+                try:
+                    self._accept_completed_trace(batch)
+                finally:
+                    with self._lock:
+                        self._pending_finalize -= 1
+                        self._idle.notify_all()
+            with self._lock:
+                if self._live_parents.get(trace_id) and has_extractable_nested_transaction(
+                    buffer=self._buffers.get(trace_id, []),
+                    live=self._live_parents.get(trace_id, {}),
+                ):
+                    self._schedule_nested_completion_locked(trace_id)
+
+        timer = threading.Timer(self._completion_holdback_millis / 1000.0, _fire)
+        timer.daemon = True
+        self._pending_nested_completions[trace_id] = timer
         timer.start()
         return []
 
