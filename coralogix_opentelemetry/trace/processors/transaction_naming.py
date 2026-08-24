@@ -15,7 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
-from coralogix_opentelemetry.trace.common import CoralogixAttributes
+from coralogix_opentelemetry.trace.common import CoralogixAttributes, CoralogixTraceState
 from coralogix_opentelemetry.trace.processors.span_copy import copy_with_attributes
 from opentelemetry.context import Context
 from opentelemetry.sdk.trace import ReadableSpan, Span
@@ -30,6 +30,7 @@ class TransactionMembership:
     root_span_id: int
     is_root: bool
     override_name: Optional[str] = None
+    inherited_name: Optional[str] = None
 
 
 def starts_new_transaction(
@@ -82,24 +83,53 @@ def apply_on_start_root_flag(span: Span, starts: bool) -> None:
         span.set_attribute(CoralogixAttributes.TRANSACTION_ROOT, True)
 
 
+def parent_transaction_from_tracestate(parent_span: Optional[object]) -> Optional[str]:
+    """Return ``cgx_transaction`` from parent SpanContext TraceState, if any."""
+    if parent_span is None:
+        return None
+    sc = getattr(parent_span, "get_span_context", lambda: None)()
+    if sc is None or not getattr(sc, "is_valid", False):
+        return None
+    trace_state = getattr(sc, "trace_state", None)
+    if trace_state is None:
+        return None
+    value = trace_state.get(CoralogixTraceState.TRANSACTION_IDENTIFIER)
+    if value is None or value == "":
+        return None
+    return str(value)
+
+
 def resolve_batch_transaction_name(
     spans: Sequence[ReadableSpan],
     membership: Mapping[int, TransactionMembership],
 ) -> str:
     """Final transaction name for a completed local-transaction batch."""
     root = _batch_root(spans)
-    if root is None or root.context is None:
-        return spans[0].name if spans else ""
+    if root is not None and root.context is not None:
+        member = membership.get(root.context.span_id)
+        if member is not None and member.override_name:
+            return member.override_name
 
-    member = membership.get(root.context.span_id)
-    if member is not None and member.override_name:
-        return member.override_name
+        attrs = root.attributes or {}
+        preset = attrs.get(CoralogixAttributes.TRANSACTION_IDENTIFIER)
+        if preset is not None:
+            return str(preset)
+        if (root.attributes or {}).get(CoralogixAttributes.TRANSACTION_ROOT):
+            return root.name
 
-    attrs = root.attributes or {}
-    preset = attrs.get(CoralogixAttributes.TRANSACTION_IDENTIFIER)
-    if preset is not None:
-        return str(preset)
-    return root.name
+    # Leftover without ROOT: prefer TraceState-inherited name on any member.
+    for span in spans:
+        if span.context is None:
+            continue
+        member = membership.get(span.context.span_id)
+        if member is not None and member.inherited_name:
+            return member.inherited_name
+        if member is not None and member.override_name:
+            return member.override_name
+
+    if root is not None:
+        return root.name
+    return spans[0].name if spans else ""
 
 
 def stamp_transaction_attributes(

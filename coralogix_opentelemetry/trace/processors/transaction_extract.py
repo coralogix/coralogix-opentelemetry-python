@@ -110,3 +110,47 @@ def extract_completed_local_transactions(
         remaining = []
 
     return batches, remaining
+
+
+def has_extractable_nested_transaction(
+    *,
+    buffer: List[ReadableSpan],
+    live: Dict[int, int],
+) -> bool:
+    """True when a nested root subtree is done while an outer ancestor is live."""
+    if not buffer or not live:
+        return False
+
+    parent_of: Dict[int, int] = {}
+    for span in buffer:
+        if span.context is None:
+            continue
+        if span.parent is not None and span.parent.is_valid:
+            parent_of[span.context.span_id] = span.parent.span_id
+    for span_id, parent_id in live.items():
+        if parent_id:
+            parent_of[span_id] = parent_id
+
+    def under_root(span_id: int, root_id: int) -> bool:
+        cur = span_id
+        seen: Set[int] = set()
+        while cur and cur not in seen:
+            if cur == root_id:
+                return True
+            seen.add(cur)
+            cur = parent_of.get(cur, 0)
+        return False
+
+    def has_live_in_subtree(root_id: int) -> bool:
+        if root_id in live:
+            return True
+        return any(under_root(live_id, root_id) for live_id in live)
+
+    for span in buffer:
+        if span.context is None:
+            continue
+        if not (span.attributes or {}).get(CoralogixAttributes.TRANSACTION_ROOT):
+            continue
+        if not has_live_in_subtree(span.context.span_id):
+            return True
+    return False

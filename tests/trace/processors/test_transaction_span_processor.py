@@ -88,6 +88,43 @@ def test_processor_tags_and_self_duration_without_sampler() -> None:
     meter_provider.shutdown()
 
 
+def test_inherits_transaction_from_parent_tracestate_when_parent_has_no_attributes() -> None:
+    from opentelemetry.trace import SpanContext, TraceFlags, set_span_in_context
+    from opentelemetry.trace.span import NonRecordingSpan, TraceState
+
+    from coralogix_opentelemetry.trace.common import CoralogixTraceState
+
+    resource = Resource.create({"service.name": "test"})
+    exporter = ListSpanExporter()
+    provider = TracerProvider(resource=resource)
+    provider.add_span_processor(
+        TransactionSpanProcessor(exporter, completion_holdback_millis=0, max_regular_traces=0)
+    )
+    tracer = provider.get_tracer("test")
+
+    parent_sc = SpanContext(
+        trace_id=0x1,
+        span_id=0x1,
+        is_remote=False,
+        trace_flags=TraceFlags(0x01),
+        trace_state=TraceState(
+            [(CoralogixTraceState.TRANSACTION_IDENTIFIER, "from-tracestate")]
+        ),
+    )
+    parent_ctx = set_span_in_context(NonRecordingSpan(parent_sc))
+    with tracer.start_as_current_span(
+        "internal-child", kind=SpanKind.INTERNAL, context=parent_ctx
+    ):
+        pass
+
+    provider.force_flush()
+    assert len(exporter.spans) == 1
+    child = exporter.spans[0]
+    assert child.attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER] == "from-tracestate"
+    assert CoralogixAttributes.TRANSACTION_ROOT not in (child.attributes or {})
+    provider.shutdown()  # type: ignore[no-untyped-call]
+
+
 def test_transaction_name_uses_final_root_name_after_update_name() -> None:
     """Express-style rename: early name must not freeze cgx.transaction."""
     exporter = ListSpanExporter()
