@@ -497,7 +497,9 @@ class TransactionSpanProcessor(SpanProcessor):
                         self._pending_finalize -= 1
                         self._idle.notify_all()
             with self._lock:
-                if self._live_parents.get(trace_id) and has_extractable_nested_transaction(
+                if self._live_parents.get(
+                    trace_id
+                ) and has_extractable_nested_transaction(
                     buffer=self._buffers.get(trace_id, []),
                     live=self._live_parents.get(trace_id, {}),
                 ):

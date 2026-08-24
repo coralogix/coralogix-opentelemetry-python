@@ -15,7 +15,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
-from coralogix_opentelemetry.trace.common import CoralogixAttributes, CoralogixTraceState
+from coralogix_opentelemetry.trace.common import (
+    CoralogixAttributes,
+    CoralogixTraceState,
+)
 from coralogix_opentelemetry.trace.processors.span_copy import copy_with_attributes
 from opentelemetry.context import Context
 from opentelemetry.sdk.trace import ReadableSpan, Span
