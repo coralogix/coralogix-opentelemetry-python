@@ -88,7 +88,9 @@ def test_processor_tags_and_self_duration_without_sampler() -> None:
     meter_provider.shutdown()
 
 
-def test_inherits_transaction_from_parent_tracestate_when_parent_has_no_attributes() -> None:
+def test_inherits_transaction_from_parent_tracestate_when_parent_has_no_attributes() -> (
+    None
+):
     from opentelemetry.trace import SpanContext, TraceFlags, set_span_in_context
     from opentelemetry.trace.span import NonRecordingSpan, TraceState
 
@@ -98,7 +100,9 @@ def test_inherits_transaction_from_parent_tracestate_when_parent_has_no_attribut
     exporter = ListSpanExporter()
     provider = TracerProvider(resource=resource)
     provider.add_span_processor(
-        TransactionSpanProcessor(exporter, completion_holdback_millis=0, max_regular_traces=0)
+        TransactionSpanProcessor(
+            exporter, completion_holdback_millis=0, max_regular_traces=0
+        )
     )
     tracer = provider.get_tracer("test")
 
@@ -120,7 +124,10 @@ def test_inherits_transaction_from_parent_tracestate_when_parent_has_no_attribut
     provider.force_flush()
     assert len(exporter.spans) == 1
     child = exporter.spans[0]
-    assert child.attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER] == "from-tracestate"
+    assert (
+        child.attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER]
+        == "from-tracestate"
+    )
     assert CoralogixAttributes.TRANSACTION_ROOT not in (child.attributes or {})
     provider.shutdown()  # type: ignore[no-untyped-call]
 
