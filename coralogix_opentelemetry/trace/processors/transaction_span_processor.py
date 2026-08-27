@@ -44,7 +44,10 @@ from coralogix_opentelemetry.trace.processors.defaults import (
 from coralogix_opentelemetry.trace.processors.holdback_scheduler import (
     HoldbackScheduler,
 )
-from coralogix_opentelemetry.trace.processors.trace_heap import select_slowest_spans
+from coralogix_opentelemetry.trace.processors.trace_heap import (
+    reparent_to_kept_ancestors,
+    select_slowest_spans,
+)
 from coralogix_opentelemetry.trace.processors.transaction_extract import (
     extract_completed_local_transactions,
     has_extractable_nested_transaction,
@@ -505,11 +508,14 @@ class TransactionSpanProcessor(SpanProcessor):
         for span in open_spans:
             if span.context is not None and span.context.span_id in ancestor_ids:
                 kept_ids.add(span.context.span_id)
-        kept_open = [
+        # Rebuild from originals then reparent so an ended child whose parent
+        # was evicted does not keep a dangling parent id in the live buffer.
+        raw_kept = [
             span
             for span in open_spans
             if span.context is not None and span.context.span_id in kept_ids
         ]
+        kept_open = reparent_to_kept_ancestors(raw_kept, all_spans=open_spans)
         dropped = [
             span
             for span in open_spans
