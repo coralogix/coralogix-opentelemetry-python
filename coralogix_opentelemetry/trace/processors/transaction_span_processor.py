@@ -171,7 +171,6 @@ class TransactionSpanProcessor(SpanProcessor):
         self._lock = threading.Lock()
         self._export_lock = threading.Lock()
         self._idle = threading.Condition(self._lock)
-        self._holdback.restart_after_fork()
         self._finalize_queue = queue.Queue(maxsize=DEFAULT_MAX_FINALIZE_QUEUE)
         self._finalize_stop = threading.Event()
         self._pending_finalize = 0
@@ -195,6 +194,7 @@ class TransactionSpanProcessor(SpanProcessor):
         self._shutdown_done = threading.Event()
         if not self._exporter_shutdown:
             self._stopped = False
+            self._holdback.restart_after_fork()
             self._start_finalize_worker()
 
     def on_start(self, span: Span, parent_context: Optional[Context] = None) -> None:
@@ -602,6 +602,11 @@ class TransactionSpanProcessor(SpanProcessor):
                     sid = span.context.span_id
                     if sid in recorded_ids and sid not in self._pending_drop_metrics:
                         self._child_intervals.pop(sid, None)
+                        self._forget_span_locked(sid)
+                        self._evicted_from_buffer.get(trace_id, set()).discard(sid)
+                        trace_ids = self._trace_span_ids.get(trace_id)
+                        if trace_ids is not None:
+                            trace_ids.discard(sid)
 
     def _forget_span_locked(self, span_id: int) -> None:
         """Drop side-table rows for a span that will not be exported."""
