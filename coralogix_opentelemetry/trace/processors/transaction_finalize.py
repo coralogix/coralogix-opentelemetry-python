@@ -30,13 +30,17 @@ def annotate_completed_batch(
     child_intervals: Dict[int, List[Tuple[int, int]]],
     membership: Dict[int, TransactionMembership],
     self_duration_hist: Histogram,
+    transaction_name: Optional[str] = None,
 ) -> List[ReadableSpan]:
     """Stamp final txn name, exclusive self-duration, and record the histogram.
 
     Order matters: transaction attrs are stamped first so metric labels see the
     final ``cgx.transaction`` value (not an early start-time name).
+
+    ``transaction_name`` overrides name resolution (used when recording metrics
+    for live-buffer evictions that do not include the transaction root span).
     """
-    txn_name = resolve_batch_transaction_name(spans, membership)
+    txn_name = transaction_name or resolve_batch_transaction_name(spans, membership)
     named = stamp_transaction_attributes(spans, txn_name)
     return _annotate_with_self_duration_and_metrics(
         named, child_intervals, self_duration_hist

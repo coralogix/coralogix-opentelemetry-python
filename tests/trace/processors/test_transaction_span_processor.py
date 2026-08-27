@@ -295,6 +295,105 @@ def test_live_buffer_trimmed_while_root_still_open() -> None:
     provider.shutdown()  # type: ignore[no-untyped-call]
 
 
+def test_live_buffer_trimmed_after_root_ends_with_async_child() -> None:
+    """Ended root plus async live child must still cap the buffer."""
+    exporter = ListSpanExporter()
+    processor = TransactionSpanProcessor(
+        exporter, max_nodes=3, completion_holdback_millis=0
+    )
+    provider = TracerProvider()
+    provider.add_span_processor(processor)
+    tracer = provider.get_tracer("test")
+
+    root = tracer.start_span("root", kind=SpanKind.SERVER)
+    root_ctx = trace.set_span_in_context(root)
+    late = tracer.start_span("late", context=root_ctx)
+    root.end()
+    # Root ended; late still live. Extra siblings must not freeze uncapped.
+    for i in range(8):
+        child = tracer.start_span("c{}".format(i), context=root_ctx)
+        child.end()
+    trace_id = root.get_span_context().trace_id
+    with processor._lock:
+        buffered = processor._buffers.get(trace_id, [])
+        assert len(buffered) <= 3
+        assert any(span.name == "root" for span in buffered)
+    late.end()
+    provider.force_flush()
+    assert "root" in {span.name for span in exporter.spans}
+    provider.shutdown()  # type: ignore[no-untyped-call]
+
+
+def test_live_buffer_eviction_metrics_use_root_transaction_name() -> None:
+    resource = Resource.create({"service.name": "test"})
+    exporter = ListSpanExporter()
+    reader = InMemoryMetricReader()
+    meter_provider = MeterProvider(resource=resource, metric_readers=[reader])
+    processor = TransactionSpanProcessor(
+        exporter,
+        max_nodes=2,
+        completion_holdback_millis=0,
+        meter_provider=meter_provider,
+    )
+    provider = TracerProvider(resource=resource)
+    provider.add_span_processor(processor)
+    tracer = provider.get_tracer("test")
+
+    root = tracer.start_span("root-txn", kind=SpanKind.SERVER)
+    root_ctx = trace.set_span_in_context(root)
+    for i in range(6):
+        tracer.start_span("leaf-{}".format(i), context=root_ctx).end()
+    root.end()
+    provider.force_flush()
+    meter_provider.force_flush()
+
+    txn_names = set()
+    for rm in reader.get_metrics_data().resource_metrics:
+        for sm in rm.scope_metrics:
+            for metric in sm.metrics:
+                if metric.name != METRIC_SELF_DURATION:
+                    continue
+                for point in metric.data.data_points:
+                    txn_names.add(
+                        dict(point.attributes).get(
+                            CoralogixAttributes.TRANSACTION_IDENTIFIER
+                        )
+                    )
+    assert "root-txn" in txn_names
+    assert "leaf-0" not in txn_names
+    provider.shutdown()  # type: ignore[no-untyped-call]
+    meter_provider.shutdown()
+
+
+def test_live_buffer_keeps_ancestor_of_live_child() -> None:
+    exporter = ListSpanExporter()
+    processor = TransactionSpanProcessor(
+        exporter, max_nodes=2, completion_holdback_millis=0
+    )
+    provider = TracerProvider()
+    provider.add_span_processor(processor)
+    tracer = provider.get_tracer("test")
+
+    root = tracer.start_span("root", kind=SpanKind.SERVER)
+    root_ctx = trace.set_span_in_context(root)
+    mid = tracer.start_span("mid", context=root_ctx)
+    mid_ctx = trace.set_span_in_context(mid)
+    leaf = tracer.start_span("leaf", context=mid_ctx)
+    mid.end()
+    # Fill buffer with short siblings so mid would be eviction-prone without protect.
+    for i in range(6):
+        tracer.start_span("sib-{}".format(i), context=root_ctx).end()
+    mid_id = mid.get_span_context().span_id
+    with processor._lock:
+        assert mid_id in processor._membership
+    leaf.end()
+    root.end()
+    provider.force_flush()
+    names = {span.name for span in exporter.spans}
+    assert "root" in names
+    provider.shutdown()  # type: ignore[no-untyped-call]
+
+
 def test_preset_template_name_different_from_span_name_is_override() -> None:
     exporter = ListSpanExporter()
     provider = TracerProvider()
