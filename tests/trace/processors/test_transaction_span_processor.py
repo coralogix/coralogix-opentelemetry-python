@@ -553,6 +553,86 @@ def test_live_buffer_applies_max_nodes_per_open_transaction() -> None:
     provider.shutdown()  # type: ignore[no-untyped-call]
 
 
+def test_live_buffer_releases_side_tables_after_trace_completes() -> None:
+    exporter = ListSpanExporter()
+    processor = TransactionSpanProcessor(
+        exporter, max_nodes=2, completion_holdback_millis=0
+    )
+    provider = TracerProvider()
+    provider.add_span_processor(processor)
+    tracer = provider.get_tracer("test")
+
+    root = tracer.start_span("root", kind=SpanKind.SERVER)
+    root_ctx = trace.set_span_in_context(root)
+    for i in range(8):
+        tracer.start_span("c{}".format(i), context=root_ctx).end()
+    trace_id = root.get_span_context().trace_id
+    with processor._lock:
+        assert processor._trace_span_ids.get(trace_id)
+    root.end()
+    provider.force_flush()
+    with processor._lock:
+        assert trace_id not in processor._trace_span_ids
+        assert not any(
+            ctx.trace_id == trace_id for ctx in processor._span_contexts.values()
+        )
+    provider.shutdown()  # type: ignore[no-untyped-call]
+
+
+def test_live_buffer_defers_metrics_until_live_child_ends() -> None:
+    resource = Resource.create({"service.name": "test"})
+    exporter = ListSpanExporter()
+    reader = InMemoryMetricReader()
+    meter_provider = MeterProvider(resource=resource, metric_readers=[reader])
+    processor = TransactionSpanProcessor(
+        exporter,
+        max_nodes=2,
+        completion_holdback_millis=0,
+        meter_provider=meter_provider,
+    )
+    provider = TracerProvider(resource=resource)
+    provider.add_span_processor(processor)
+    tracer = provider.get_tracer("test")
+
+    root = tracer.start_span("root", kind=SpanKind.SERVER)
+    root_ctx = trace.set_span_in_context(root)
+    mid = tracer.start_span("mid", context=root_ctx)
+    mid_ctx = trace.set_span_in_context(mid)
+    leaf = tracer.start_span("leaf", context=mid_ctx)
+    mid.end()  # short mid; leaf stays live
+    # Longer siblings displace mid while leaf is still live.
+    for i in range(8):
+        child = tracer.start_span("sib-{}".format(i), context=root_ctx)
+        time.sleep(0.01)
+        child.end()
+    mid_id = mid.get_span_context().span_id
+    with processor._lock:
+        assert mid_id in processor._pending_drop_metrics
+    time.sleep(0.02)
+    leaf.end()
+    root.end()
+    provider.force_flush()
+    meter_provider.force_flush()
+
+    with processor._lock:
+        assert mid_id not in processor._pending_drop_metrics
+
+    mid_points = []
+    for rm in reader.get_metrics_data().resource_metrics:
+        for sm in rm.scope_metrics:
+            for metric in sm.metrics:
+                if metric.name != METRIC_SELF_DURATION:
+                    continue
+                for point in metric.data.data_points:
+                    if dict(point.attributes).get("span.name") == "mid":
+                        mid_points.append(point)
+    assert mid_points
+    # Child leaf outlived mid; exclusive self-duration must exclude that overlap.
+    assert mid_points[0].sum < 0.02
+    provider.shutdown()  # type: ignore[no-untyped-call]
+    meter_provider.shutdown()
+
+
 def test_preset_template_name_different_from_span_name_is_override() -> None:
     exporter = ListSpanExporter()
     provider = TracerProvider()
