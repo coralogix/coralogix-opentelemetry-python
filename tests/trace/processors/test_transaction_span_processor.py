@@ -394,6 +394,46 @@ def test_live_buffer_keeps_ancestor_of_live_child() -> None:
     provider.shutdown()  # type: ignore[no-untyped-call]
 
 
+def test_live_buffer_reparents_when_ended_parent_evicted() -> None:
+    """After a live child ends, its parent can be evicted; re-link survivors."""
+    exporter = ListSpanExporter()
+    processor = TransactionSpanProcessor(
+        exporter, max_nodes=2, completion_holdback_millis=0
+    )
+    provider = TracerProvider()
+    provider.add_span_processor(processor)
+    tracer = provider.get_tracer("test")
+
+    root = tracer.start_span("root", kind=SpanKind.SERVER)
+    root_ctx = trace.set_span_in_context(root)
+    root_id = root.get_span_context().span_id
+    mid = tracer.start_span("mid", context=root_ctx)
+    mid_ctx = trace.set_span_in_context(mid)
+    leaf = tracer.start_span("leaf", context=mid_ctx)
+    time.sleep(0.03)
+    mid.end()
+    leaf.end()
+    # Longer siblings displace the short mid while leaf may remain.
+    for i in range(8):
+        child = tracer.start_span("sib-{}".format(i), context=root_ctx)
+        time.sleep(0.01)
+        child.end()
+
+    trace_id = root.get_span_context().trace_id
+    with processor._lock:
+        buffered = processor._buffers.get(trace_id, [])
+        by_name = {span.name: span for span in buffered if span.context is not None}
+        assert "leaf" in by_name
+        assert "mid" not in by_name
+        leaf_span = by_name["leaf"]
+        assert leaf_span.parent is not None
+        assert leaf_span.parent.span_id == root_id
+
+    root.end()
+    provider.force_flush()
+    provider.shutdown()  # type: ignore[no-untyped-call]
+
+
 def test_preset_template_name_different_from_span_name_is_override() -> None:
     exporter = ListSpanExporter()
     provider = TracerProvider()

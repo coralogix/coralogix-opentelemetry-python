@@ -2,12 +2,55 @@
 
 from __future__ import annotations
 
-from typing import Mapping, Optional
+from typing import Any, Mapping, Optional
 
 from opentelemetry.sdk.resources import Resource
-from opentelemetry.sdk.trace import ReadableSpan
+from opentelemetry.sdk.trace import BoundedAttributes, ReadableSpan
 from opentelemetry.trace import SpanContext, Status, StatusCode
 from opentelemetry.util.types import AttributeValue
+
+
+def _passthrough_attributes(span: ReadableSpan) -> Any:
+    # Prefer the SDK's BoundedAttributes so dropped_attributes survives the copy.
+    internal = getattr(span, "_attributes", None)
+    if internal is not None:
+        return internal
+    return span.attributes
+
+
+def _passthrough_events(span: ReadableSpan) -> Any:
+    # span.events returns a tuple; _events keeps BoundedList.dropped.
+    internal = getattr(span, "_events", None)
+    if internal is not None:
+        return internal
+    return span.events
+
+
+def _passthrough_links(span: ReadableSpan) -> Any:
+    internal = getattr(span, "_links", None)
+    if internal is not None:
+        return internal
+    return span.links
+
+
+def _attributes_preserving_dropped(
+    span: ReadableSpan, attributes: Mapping[str, AttributeValue]
+) -> Any:
+    """Rebuild attributes while keeping the original dropped-attribute count."""
+    original = getattr(span, "_attributes", None)
+    if not isinstance(original, BoundedAttributes):
+        return dict(attributes)
+    rebuilt = BoundedAttributes(
+        maxlen=original.maxlen,
+        attributes=None,
+        immutable=False,
+        max_value_len=original.max_value_len,
+    )
+    rebuilt.dropped = original.dropped
+    for key, value in attributes.items():
+        rebuilt[key] = value
+    rebuilt._immutable = True
+    return rebuilt
 
 
 def copy_with_parent(span: ReadableSpan, parent: Optional[SpanContext]) -> ReadableSpan:
@@ -16,9 +59,9 @@ def copy_with_parent(span: ReadableSpan, parent: Optional[SpanContext]) -> Reada
         context=span.context,
         parent=parent,
         resource=span.resource if span.resource is not None else Resource.create({}),
-        attributes=dict(span.attributes or {}),
-        events=span.events,
-        links=span.links,
+        attributes=_passthrough_attributes(span),
+        events=_passthrough_events(span),
+        links=_passthrough_links(span),
         kind=span.kind,
         status=span.status if span.status is not None else Status(StatusCode.UNSET),
         start_time=span.start_time,
@@ -35,9 +78,9 @@ def copy_with_attributes(
         context=span.context,
         parent=span.parent,
         resource=span.resource if span.resource is not None else Resource.create({}),
-        attributes=dict(attributes),
-        events=span.events,
-        links=span.links,
+        attributes=_attributes_preserving_dropped(span, attributes),
+        events=_passthrough_events(span),
+        links=_passthrough_links(span),
         kind=span.kind,
         status=span.status if span.status is not None else Status(StatusCode.UNSET),
         start_time=span.start_time,
