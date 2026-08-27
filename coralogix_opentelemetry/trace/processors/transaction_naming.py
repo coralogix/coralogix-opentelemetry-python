@@ -34,6 +34,8 @@ class TransactionMembership:
     is_root: bool
     override_name: Optional[str] = None
     inherited_name: Optional[str] = None
+    # Span name observed at on_start (before framework update_name).
+    start_name: Optional[str] = None
 
 
 def starts_new_transaction(
@@ -74,10 +76,16 @@ def parent_has_transaction_attrs(parent_span: Optional[object]) -> bool:
 
 
 def preset_transaction_name(span: Span) -> Optional[str]:
-    """Return an explicit ``cgx.transaction`` already on the span, if any."""
+    """Return a ``cgx.transaction`` already on the span, if any."""
     attrs = getattr(span, "attributes", None)
     value = _attr_get(attrs, CoralogixAttributes.TRANSACTION_IDENTIFIER.value)
     return str(value) if value is not None else None
+
+
+def explicit_transaction_override(span: object) -> bool:
+    """True when ``start_new_transaction`` marked this span's name as explicit."""
+    attrs = getattr(span, "attributes", None)
+    return _attr_get(attrs, CoralogixAttributes.TRANSACTION_EXPLICIT.value) is True
 
 
 def apply_on_start_root_flag(span: Span, starts: bool) -> None:
@@ -115,18 +123,38 @@ def resolve_batch_transaction_name(
     spans: Sequence[ReadableSpan],
     membership: Mapping[int, TransactionMembership],
 ) -> str:
-    """Final transaction name for a completed local-transaction batch."""
+    """Final transaction name for a completed local-transaction batch.
+
+    Prefer an explicit ``start_new_transaction`` / route-template override.
+    Sampler-injected ``cgx.transaction`` that merely echoed the on_start span
+    name is ignored so ``update_name`` can still supply the final name.
+    """
     root = _batch_root(spans)
     if root is not None and root.context is not None:
+        if explicit_transaction_override(root):
+            preset = (root.attributes or {}).get(
+                CoralogixAttributes.TRANSACTION_IDENTIFIER
+            )
+            if preset is not None:
+                return str(preset)
+
         member = membership.get(root.context.span_id)
         if member is not None and member.override_name:
             return member.override_name
 
         attrs = root.attributes or {}
         preset = attrs.get(CoralogixAttributes.TRANSACTION_IDENTIFIER)
-        if preset is not None:
+        if (
+            member is not None
+            and preset is not None
+            and member.start_name is not None
+            and str(preset) != member.start_name
+        ):
             return str(preset)
-        if (root.attributes or {}).get(CoralogixAttributes.TRANSACTION_ROOT):
+
+        if attrs.get(CoralogixAttributes.TRANSACTION_ROOT) or (
+            member is not None and member.is_root
+        ):
             return root.name
 
     # Leftover without ROOT: prefer TraceState-inherited name on any member.
@@ -152,6 +180,8 @@ def stamp_transaction_attributes(
     stamped: list[ReadableSpan] = []
     for span in spans:
         attrs: Dict[str, AttributeValue] = dict(span.attributes or {})
+        attrs.pop(CoralogixAttributes.TRANSACTION_EXPLICIT, None)
+        attrs.pop(CoralogixAttributes.TRANSACTION_EXPLICIT.value, None)
         attrs[CoralogixAttributes.TRANSACTION_IDENTIFIER] = transaction_name
         if attrs.get(CoralogixAttributes.TRANSACTION_ROOT):
             attrs[CoralogixAttributes.TRANSACTION_ROOT] = True
