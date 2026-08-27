@@ -171,9 +171,6 @@ class TransactionSpanProcessor(SpanProcessor):
         apply_on_start_root_flag(span, starts)
         start_name = span.name
         preset = preset_transaction_name(span)
-        # Sampler echoes start name into cgx.transaction; only treat a pre-set
-        # value as override when it differs (route template / explicit rename).
-        override = preset if (preset is not None and preset != start_name) else None
 
         trace_id = span.context.trace_id
         span_id = span.context.span_id
@@ -191,6 +188,26 @@ class TransactionSpanProcessor(SpanProcessor):
                 and trace_id not in self._buffers
             ):
                 return
+
+            # Sampler echoes start name or copies the outer txn onto nested
+            # SERVER/CONSUMER roots; only a differing non-inherited preset is
+            # an override (route template / explicit rename).
+            override = None
+            if preset is not None and preset != start_name:
+                parent_txn = None
+                if parent_member is not None:
+                    parent_txn = (
+                        parent_member.override_name
+                        or parent_member.inherited_name
+                        or parent_member.start_name
+                    )
+                elif inherited_from_ts is not None:
+                    parent_txn = inherited_from_ts
+                else:
+                    parent_txn = parent_transaction_from_attrs(parent_span)
+                if not (starts and parent_txn is not None and preset == parent_txn):
+                    override = preset
+
             if starts:
                 self._membership[span_id] = TransactionMembership(
                     root_span_id=span_id,
@@ -249,11 +266,22 @@ class TransactionSpanProcessor(SpanProcessor):
                     and member.start_name is not None
                     and str(preset) != member.start_name
                 ):
-                    # Template / late attr different from the on_start name.
-                    member.override_name = str(preset)
+                    parent_txn = None
+                    if span.parent is not None and span.parent.is_valid:
+                        parent_member = self._membership.get(span.parent.span_id)
+                        if parent_member is not None:
+                            parent_txn = (
+                                parent_member.override_name
+                                or parent_member.inherited_name
+                                or parent_member.start_name
+                            )
+                    # Ignore sampler copy of the outer txn onto a nested root.
+                    if parent_txn is None or str(preset) != parent_txn:
+                        member.override_name = str(preset)
 
         trace_id = span.context.trace_id
         completed_batches: List[List[ReadableSpan]] = []
+        dropped_for_metrics: List[ReadableSpan] = []
         with self._lock:
             if self._exporter_shutdown:
                 return
@@ -280,6 +308,9 @@ class TransactionSpanProcessor(SpanProcessor):
             still_live = bool(self._live_parents.get(trace_id))
             if still_live:
                 completed_batches = self._schedule_nested_completion_locked(trace_id)
+                # Bound ended spans under live roots so one long-lived root
+                # cannot grow `_buffers` without limit before max_nodes trim.
+                dropped_for_metrics = self._trim_live_buffer_locked(trace_id)
             elif self._buffers.get(trace_id):
                 self._cancel_pending_nested_completion_locked(trace_id)
                 completed_batches = self._schedule_completion_locked(trace_id)
@@ -289,6 +320,8 @@ class TransactionSpanProcessor(SpanProcessor):
             self._pending_finalize += len(completed_batches)
             if self._total_live_locked() == 0 and self._pending_finalize == 0:
                 self._idle.notify_all()
+        if dropped_for_metrics:
+            self._record_metrics_for_dropped_spans(dropped_for_metrics)
         # Always queue finalize/export (including zero-holdback) so Span.end
         # never blocks on a slow exporter and the bounded backlog applies.
         self._dispatch_accept_completed(completed_batches)
@@ -305,6 +338,109 @@ class TransactionSpanProcessor(SpanProcessor):
             with self._lock:
                 self._pending_finalize -= 1
                 self._idle.notify_all()
+
+    def _record_metrics_for_dropped_spans(self, spans: Sequence[ReadableSpan]) -> None:
+        """Record self-duration metrics for spans evicted before export."""
+        try:
+            with self._lock:
+                interval_snapshot: Dict[int, List[Tuple[int, int]]] = {
+                    span.context.span_id: list(
+                        self._child_intervals.get(span.context.span_id, [])
+                    )
+                    for span in spans
+                    if span.context is not None
+                }
+                membership_snapshot = {
+                    span.context.span_id: self._membership[span.context.span_id]
+                    for span in spans
+                    if span.context is not None
+                    and span.context.span_id in self._membership
+                }
+            annotate_completed_batch(
+                spans,
+                child_intervals=interval_snapshot,
+                membership=membership_snapshot,
+                self_duration_hist=self._self_duration_hist,
+            )
+        except Exception:
+            _LOG.exception(
+                "TransactionSpanProcessor failed while recording metrics for "
+                "live-buffer overflow spans"
+            )
+        finally:
+            with self._lock:
+                for span in spans:
+                    if span.context is not None:
+                        self._child_intervals.pop(span.context.span_id, None)
+                        self._membership.pop(span.context.span_id, None)
+
+    def _trim_live_buffer_locked(self, trace_id: int) -> List[ReadableSpan]:
+        """Evict surplus ended spans under live roots; return them for metrics.
+
+        Nested completed subtrees waiting on holdback stay untouched. Only spans
+        belonging to still-open transaction roots are subject to ``max_nodes``.
+        Caller must hold ``_lock``.
+        """
+        if self._max_nodes <= 0:
+            return []
+        buf = self._buffers.get(trace_id)
+        if buf is None or len(buf) <= self._max_nodes:
+            return []
+
+        live = self._live_parents.get(trace_id) or {}
+        live_root_ids = set()
+        for span_id in live:
+            member = self._membership.get(span_id)
+            if member is not None and member.is_root:
+                live_root_ids.add(span_id)
+        frozen: List[ReadableSpan] = []
+        open_spans: List[ReadableSpan] = []
+        for span in buf:
+            if span.context is None:
+                continue
+            member = self._membership.get(span.context.span_id)
+            root_id = (
+                member.root_span_id if member is not None else span.context.span_id
+            )
+            if root_id in live or root_id in live_root_ids:
+                open_spans.append(span)
+            else:
+                frozen.append(span)
+
+        reserve = max(1, len(live_root_ids))
+        child_cap = max(0, self._max_nodes - reserve)
+        if len(open_spans) <= child_cap:
+            return []
+
+        protect: List[str] = []
+        for span in open_spans:
+            if span.context is None:
+                continue
+            member = self._membership.get(span.context.span_id)
+            if member is not None and member.is_root:
+                protect.append(format_span_id(span.context.span_id))
+        kept_open = select_slowest_spans(
+            open_spans,
+            max_nodes=max(child_cap, len(protect)),
+            root_span_ids=protect,
+        )
+        kept_ids = {
+            span.context.span_id for span in kept_open if span.context is not None
+        }
+        dropped = [
+            span
+            for span in open_spans
+            if span.context is not None and span.context.span_id not in kept_ids
+        ]
+        self._buffers[trace_id] = frozen + kept_open
+        if dropped:
+            _LOG.error(
+                "TransactionSpanProcessor live buffer over max_nodes=%d; "
+                "dropping %d ended span(s) under live root(s)",
+                self._max_nodes,
+                len(dropped),
+            )
+        return dropped
 
     def _abandon_completed_batch(
         self, batch: Sequence[ReadableSpan], *, adjust_pending: bool = True
