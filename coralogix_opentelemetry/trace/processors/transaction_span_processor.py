@@ -82,6 +82,9 @@ _HOLD_NESTED = "nested"
 DEFAULT_MAX_FINALIZE_QUEUE = 256
 # Cap batches retained across timed-out force_flush calls (same order as the queue).
 DEFAULT_MAX_DEFERRED_FINALIZE = DEFAULT_MAX_FINALIZE_QUEUE
+# Full dropped spans wait for a root's final name only up to this cap. Overflow
+# is recorded immediately with the root's start name to keep memory bounded.
+DEFAULT_MAX_DEFERRED_DROP_METRICS = DEFAULT_MAX_FINALIZE_QUEUE
 
 
 class TransactionSpanProcessor(SpanProcessor):
@@ -532,14 +535,30 @@ class TransactionSpanProcessor(SpanProcessor):
                     name = self._metrics_transaction_name_locked(trace_id, root_id)
                     if name is None:
                         # Root still open without a final/override name — wait.
+                        overflow: List[ReadableSpan] = []
                         for span in group:
                             if span.context is None:
                                 continue
                             sid = span.context.span_id
+                            if (
+                                len(self._pending_drop_metrics)
+                                >= DEFAULT_MAX_DEFERRED_DROP_METRICS
+                            ):
+                                overflow.append(span)
+                                continue
                             self._pending_drop_metrics[sid] = span
                             self._pending_drop_waiters.setdefault(sid, set()).add(
                                 root_id
                             )
+                        if overflow:
+                            root_member = self._membership.get(root_id)
+                            group_names[root_id] = (
+                                root_member.start_name
+                                if root_member is not None
+                                and root_member.start_name is not None
+                                else overflow[0].name
+                            )
+                            annotate_groups[root_id] = overflow
                         continue
                     group_names[root_id] = name
                     annotate_groups[root_id] = group
