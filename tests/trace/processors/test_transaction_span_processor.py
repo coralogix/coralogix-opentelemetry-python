@@ -434,6 +434,125 @@ def test_live_buffer_reparents_when_ended_parent_evicted() -> None:
     provider.shutdown()  # type: ignore[no-untyped-call]
 
 
+def test_live_buffer_does_not_retain_unbounded_ancestor_chain() -> None:
+    """Long async parent chains must not expand the buffer past max_nodes."""
+    exporter = ListSpanExporter()
+    processor = TransactionSpanProcessor(
+        exporter, max_nodes=3, completion_holdback_millis=0
+    )
+    provider = TracerProvider()
+    provider.add_span_processor(processor)
+    tracer = provider.get_tracer("test")
+
+    root = tracer.start_span("root", kind=SpanKind.SERVER)
+    parent_ctx = trace.set_span_in_context(root)
+    tip = tracer.start_span("tip-0", context=parent_ctx)
+    for i in range(12):
+        ended = tip
+        ended.end()
+        parent_ctx = trace.set_span_in_context(ended)
+        tip = tracer.start_span("tip-{}".format(i + 1), context=parent_ctx)
+
+    trace_id = root.get_span_context().trace_id
+    with processor._lock:
+        buffered = processor._buffers.get(trace_id, [])
+        assert len(buffered) <= 3
+
+    tip.end()
+    root.end()
+    provider.force_flush()
+    provider.shutdown()  # type: ignore[no-untyped-call]
+
+
+def test_live_buffer_protects_start_new_transaction_root() -> None:
+    exporter = ListSpanExporter()
+    processor = TransactionSpanProcessor(
+        exporter, max_nodes=2, completion_holdback_millis=0
+    )
+    provider = TracerProvider()
+    provider.add_span_processor(processor)
+    tracer = provider.get_tracer("test")
+
+    outer = tracer.start_span("outer", kind=SpanKind.SERVER)
+    outer_ctx = trace.set_span_in_context(outer)
+    nested = tracer.start_span("nested", context=outer_ctx)
+    start_new_transaction(nested, "fulfill")
+    nested_ctx = trace.set_span_in_context(nested)
+    child = tracer.start_span("child", context=nested_ctx)
+    nested.end()
+    for i in range(8):
+        tracer.start_span("outer-sib-{}".format(i), context=outer_ctx).end()
+    nested_id = nested.get_span_context().span_id
+    with processor._lock:
+        buffered = processor._buffers.get(outer.get_span_context().trace_id, [])
+        assert any(
+            span.context is not None and span.context.span_id == nested_id
+            for span in buffered
+        )
+    child.end()
+    outer.end()
+    provider.force_flush()
+    fulfill = [
+        span
+        for span in exporter.spans
+        if (span.attributes or {}).get(CoralogixAttributes.TRANSACTION_IDENTIFIER)
+        == "fulfill"
+    ]
+    assert fulfill
+    assert any(
+        (span.attributes or {}).get(CoralogixAttributes.TRANSACTION_ROOT)
+        for span in fulfill
+    )
+    provider.shutdown()  # type: ignore[no-untyped-call]
+
+
+def test_live_buffer_applies_max_nodes_per_open_transaction() -> None:
+    exporter = ListSpanExporter()
+    processor = TransactionSpanProcessor(
+        exporter, max_nodes=3, completion_holdback_millis=0
+    )
+    provider = TracerProvider()
+    provider.add_span_processor(processor)
+    tracer = provider.get_tracer("test")
+
+    outer = tracer.start_span("outer", kind=SpanKind.SERVER)
+    outer_ctx = trace.set_span_in_context(outer)
+    nested = tracer.start_span("nested", context=outer_ctx)
+    start_new_transaction(nested, "inner-txn")
+    nested_ctx = trace.set_span_in_context(nested)
+    # Two open transactions, each with many ended children.
+    for i in range(6):
+        tracer.start_span("outer-c{}".format(i), context=outer_ctx).end()
+        tracer.start_span("inner-c{}".format(i), context=nested_ctx).end()
+
+    trace_id = outer.get_span_context().trace_id
+    with processor._lock:
+        buffered = processor._buffers.get(trace_id, [])
+        outer_id = outer.get_span_context().span_id
+        nested_id = nested.get_span_context().span_id
+        outer_spans = []
+        nested_spans = []
+        for span in buffered:
+            if span.context is None:
+                continue
+            member = processor._membership.get(span.context.span_id)
+            root_id = (
+                member.root_span_id if member is not None else span.context.span_id
+            )
+            if root_id == nested_id:
+                nested_spans.append(span)
+            elif root_id == outer_id:
+                outer_spans.append(span)
+        # Each open txn keeps up to max_nodes-1 ended spans (1 reserved for live root).
+        assert len(outer_spans) <= 2
+        assert len(nested_spans) <= 2
+
+    nested.end()
+    outer.end()
+    provider.force_flush()
+    provider.shutdown()  # type: ignore[no-untyped-call]
+
+
 def test_preset_template_name_different_from_span_name_is_override() -> None:
     exporter = ListSpanExporter()
     provider = TracerProvider()
@@ -537,6 +656,11 @@ def test_accept_completed_failure_does_not_escape_on_end(
 
 def test_holdback_uses_single_scheduler_thread() -> None:
     exporter = ListSpanExporter()
+    before = {
+        t.ident
+        for t in threading.enumerate()
+        if t.name == "TransactionSpanProcessor-holdback"
+    }
     processors = [
         TransactionSpanProcessor(exporter, completion_holdback_millis=200)
         for _ in range(3)
@@ -550,13 +674,13 @@ def test_holdback_uses_single_scheduler_thread() -> None:
         span = tracer.start_span("s{}".format(i), kind=SpanKind.SERVER)
         span.end()
 
-    holdback_threads = [
-        t
+    holdback_threads = {
+        t.ident
         for t in threading.enumerate()
         if t.name == "TransactionSpanProcessor-holdback"
-    ]
+    }
     # One scheduler thread per processor instance (not per completed trace).
-    assert len(holdback_threads) == 3
+    assert len(holdback_threads - before) == 3
     provider.shutdown()  # type: ignore[no-untyped-call]
 
 
