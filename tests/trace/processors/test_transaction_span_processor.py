@@ -701,7 +701,10 @@ def test_rebind_child_started_under_evicted_parent() -> None:
     late = tracer.start_span("late", context=mid_ctx)
     with processor._lock:
         assert processor._parent_rebind.get(late.get_span_context().span_id) == root_id
-        assert processor._live_parents[trace_id][late.get_span_context().span_id] == root_id
+        assert (
+            processor._live_parents[trace_id][late.get_span_context().span_id]
+            == root_id
+        )
     late.end()
     with processor._lock:
         buffered = processor._buffers.get(trace_id, [])
