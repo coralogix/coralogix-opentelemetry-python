@@ -775,7 +775,11 @@ class TransactionSpanProcessor(SpanProcessor):
 
             # Strict per-transaction cap. Do not expand for ancestry — rebind
             # live descendants below instead of retaining every ended parent.
-            trimmed = select_slowest_spans(spans, max_nodes=cap, root_span_ids=protect)
+            trimmed = (
+                []
+                if cap == 0
+                else select_slowest_spans(spans, max_nodes=cap, root_span_ids=protect)
+            )
             kept_ids = {
                 span.context.span_id for span in trimmed if span.context is not None
             }
