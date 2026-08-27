@@ -757,6 +757,83 @@ def test_rebind_child_started_under_evicted_parent() -> None:
     provider.shutdown()  # type: ignore[no-untyped-call]
 
 
+def test_disjoint_child_intervals_use_bounded_covered_aggregate() -> None:
+    """Sequential children under a live root must not grow an interval list."""
+    exporter = ListSpanExporter()
+    processor = TransactionSpanProcessor(
+        exporter, max_nodes=1, completion_holdback_millis=0
+    )
+    provider = TracerProvider()
+    provider.add_span_processor(processor)
+    tracer = provider.get_tracer("test")
+
+    root = tracer.start_span("root", kind=SpanKind.SERVER)
+    root_ctx = trace.set_span_in_context(root)
+    root_id = root.get_span_context().span_id
+    for index in range(40):
+        child = tracer.start_span("child-{}".format(index), context=root_ctx)
+        time.sleep(0.002)
+        child.end()
+    with processor._lock:
+        residual = processor._child_intervals.get(root_id, [])
+        covered = processor._child_covered_ns.get(root_id, 0)
+        assert len(residual) <= 1
+        assert covered > 0
+        aggregate = covered + sum(end - start for start, end in residual)
+        assert aggregate > 0
+    root.end()
+    provider.force_flush()
+    roots = [span for span in exporter.spans if span.name == "root"]
+    assert len(roots) == 1
+    self_sec = roots[0].attributes[SELF_DURATION_ATTRIBUTE]
+    wall_sec = (roots[0].end_time - roots[0].start_time) / 1_000_000_000.0
+    # Exclusive self-duration must subtract folded child coverage (not ≈ wall).
+    assert self_sec < wall_sec
+    assert self_sec >= 0
+    provider.shutdown()  # type: ignore[no-untyped-call]
+
+
+def test_evicted_ancestry_retained_after_metrics_until_idle() -> None:
+    """Compact ancestry/marker survive eviction metrics for late rebind."""
+    exporter = ListSpanExporter()
+    processor = TransactionSpanProcessor(
+        exporter, max_nodes=2, completion_holdback_millis=0
+    )
+    provider = TracerProvider()
+    provider.add_span_processor(processor)
+    tracer = provider.get_tracer("test")
+
+    root = tracer.start_span("root", kind=SpanKind.SERVER)
+    start_new_transaction(root, "named-txn")
+    root_ctx = trace.set_span_in_context(root)
+    root_id = root.get_span_context().span_id
+    mid = tracer.start_span("mid", context=root_ctx)
+    mid_ctx = trace.set_span_in_context(mid)
+    mid.end()
+    for i in range(8):
+        child = tracer.start_span("sib-{}".format(i), context=root_ctx)
+        time.sleep(0.01)
+        child.end()
+    mid_id = mid.get_span_context().span_id
+    trace_id = root.get_span_context().trace_id
+    with processor._lock:
+        assert mid_id in processor._evicted_from_buffer.get(trace_id, set())
+        assert mid_id in processor._span_contexts
+        assert mid_id in processor._span_parent_ids
+        assert mid_id not in processor._pending_drop_metrics
+    late = tracer.start_span("late", context=mid_ctx)
+    with processor._lock:
+        assert processor._parent_rebind.get(late.get_span_context().span_id) == root_id
+    late.end()
+    root.end()
+    provider.force_flush()
+    with processor._lock:
+        assert mid_id not in processor._span_contexts
+        assert mid_id not in processor._span_parent_ids
+        assert mid_id not in processor._evicted_from_buffer.get(trace_id, set())
+    provider.shutdown()  # type: ignore[no-untyped-call]
+
+
 def test_eviction_metrics_wait_for_root_rename() -> None:
     resource = Resource.create({"service.name": "test"})
     exporter = ListSpanExporter()
