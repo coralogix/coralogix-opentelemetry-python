@@ -144,6 +144,7 @@ class TransactionSpanProcessor(SpanProcessor):
         # self-duration correct without unbounded disjoint interval lists.
         self._child_intervals: Dict[int, List[Tuple[int, int]]] = {}
         self._child_covered_ns: Dict[int, int] = {}
+        self._live_child_starts: Dict[int, Dict[int, int]] = {}
         self._pending_completions: Dict[int, int] = {}
         self._pending_nested_completions: Dict[int, int] = {}
         self._holdback = HoldbackScheduler()
@@ -202,6 +203,7 @@ class TransactionSpanProcessor(SpanProcessor):
         self._root_final_names.clear()
         self._child_intervals.clear()
         self._child_covered_ns.clear()
+        self._live_child_starts.clear()
         self._shutdown_started = False
         self._shutdown_done = threading.Event()
         if not self._exporter_shutdown:
@@ -227,31 +229,6 @@ class TransactionSpanProcessor(SpanProcessor):
         if span.parent is not None and span.parent.is_valid:
             parent_id = span.parent.span_id
 
-        with self._lock:
-            parent_member = self._membership.get(parent_id) if parent_id else None
-            inherited_from_ts = parent_transaction_from_tracestate(parent_span)
-            trace_already_tracked = (
-                span.context.trace_id in self._live_parents
-                or span.context.trace_id in self._buffers
-            )
-            parent_has_local = (
-                parent_member is not None
-                or parent_has_transaction_attrs(parent_span)
-                or inherited_from_ts is not None
-                # Parent may have been live-trimmed out of the buffer while a
-                # caller still holds its context; keep inheriting on this TraceID.
-                or (bool(parent_id) and trace_already_tracked)
-            )
-
-        starts = starts_new_transaction(
-            span_kind=span.kind,
-            parent_context=parent_context,
-            parent_has_local_transaction=parent_has_local,
-        )
-        apply_on_start_root_flag(span, starts)
-        start_name = span.name
-        preset = preset_transaction_name(span)
-
         trace_id = span.context.trace_id
         span_id = span.context.span_id
 
@@ -268,6 +245,29 @@ class TransactionSpanProcessor(SpanProcessor):
                 and trace_id not in self._buffers
             ):
                 return
+
+            # Keep deciding inheritance and registering this live child in one
+            # critical section. Otherwise its parent can end between the lookup
+            # and registration and extract a separate transaction batch.
+            parent_member = self._membership.get(parent_id) if parent_id else None
+            inherited_from_ts = parent_transaction_from_tracestate(parent_span)
+            trace_already_tracked = (
+                trace_id in self._live_parents or trace_id in self._buffers
+            )
+            parent_has_local = (
+                parent_member is not None
+                or parent_has_transaction_attrs(parent_span)
+                or inherited_from_ts is not None
+                or (bool(parent_id) and trace_already_tracked)
+            )
+            starts = starts_new_transaction(
+                span_kind=span.kind,
+                parent_context=parent_context,
+                parent_has_local_transaction=parent_has_local,
+            )
+            apply_on_start_root_flag(span, starts)
+            start_name = span.name
+            preset = preset_transaction_name(span)
 
             # Sampler echoes start name or copies the outer txn onto nested
             # SERVER/CONSUMER roots; only a differing non-inherited preset is
@@ -368,6 +368,10 @@ class TransactionSpanProcessor(SpanProcessor):
                 self._span_parent_ids.pop(span_id, None)
             live = self._live_parents.setdefault(trace_id, {})
             live[span_id] = effective_parent_id
+            if parent_id and self._is_local_parent_locked(trace_id, parent_id):
+                self._live_child_starts.setdefault(parent_id, {})[span_id] = int(
+                    span.start_time or 0
+                )
             if self._stopped:
                 return
 
@@ -434,8 +438,13 @@ class TransactionSpanProcessor(SpanProcessor):
                 and span.end_time is not None
                 and self._is_local_parent_locked(trace_id, original_parent_id)
             ):
+                live_children = self._live_child_starts.get(original_parent_id)
+                if live_children is not None:
+                    live_children.pop(span.context.span_id, None)
+                    if not live_children:
+                        self._live_child_starts.pop(original_parent_id, None)
                 self._add_child_interval_locked(
-                    original_parent_id, span.start_time, span.end_time
+                    trace_id, original_parent_id, span.start_time, span.end_time
                 )
 
             # Live-buffer eviction may have rebound this span's parent past
@@ -615,32 +624,56 @@ class TransactionSpanProcessor(SpanProcessor):
                         self._pending_drop_metrics.pop(sid, None)
                         self._pending_drop_waiters.pop(sid, None)
 
-    def _add_child_interval_locked(self, parent_id: int, start: int, end: int) -> None:
-        """Accumulate exclusive-child coverage with O(1) residual state.
+    def _add_child_interval_locked(
+        self, trace_id: int, parent_id: int, start: int, end: int
+    ) -> None:
+        """Accumulate child coverage without folding over a live sibling.
 
-        Overlapping intervals coalesce into at most one residual range. Disjoint
-        pieces fold their exact merged duration into ``_child_covered_ns`` so a
-        long-lived parent cannot grow an unbounded interval list, while
-        self-duration still subtracts the true covered child time.
+        Only the prefix before every live child's start is safe to fold: a live
+        sibling can still overlap any later interval. Once no such sibling is
+        live, all residual geometry folds into the scalar.
         """
+        for parent in self._buffers.get(trace_id, []):
+            if (
+                parent.context is not None
+                and parent.context.span_id == parent_id
+                and parent.start_time is not None
+                and parent.end_time is not None
+            ):
+                start = max(start, parent.start_time)
+                end = min(end, parent.end_time)
+                break
         if end <= start:
             return
-        residual = list(self._child_intervals.get(parent_id, []))
-        residual.append((start, end))
-        residual.sort()
+        prior = list(self._child_intervals.get(parent_id, []))
+        prior.append((start, end))
+        prior.sort()
         merged: List[Tuple[int, int]] = []
-        for interval_start, interval_end in residual:
+        for interval_start, interval_end in prior:
             if merged and interval_start <= merged[-1][1]:
                 merged[-1] = (merged[-1][0], max(merged[-1][1], interval_end))
             else:
                 merged.append((interval_start, interval_end))
-        if len(merged) <= DEFAULT_MAX_CHILD_INTERVAL_RESIDUAL:
-            self._child_intervals[parent_id] = merged
-            return
-        self._child_covered_ns[parent_id] = self._child_covered_ns.get(
-            parent_id, 0
-        ) + merge_interval_duration_ns(merged)
-        self._child_intervals.pop(parent_id, None)
+        live_starts = self._live_child_starts.get(parent_id, {}).values()
+        watermark = min(live_starts) if live_starts else None
+        folded: List[Tuple[int, int]] = []
+        residual: List[Tuple[int, int]] = []
+        for interval_start, interval_end in merged:
+            if watermark is None or interval_end <= watermark:
+                folded.append((interval_start, interval_end))
+            elif interval_start < watermark:
+                folded.append((interval_start, watermark))
+                residual.append((watermark, interval_end))
+            else:
+                residual.append((interval_start, interval_end))
+        if folded:
+            self._child_covered_ns[parent_id] = self._child_covered_ns.get(
+                parent_id, 0
+            ) + merge_interval_duration_ns(folded)
+        if residual:
+            self._child_intervals[parent_id] = residual
+        else:
+            self._child_intervals.pop(parent_id, None)
 
     def _child_coverage_snapshot_locked(
         self, span_ids: Sequence[int]
@@ -667,6 +700,7 @@ class TransactionSpanProcessor(SpanProcessor):
         self._root_final_names.pop(span_id, None)
         self._child_intervals.pop(span_id, None)
         self._child_covered_ns.pop(span_id, None)
+        self._live_child_starts.pop(span_id, None)
 
     def _batch_trace_id(self, batch: Sequence[ReadableSpan]) -> Optional[int]:
         for span in batch:
@@ -1188,6 +1222,7 @@ class TransactionSpanProcessor(SpanProcessor):
                 self._exporter_shutdown = True
                 self._child_intervals.clear()
                 self._child_covered_ns.clear()
+                self._live_child_starts.clear()
                 self._membership.clear()
                 self._span_contexts.clear()
                 self._span_parent_ids.clear()
