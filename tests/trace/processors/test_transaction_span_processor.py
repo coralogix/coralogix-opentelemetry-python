@@ -634,6 +634,26 @@ def test_live_buffer_defers_metrics_until_live_child_ends() -> None:
     meter_provider.shutdown()
 
 
+def test_live_root_with_one_node_drops_ended_children() -> None:
+    exporter = ListSpanExporter()
+    processor = TransactionSpanProcessor(
+        exporter, max_nodes=1, completion_holdback_millis=0
+    )
+    provider = TracerProvider()
+    provider.add_span_processor(processor)
+    tracer = provider.get_tracer("test")
+    root = tracer.start_span("root", kind=SpanKind.SERVER)
+    root_ctx = trace.set_span_in_context(root)
+    for index in range(5):
+        tracer.start_span("child-{}".format(index), context=root_ctx).end()
+    with processor._lock:
+        assert not processor._buffers.get(root.get_span_context().trace_id)
+    root.end()
+    provider.force_flush()
+    assert [span.name for span in exporter.spans] == ["root"]
+    provider.shutdown()  # type: ignore[no-untyped-call]
+
+
 def test_side_tables_survive_until_last_inflight_batch() -> None:
     """Nested then outer batches on one TraceID must not drop membership early."""
     exporter = ListSpanExporter()
