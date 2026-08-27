@@ -45,6 +45,9 @@ from coralogix_opentelemetry.trace.processors.defaults import (
 from coralogix_opentelemetry.trace.processors.holdback_scheduler import (
     HoldbackScheduler,
 )
+from coralogix_opentelemetry.trace.processors.self_duration import (
+    merge_interval_duration_ns,
+)
 from coralogix_opentelemetry.trace.processors.span_copy import copy_with_parent
 from coralogix_opentelemetry.trace.processors.trace_heap import select_slowest_spans
 from coralogix_opentelemetry.trace.processors.transaction_extract import (
@@ -437,13 +440,9 @@ class TransactionSpanProcessor(SpanProcessor):
                     else:
                         merged.append((interval_start, interval_end))
                 while len(merged) > DEFAULT_MAX_CHILD_INTERVALS:
-                    index = min(
-                        range(len(merged) - 1),
-                        key=lambda i: merged[i + 1][0] - merged[i][1],
-                    )
-                    merged[index : index + 2] = [
-                        (merged[index][0], merged[index + 1][1])
-                    ]
+                    # Never join disjoint intervals: their gap is parent work.
+                    # Discard the oldest coverage once the bounded ceiling hits.
+                    merged.pop(0)
                 self._child_intervals[original_parent_id] = merged
 
             # Live-buffer eviction may have rebound this span's parent past
@@ -622,7 +621,11 @@ class TransactionSpanProcessor(SpanProcessor):
                         else:
                             self._forget_span_locked(sid)
                         trace_ids = self._trace_span_ids.get(trace_id)
-                        if trace_ids is not None:
+                        if (
+                            trace_ids is not None
+                            and sid
+                            not in self._evicted_from_buffer.get(trace_id, set())
+                        ):
                             trace_ids.discard(sid)
 
     def _forget_span_locked(self, span_id: int) -> None:
