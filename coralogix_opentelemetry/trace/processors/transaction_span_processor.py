@@ -88,7 +88,10 @@ DEFAULT_MAX_DEFERRED_FINALIZE = DEFAULT_MAX_FINALIZE_QUEUE
 # Full dropped spans wait for a root's final name only up to this cap. Overflow
 # is recorded immediately with the root's start name to keep memory bounded.
 DEFAULT_MAX_DEFERRED_DROP_METRICS = DEFAULT_MAX_FINALIZE_QUEUE
-DEFAULT_MAX_CHILD_INTERVALS = DEFAULT_MAX_FINALIZE_QUEUE
+# Residual merged child intervals kept per parent before folding into the
+# covered-duration scalar. One residual interval is enough for overlap merges
+# with the next child; disjoint pieces fold into ``_child_covered_ns``.
+DEFAULT_MAX_CHILD_INTERVAL_RESIDUAL = 1
 
 
 class TransactionSpanProcessor(SpanProcessor):
@@ -136,7 +139,11 @@ class TransactionSpanProcessor(SpanProcessor):
         self._evicted_from_buffer: Dict[int, Set[int]] = {}
         # Final root span names captured at root on_end (after update_name).
         self._root_final_names: Dict[int, str] = {}
+        # Exclusive-child coverage for parents that outlive some children.
+        # Residual merged intervals (≤1) plus a folded covered-ns scalar keep
+        # self-duration correct without unbounded disjoint interval lists.
         self._child_intervals: Dict[int, List[Tuple[int, int]]] = {}
+        self._child_covered_ns: Dict[int, int] = {}
         self._pending_completions: Dict[int, int] = {}
         self._pending_nested_completions: Dict[int, int] = {}
         self._holdback = HoldbackScheduler()
@@ -194,6 +201,7 @@ class TransactionSpanProcessor(SpanProcessor):
         self._evicted_from_buffer.clear()
         self._root_final_names.clear()
         self._child_intervals.clear()
+        self._child_covered_ns.clear()
         self._shutdown_started = False
         self._shutdown_done = threading.Event()
         if not self._exporter_shutdown:
@@ -426,24 +434,9 @@ class TransactionSpanProcessor(SpanProcessor):
                 and span.end_time is not None
                 and self._is_local_parent_locked(trace_id, original_parent_id)
             ):
-                intervals = self._child_intervals.setdefault(original_parent_id, [])
-                start, end = span.start_time, span.end_time
-                intervals.append((start, end))
-                intervals.sort()
-                merged: List[Tuple[int, int]] = []
-                for interval_start, interval_end in intervals:
-                    if merged and interval_start <= merged[-1][1]:
-                        merged[-1] = (
-                            merged[-1][0],
-                            max(merged[-1][1], interval_end),
-                        )
-                    else:
-                        merged.append((interval_start, interval_end))
-                while len(merged) > DEFAULT_MAX_CHILD_INTERVALS:
-                    # Never join disjoint intervals: their gap is parent work.
-                    # Discard the oldest coverage once the bounded ceiling hits.
-                    merged.pop(0)
-                self._child_intervals[original_parent_id] = merged
+                self._add_child_interval_locked(
+                    original_parent_id, span.start_time, span.end_time
+                )
 
             # Live-buffer eviction may have rebound this span's parent past
             # dropped ancestors; apply before buffering so export does not keep
@@ -517,13 +510,13 @@ class TransactionSpanProcessor(SpanProcessor):
         recorded_ids: Set[int] = set()
         try:
             with self._lock:
-                interval_snapshot: Dict[int, List[Tuple[int, int]]] = {
-                    span.context.span_id: list(
-                        self._child_intervals.get(span.context.span_id, [])
-                    )
-                    for span in spans
-                    if span.context is not None
-                }
+                span_ids = [
+                    span.context.span_id for span in spans if span.context is not None
+                ]
+                (
+                    interval_snapshot,
+                    covered_snapshot,
+                ) = self._child_coverage_snapshot_locked(span_ids)
                 membership_snapshot: Dict[int, TransactionMembership] = {}
                 for span in spans:
                     if span.context is None:
@@ -589,6 +582,7 @@ class TransactionSpanProcessor(SpanProcessor):
                     membership=membership_snapshot,
                     self_duration_hist=self._self_duration_hist,
                     transaction_name=group_names.get(root_id),
+                    child_covered_ns=covered_snapshot,
                 )
             # Spans deferred for root rename keep their child_intervals.
             recorded_ids = {
@@ -609,24 +603,58 @@ class TransactionSpanProcessor(SpanProcessor):
                         continue
                     sid = span.context.span_id
                     if sid in recorded_ids and sid not in self._pending_drop_metrics:
+                        # Drop coverage used for this span's metrics. Keep compact
+                        # ancestry (context, parent id) and the eviction marker
+                        # until the TraceID is idle so a later child can still
+                        # start from this span's retained context.
                         self._child_intervals.pop(sid, None)
-                        if sid in self._evicted_from_buffer.get(trace_id, set()):
-                            # Keep only the compact parent edge and eviction
-                            # marker: a late child may still start from this
-                            # span's context before the trace becomes idle.
-                            self._membership.pop(sid, None)
-                            self._span_contexts.pop(sid, None)
-                            self._parent_rebind.pop(sid, None)
-                            self._root_final_names.pop(sid, None)
-                        else:
-                            self._forget_span_locked(sid)
-                        trace_ids = self._trace_span_ids.get(trace_id)
-                        if (
-                            trace_ids is not None
-                            and sid
-                            not in self._evicted_from_buffer.get(trace_id, set())
-                        ):
-                            trace_ids.discard(sid)
+                        self._child_covered_ns.pop(sid, None)
+                        self._membership.pop(sid, None)
+                        self._parent_rebind.pop(sid, None)
+                        self._root_final_names.pop(sid, None)
+                        self._pending_drop_metrics.pop(sid, None)
+                        self._pending_drop_waiters.pop(sid, None)
+
+    def _add_child_interval_locked(self, parent_id: int, start: int, end: int) -> None:
+        """Accumulate exclusive-child coverage with O(1) residual state.
+
+        Overlapping intervals coalesce into at most one residual range. Disjoint
+        pieces fold their exact merged duration into ``_child_covered_ns`` so a
+        long-lived parent cannot grow an unbounded interval list, while
+        self-duration still subtracts the true covered child time.
+        """
+        if end <= start:
+            return
+        residual = list(self._child_intervals.get(parent_id, []))
+        residual.append((start, end))
+        residual.sort()
+        merged: List[Tuple[int, int]] = []
+        for interval_start, interval_end in residual:
+            if merged and interval_start <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], interval_end))
+            else:
+                merged.append((interval_start, interval_end))
+        if len(merged) <= DEFAULT_MAX_CHILD_INTERVAL_RESIDUAL:
+            self._child_intervals[parent_id] = merged
+            return
+        self._child_covered_ns[parent_id] = self._child_covered_ns.get(
+            parent_id, 0
+        ) + merge_interval_duration_ns(merged)
+        self._child_intervals.pop(parent_id, None)
+
+    def _child_coverage_snapshot_locked(
+        self, span_ids: Sequence[int]
+    ) -> Tuple[Dict[int, List[Tuple[int, int]]], Dict[int, int]]:
+        intervals = {
+            span_id: list(self._child_intervals.get(span_id, []))
+            for span_id in span_ids
+        }
+        covered = {
+            span_id: int(self._child_covered_ns.get(span_id, 0))
+            for span_id in span_ids
+            if self._child_covered_ns.get(span_id, 0)
+        }
+        return intervals, covered
 
     def _forget_span_locked(self, span_id: int) -> None:
         """Drop side-table rows for a span that will not be exported."""
@@ -637,6 +665,8 @@ class TransactionSpanProcessor(SpanProcessor):
         self._pending_drop_metrics.pop(span_id, None)
         self._pending_drop_waiters.pop(span_id, None)
         self._root_final_names.pop(span_id, None)
+        self._child_intervals.pop(span_id, None)
+        self._child_covered_ns.pop(span_id, None)
 
     def _batch_trace_id(self, batch: Sequence[ReadableSpan]) -> Optional[int]:
         for span in batch:
@@ -721,7 +751,6 @@ class TransactionSpanProcessor(SpanProcessor):
             return
         self._evicted_from_buffer.pop(trace_id, None)
         for span_id in self._trace_span_ids.pop(trace_id, set()):
-            self._child_intervals.pop(span_id, None)
             self._forget_span_locked(span_id)
 
     def _flush_pending_drop_metrics_locked(self, trace_id: int) -> List[ReadableSpan]:
@@ -928,13 +957,13 @@ class TransactionSpanProcessor(SpanProcessor):
         """Drop export for an unqueued batch; still record self-duration metrics."""
         try:
             with self._lock:
-                interval_snapshot: Dict[int, List[Tuple[int, int]]] = {
-                    span.context.span_id: list(
-                        self._child_intervals.get(span.context.span_id, [])
-                    )
-                    for span in batch
-                    if span.context is not None
-                }
+                span_ids = [
+                    span.context.span_id for span in batch if span.context is not None
+                ]
+                (
+                    interval_snapshot,
+                    covered_snapshot,
+                ) = self._child_coverage_snapshot_locked(span_ids)
                 membership_snapshot = {
                     span.context.span_id: self._membership[span.context.span_id]
                     for span in batch
@@ -946,6 +975,7 @@ class TransactionSpanProcessor(SpanProcessor):
                 child_intervals=interval_snapshot,
                 membership=membership_snapshot,
                 self_duration_hist=self._self_duration_hist,
+                child_covered_ns=covered_snapshot,
             )
         except Exception:
             _LOG.exception(
@@ -1157,6 +1187,7 @@ class TransactionSpanProcessor(SpanProcessor):
             with self._lock:
                 self._exporter_shutdown = True
                 self._child_intervals.clear()
+                self._child_covered_ns.clear()
                 self._membership.clear()
                 self._span_contexts.clear()
                 self._span_parent_ids.clear()
@@ -1328,13 +1359,12 @@ class TransactionSpanProcessor(SpanProcessor):
 
     def _accept_completed_trace(self, spans: Sequence[ReadableSpan]) -> None:
         with self._lock:
-            interval_snapshot: Dict[int, List[Tuple[int, int]]] = {
-                span.context.span_id: list(
-                    self._child_intervals.get(span.context.span_id, [])
-                )
-                for span in spans
-                if span.context is not None
-            }
+            span_ids = [
+                span.context.span_id for span in spans if span.context is not None
+            ]
+            interval_snapshot, covered_snapshot = self._child_coverage_snapshot_locked(
+                span_ids
+            )
             membership_snapshot = {
                 span.context.span_id: self._membership[span.context.span_id]
                 for span in spans
@@ -1345,6 +1375,7 @@ class TransactionSpanProcessor(SpanProcessor):
             child_intervals=interval_snapshot,
             membership=membership_snapshot,
             self_duration_hist=self._self_duration_hist,
+            child_covered_ns=covered_snapshot,
         )
 
         root_span_ids = [
