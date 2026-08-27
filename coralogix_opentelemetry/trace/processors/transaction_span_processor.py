@@ -422,9 +422,20 @@ class TransactionSpanProcessor(SpanProcessor):
                 and span.end_time is not None
                 and self._is_local_parent_locked(trace_id, original_parent_id)
             ):
-                self._child_intervals.setdefault(original_parent_id, []).append(
-                    (span.start_time, span.end_time)
-                )
+                intervals = self._child_intervals.setdefault(original_parent_id, [])
+                start, end = span.start_time, span.end_time
+                intervals.append((start, end))
+                intervals.sort()
+                merged: List[Tuple[int, int]] = []
+                for interval_start, interval_end in intervals:
+                    if merged and interval_start <= merged[-1][1]:
+                        merged[-1] = (
+                            merged[-1][0],
+                            max(merged[-1][1], interval_end),
+                        )
+                    else:
+                        merged.append((interval_start, interval_end))
+                self._child_intervals[original_parent_id] = merged
 
             # Live-buffer eviction may have rebound this span's parent past
             # dropped ancestors; apply before buffering so export does not keep
@@ -839,6 +850,9 @@ class TransactionSpanProcessor(SpanProcessor):
                     continue
                 sid = span.context.span_id
                 if sid not in live_ancestor_ids:
+                    ready.append(span)
+                    continue
+                if len(self._pending_drop_metrics) >= DEFAULT_MAX_DEFERRED_DROP_METRICS:
                     ready.append(span)
                     continue
                 self._pending_drop_metrics[sid] = span
