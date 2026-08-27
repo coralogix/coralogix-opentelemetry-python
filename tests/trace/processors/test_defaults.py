@@ -55,9 +55,7 @@ def test_resolve_constructor_negatives_fall_back_to_defaults() -> None:
     assert resolve_max_nodes(-1) == DEFAULT_MAX_TXN_TRACE_NODES
     assert resolve_max_regular_traces(-3) == DEFAULT_MAX_REGULAR_TRACES
     assert resolve_harvest_period_millis(-10) == DEFAULT_HARVEST_PERIOD_MILLIS
-    assert (
-        resolve_completion_holdback_millis(-5) == DEFAULT_COMPLETION_HOLDBACK_MILLIS
-    )
+    assert resolve_completion_holdback_millis(-5) == DEFAULT_COMPLETION_HOLDBACK_MILLIS
 
 
 def test_resolve_constructor_zero_is_preserved() -> None:

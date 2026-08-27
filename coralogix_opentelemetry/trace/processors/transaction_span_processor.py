@@ -32,6 +32,7 @@ For each completed local transaction the export pipeline is:
 from __future__ import annotations
 
 import logging
+import queue
 import threading
 import time
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -49,7 +50,9 @@ from coralogix_opentelemetry.trace.processors.harvest import (
     RegularTraceHeap,
     root_duration_ns,
 )
-from coralogix_opentelemetry.trace.processors.holdback_scheduler import HoldbackScheduler
+from coralogix_opentelemetry.trace.processors.holdback_scheduler import (
+    HoldbackScheduler,
+)
 from coralogix_opentelemetry.trace.processors.trace_heap import select_slowest_spans
 from coralogix_opentelemetry.trace.processors.transaction_extract import (
     extract_completed_local_transactions,
@@ -80,6 +83,7 @@ DEFAULT_MAX_NODES = DEFAULT_MAX_TXN_TRACE_NODES
 # HoldbackScheduler keys: distinguish idle vs nested arms for the same TraceID.
 _HOLD_IDLE = "idle"
 _HOLD_NESTED = "nested"
+_FINALIZE_STOP = object()
 
 
 class TransactionSpanProcessor(SpanProcessor):
@@ -117,6 +121,14 @@ class TransactionSpanProcessor(SpanProcessor):
         self._pending_completions: Dict[int, int] = {}
         self._pending_nested_completions: Dict[int, int] = {}
         self._holdback = HoldbackScheduler()
+        # Holdback deadlines must not wait on exporters; finalize/export runs here.
+        self._finalize_queue: queue.Queue = queue.Queue()
+        self._finalize_worker = threading.Thread(
+            target=self._finalize_loop,
+            name="TransactionSpanProcessor-finalize",
+            daemon=True,
+        )
+        self._finalize_worker.start()
         self._stopped = False
         self._exporter_shutdown = False
         self._shutdown_started = False
@@ -288,6 +300,23 @@ class TransactionSpanProcessor(SpanProcessor):
                 self._pending_finalize -= 1
                 self._idle.notify_all()
 
+    def _dispatch_accept_completed(
+        self, batches: Sequence[Sequence[ReadableSpan]]
+    ) -> None:
+        """Queue finalize/export so the holdback worker never blocks on exporters."""
+        for batch in batches:
+            self._finalize_queue.put(list(batch))
+
+    def _finalize_loop(self) -> None:
+        while True:
+            item = self._finalize_queue.get()
+            try:
+                if item is _FINALIZE_STOP:
+                    return
+                self._run_accept_completed(item)
+            finally:
+                self._finalize_queue.task_done()
+
     def force_flush(self, timeout_millis: int = 30000) -> bool:
         with self._lock:
             if self._exporter_shutdown:
@@ -374,6 +403,8 @@ class TransactionSpanProcessor(SpanProcessor):
                 self._exporter.shutdown()
         finally:
             self._holdback.shutdown()
+            self._finalize_queue.put(_FINALIZE_STOP)
+            self._finalize_worker.join(timeout=30.0)
             self._shutdown_done.set()
 
     def _total_live_locked(self) -> int:
@@ -462,8 +493,8 @@ class TransactionSpanProcessor(SpanProcessor):
                     trace_id, flush_leftover=True
                 )
                 self._pending_finalize += len(batches)
-            for batch in batches:
-                self._run_accept_completed(batch)
+            # Return quickly: export runs on the finalize worker, not this deadline thread.
+            self._dispatch_accept_completed(batches)
 
         token = self._holdback.schedule(
             (_HOLD_IDLE, trace_id),
@@ -503,9 +534,6 @@ class TransactionSpanProcessor(SpanProcessor):
                         trace_id, flush_leftover=False
                     )
                 self._pending_finalize += len(batches)
-            for batch in batches:
-                self._run_accept_completed(batch)
-            with self._lock:
                 if self._live_parents.get(
                     trace_id
                 ) and has_extractable_nested_transaction(
@@ -513,6 +541,7 @@ class TransactionSpanProcessor(SpanProcessor):
                     live=self._live_parents.get(trace_id, {}),
                 ):
                     self._schedule_nested_completion_locked(trace_id)
+            self._dispatch_accept_completed(batches)
 
         token = self._holdback.schedule(
             (_HOLD_NESTED, trace_id),
