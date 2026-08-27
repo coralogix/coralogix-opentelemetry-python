@@ -120,6 +120,14 @@ class TransactionSpanProcessor(SpanProcessor):
         # metrics can include those children's intervals.
         self._pending_drop_metrics: Dict[int, ReadableSpan] = {}
         self._pending_drop_waiters: Dict[int, Set[int]] = {}
+        # Batches extracted but not yet accept/abandon-finished, per TraceID.
+        # Side tables must outlive the first queued batch when several share a
+        # TraceID (nested + outer extracted together).
+        self._inflight_batches_by_trace: Dict[int, int] = {}
+        # Span IDs removed from `_buffers` by live-trim (compact links retained).
+        self._evicted_from_buffer: Dict[int, Set[int]] = {}
+        # Final root span names captured at root on_end (after update_name).
+        self._root_final_names: Dict[int, str] = {}
         self._child_intervals: Dict[int, List[Tuple[int, int]]] = {}
         self._pending_completions: Dict[int, int] = {}
         self._pending_nested_completions: Dict[int, int] = {}
@@ -292,18 +300,24 @@ class TransactionSpanProcessor(SpanProcessor):
 
             self._span_contexts[span_id] = span.context
             self._trace_span_ids.setdefault(trace_id, set()).add(span_id)
-            if parent_id:
-                self._span_parent_ids[span_id] = parent_id
-            else:
-                self._span_parent_ids.pop(span_id, None)
 
             self._cancel_pending_completion_locked(trace_id)
-            if self._stopped:
-                live = self._live_parents.setdefault(trace_id, {})
-                live[span_id] = parent_id
-                return
+            # Parent may already have been live-trimmed; rebind new children onto
+            # the nearest retained ancestor so export does not keep a dangling id.
+            effective_parent_id = parent_id
+            if parent_id and parent_id in self._evicted_from_buffer.get(trace_id, ()):
+                kept = self._nearest_retained_ancestor_locked(trace_id, parent_id)
+                if kept and kept != parent_id:
+                    effective_parent_id = kept
+                    self._parent_rebind[span_id] = kept
+            if effective_parent_id:
+                self._span_parent_ids[span_id] = effective_parent_id
+            else:
+                self._span_parent_ids.pop(span_id, None)
             live = self._live_parents.setdefault(trace_id, {})
-            live[span_id] = parent_id
+            live[span_id] = effective_parent_id
+            if self._stopped:
+                return
 
     def on_end(self, span: ReadableSpan) -> None:
         try:
@@ -344,6 +358,8 @@ class TransactionSpanProcessor(SpanProcessor):
                     # Ignore sampler copy of the outer txn onto a nested root.
                     if parent_txn is None or str(preset) != parent_txn:
                         member.override_name = str(preset)
+            if member is not None and member.is_root:
+                self._root_final_names[span.context.span_id] = span.name
 
         # Record intervals against the SDK parent before any live-trim rebind so
         # deferred eviction metrics still see async children.
@@ -405,6 +421,7 @@ class TransactionSpanProcessor(SpanProcessor):
                 completed_batches = []
 
             self._pending_finalize += len(completed_batches)
+            self._note_inflight_batches_locked(completed_batches)
             if self._total_live_locked() == 0 and self._pending_finalize == 0:
                 self._idle.notify_all()
         if dropped_for_metrics:
@@ -417,6 +434,7 @@ class TransactionSpanProcessor(SpanProcessor):
 
     def _run_accept_completed(self, batch: Sequence[ReadableSpan]) -> None:
         """Run finalize/export off the caller's contract: never raise to Span.end."""
+        stranded_metrics: List[ReadableSpan] = []
         try:
             self._accept_completed_trace(batch)
         except Exception:
@@ -426,12 +444,18 @@ class TransactionSpanProcessor(SpanProcessor):
         finally:
             with self._lock:
                 self._pending_finalize -= 1
+                self._finish_inflight_batch_locked(batch)
+                # After this batch is no longer inflight, idle TraceIDs can drop
+                # side tables (nested+outer may share a TraceID across batches).
+                stranded_metrics = self._release_completed_traces_locked(batch)
                 self._idle.notify_all()
+        self._record_stranded_drop_metrics(stranded_metrics)
 
     def _record_metrics_for_dropped_spans(
         self, spans: Sequence[ReadableSpan], *, trace_id: int
     ) -> None:
         """Record self-duration metrics for spans evicted before export."""
+        recorded_ids: Set[int] = set()
         try:
             with self._lock:
                 interval_snapshot: Dict[int, List[Tuple[int, int]]] = {
@@ -466,19 +490,24 @@ class TransactionSpanProcessor(SpanProcessor):
                     groups.setdefault(root_id, []).append(span)
 
                 group_names: Dict[int, str] = {}
-                for root_id in groups:
-                    root_member = membership_snapshot.get(root_id)
-                    if root_member is None:
+                annotate_groups: Dict[int, List[ReadableSpan]] = {}
+                for root_id, group in groups.items():
+                    name = self._metrics_transaction_name_locked(trace_id, root_id)
+                    if name is None:
+                        # Root still open without a final/override name — wait.
+                        for span in group:
+                            if span.context is None:
+                                continue
+                            sid = span.context.span_id
+                            self._pending_drop_metrics[sid] = span
+                            self._pending_drop_waiters.setdefault(sid, set()).add(
+                                root_id
+                            )
                         continue
-                    name = (
-                        root_member.override_name
-                        or root_member.inherited_name
-                        or root_member.start_name
-                    )
-                    if name:
-                        group_names[root_id] = name
+                    group_names[root_id] = name
+                    annotate_groups[root_id] = group
 
-            for root_id, group in groups.items():
+            for root_id, group in annotate_groups.items():
                 annotate_completed_batch(
                     group,
                     child_intervals=interval_snapshot,
@@ -486,6 +515,13 @@ class TransactionSpanProcessor(SpanProcessor):
                     self_duration_hist=self._self_duration_hist,
                     transaction_name=group_names.get(root_id),
                 )
+            # Spans deferred for root rename keep their child_intervals.
+            recorded_ids = {
+                span.context.span_id
+                for group in annotate_groups.values()
+                for span in group
+                if span.context is not None
+            }
         except Exception:
             _LOG.exception(
                 "TransactionSpanProcessor failed while recording metrics for "
@@ -496,11 +532,9 @@ class TransactionSpanProcessor(SpanProcessor):
                 for span in spans:
                     if span.context is None:
                         continue
-                    # Keep compact membership/parent links after live-trim eviction.
-                    # A child may still start under this parent via an explicit
-                    # context handle; dropping membership would spawn a spurious
-                    # new transaction root. ReadableSpans are already gone.
-                    self._child_intervals.pop(span.context.span_id, None)
+                    sid = span.context.span_id
+                    if sid in recorded_ids and sid not in self._pending_drop_metrics:
+                        self._child_intervals.pop(sid, None)
 
     def _forget_span_locked(self, span_id: int) -> None:
         """Drop side-table rows for a span that will not be exported."""
@@ -510,11 +544,90 @@ class TransactionSpanProcessor(SpanProcessor):
         self._parent_rebind.pop(span_id, None)
         self._pending_drop_metrics.pop(span_id, None)
         self._pending_drop_waiters.pop(span_id, None)
+        self._root_final_names.pop(span_id, None)
+
+    def _batch_trace_id(self, batch: Sequence[ReadableSpan]) -> Optional[int]:
+        for span in batch:
+            if span.context is not None:
+                return int(span.context.trace_id)
+        return None
+
+    def _note_inflight_batches_locked(
+        self, batches: Sequence[Sequence[ReadableSpan]]
+    ) -> None:
+        for batch in batches:
+            trace_id = self._batch_trace_id(batch)
+            if trace_id is None:
+                continue
+            self._inflight_batches_by_trace[trace_id] = (
+                self._inflight_batches_by_trace.get(trace_id, 0) + 1
+            )
+
+    def _finish_inflight_batch_locked(self, batch: Sequence[ReadableSpan]) -> None:
+        trace_id = self._batch_trace_id(batch)
+        if trace_id is None:
+            return
+        left = self._inflight_batches_by_trace.get(trace_id, 0) - 1
+        if left <= 0:
+            self._inflight_batches_by_trace.pop(trace_id, None)
+        else:
+            self._inflight_batches_by_trace[trace_id] = left
+
+    def _nearest_retained_ancestor_locked(
+        self, trace_id: int, span_id: int
+    ) -> Optional[int]:
+        """Walk compact parents past live-trim evictions to a retained ancestor."""
+        evicted = self._evicted_from_buffer.get(trace_id) or set()
+        live = self._live_parents.get(trace_id) or {}
+        buffered_ids = {
+            span.context.span_id
+            for span in self._buffers.get(trace_id) or []
+            if span.context is not None
+        }
+        cur = self._span_parent_ids.get(span_id, 0)
+        seen: Set[int] = set()
+        while cur and cur not in seen:
+            seen.add(cur)
+            if cur not in evicted and (
+                cur in live or cur in buffered_ids or cur in self._span_contexts
+            ):
+                return cur
+            cur = self._span_parent_ids.get(cur, 0)
+        return None
+
+    def _metrics_transaction_name_locked(
+        self, trace_id: int, root_id: int
+    ) -> Optional[str]:
+        """Resolve eviction-metric txn name; None means defer until root is final."""
+        root_member = self._membership.get(root_id)
+        if root_member is not None:
+            if root_member.override_name:
+                return root_member.override_name
+            if root_member.inherited_name:
+                return root_member.inherited_name
+        live = self._live_parents.get(trace_id) or {}
+        if root_id in live:
+            # Root still open: start_name is not final (frameworks may update_name).
+            return None
+        final_name = self._root_final_names.get(root_id)
+        if final_name:
+            return final_name
+        for span in self._buffers.get(trace_id) or []:
+            if span.context is not None and span.context.span_id == root_id:
+                return span.name
+        if root_member is not None and root_member.start_name:
+            return root_member.start_name
+        return None
 
     def _release_idle_trace_side_tables_locked(self, trace_id: int) -> None:
-        """Forget compact ancestry once a TraceID has nothing live or buffered."""
-        if self._live_parents.get(trace_id) or self._buffers.get(trace_id):
+        """Forget compact ancestry once a TraceID has nothing live, buffered, or queued."""
+        if (
+            self._live_parents.get(trace_id)
+            or self._buffers.get(trace_id)
+            or self._inflight_batches_by_trace.get(trace_id, 0) > 0
+        ):
             return
+        self._evicted_from_buffer.pop(trace_id, None)
         for span_id in self._trace_span_ids.pop(trace_id, set()):
             self._child_intervals.pop(span_id, None)
             self._forget_span_locked(span_id)
@@ -699,6 +812,8 @@ class TransactionSpanProcessor(SpanProcessor):
                         self._span_parent_ids.pop(live_id, None)
 
         self._buffers[trace_id] = frozen + kept_open
+        if dropped_ids:
+            self._evicted_from_buffer.setdefault(trace_id, set()).update(dropped_ids)
         if dropped:
             _LOG.error(
                 "TransactionSpanProcessor live buffer over max_nodes=%d; "
@@ -742,11 +857,14 @@ class TransactionSpanProcessor(SpanProcessor):
             with self._lock:
                 if adjust_pending:
                     self._pending_finalize -= 1
+                self._finish_inflight_batch_locked(batch)
                 for span in batch:
                     if span.context is not None:
                         self._child_intervals.pop(span.context.span_id, None)
                         self._forget_span_locked(span.context.span_id)
+                stranded = self._release_completed_traces_locked(batch)
                 self._idle.notify_all()
+            self._record_stranded_drop_metrics(stranded)
 
     def _retain_deferred_batches(
         self, batches: Sequence[Sequence[ReadableSpan]]
@@ -851,9 +969,11 @@ class TransactionSpanProcessor(SpanProcessor):
         with self._lock:
             if self._exporter_shutdown:
                 return True
-            batches = list(self._deferred_finalize)
+            deferred = list(self._deferred_finalize)
             self._deferred_finalize = []
-            batches.extend(self._flush_pending_completions_locked())
+            new_batches = self._flush_pending_completions_locked()
+            self._note_inflight_batches_locked(new_batches)
+            batches = deferred + new_batches
             self._pending_finalize += len(batches)
         # Wait for queue capacity within the deadline — retain on timeout.
         if not self._dispatch_accept_completed(batches, deadline=deadline):
@@ -905,9 +1025,9 @@ class TransactionSpanProcessor(SpanProcessor):
             with self._lock:
                 self._wait_for_idle_locked(timeout_sec=30.0)
                 holdback_batches = self._flush_pending_completions_locked()
-                batches: List[List[ReadableSpan]] = list(self._deferred_finalize)
+                deferred = list(self._deferred_finalize)
                 self._deferred_finalize = []
-                batches.extend(holdback_batches)
+                extracted: List[List[ReadableSpan]] = []
                 for trace_id in list(self._buffers.keys()):
                     if self._live_parents.get(trace_id):
                         dropped = self._buffers.pop(trace_id, None) or []
@@ -917,10 +1037,13 @@ class TransactionSpanProcessor(SpanProcessor):
                                 self._child_intervals.pop(span.context.span_id, None)
                                 self._forget_span_locked(span.context.span_id)
                         continue
-                    extracted = self._extract_completed_local_transactions_locked(
-                        trace_id, flush_leftover=True
+                    extracted.extend(
+                        self._extract_completed_local_transactions_locked(
+                            trace_id, flush_leftover=True
+                        )
                     )
-                    batches.extend(extracted)
+                self._note_inflight_batches_locked(holdback_batches + extracted)
+                batches = deferred + holdback_batches + extracted
                 self._pending_finalize += len(batches)
                 self._buffers.clear()
                 self._live_parents.clear()
@@ -946,6 +1069,9 @@ class TransactionSpanProcessor(SpanProcessor):
                 self._trace_span_ids.clear()
                 self._pending_drop_metrics.clear()
                 self._pending_drop_waiters.clear()
+                self._inflight_batches_by_trace.clear()
+                self._evicted_from_buffer.clear()
+                self._root_final_names.clear()
             with self._export_lock:
                 self._exporter.shutdown()
         finally:
@@ -1029,6 +1155,7 @@ class TransactionSpanProcessor(SpanProcessor):
                     trace_id, flush_leftover=True
                 )
                 self._pending_finalize += len(batches)
+                self._note_inflight_batches_locked(batches)
             # Return quickly: export runs on the finalize worker, not this deadline thread.
             self._dispatch_accept_completed(batches)
 
@@ -1070,6 +1197,7 @@ class TransactionSpanProcessor(SpanProcessor):
                         trace_id, flush_leftover=False
                     )
                 self._pending_finalize += len(batches)
+                self._note_inflight_batches_locked(batches)
                 if self._live_parents.get(
                     trace_id
                 ) and has_extractable_nested_transaction(
@@ -1136,15 +1264,12 @@ class TransactionSpanProcessor(SpanProcessor):
             max_nodes=self._max_nodes,
             root_span_ids=root_span_ids,
         )
-        stranded_metrics: List[ReadableSpan] = []
         if not trimmed:
             with self._lock:
                 for span in annotated:
                     if span.context is not None:
                         self._child_intervals.pop(span.context.span_id, None)
                         self._forget_span_locked(span.context.span_id)
-                stranded_metrics = self._release_completed_traces_locked(annotated)
-            self._record_stranded_drop_metrics(stranded_metrics)
             return
 
         try:
@@ -1155,8 +1280,6 @@ class TransactionSpanProcessor(SpanProcessor):
                     if span.context is not None:
                         self._child_intervals.pop(span.context.span_id, None)
                         self._forget_span_locked(span.context.span_id)
-                stranded_metrics = self._release_completed_traces_locked(annotated)
-            self._record_stranded_drop_metrics(stranded_metrics)
 
     def _record_stranded_drop_metrics(self, spans: Sequence[ReadableSpan]) -> None:
         by_trace: Dict[int, List[ReadableSpan]] = {}
