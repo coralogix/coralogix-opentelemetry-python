@@ -452,9 +452,11 @@ def test_finalize_queue_drops_when_full(monkeypatch: MonkeyPatch) -> None:
     assert processor._finalize_queue.maxsize == 1
     original_abandon = processor._abandon_completed_batch
 
-    def tracking_abandon(batch: Sequence[ReadableSpan]) -> None:
+    def tracking_abandon(
+        batch: Sequence[ReadableSpan], *, adjust_pending: bool = True
+    ) -> None:
         abandoned.append([span.name for span in batch])
-        original_abandon(batch)
+        original_abandon(batch, adjust_pending=adjust_pending)
 
     processor._abandon_completed_batch = tracking_abandon  # type: ignore[method-assign]
 
