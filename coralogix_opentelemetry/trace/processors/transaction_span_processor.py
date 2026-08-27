@@ -33,7 +33,7 @@ import logging
 import queue
 import threading
 import time
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from coralogix_opentelemetry.trace.common import CoralogixAttributes
 from coralogix_opentelemetry.trace.processors.defaults import (
@@ -321,7 +321,9 @@ class TransactionSpanProcessor(SpanProcessor):
             if self._total_live_locked() == 0 and self._pending_finalize == 0:
                 self._idle.notify_all()
         if dropped_for_metrics:
-            self._record_metrics_for_dropped_spans(dropped_for_metrics)
+            self._record_metrics_for_dropped_spans(
+                dropped_for_metrics, trace_id=trace_id
+            )
         # Always queue finalize/export (including zero-holdback) so Span.end
         # never blocks on a slow exporter and the bounded backlog applies.
         self._dispatch_accept_completed(completed_batches)
@@ -339,7 +341,9 @@ class TransactionSpanProcessor(SpanProcessor):
                 self._pending_finalize -= 1
                 self._idle.notify_all()
 
-    def _record_metrics_for_dropped_spans(self, spans: Sequence[ReadableSpan]) -> None:
+    def _record_metrics_for_dropped_spans(
+        self, spans: Sequence[ReadableSpan], *, trace_id: int
+    ) -> None:
         """Record self-duration metrics for spans evicted before export."""
         try:
             with self._lock:
@@ -350,18 +354,51 @@ class TransactionSpanProcessor(SpanProcessor):
                     for span in spans
                     if span.context is not None
                 }
-                membership_snapshot = {
-                    span.context.span_id: self._membership[span.context.span_id]
-                    for span in spans
-                    if span.context is not None
-                    and span.context.span_id in self._membership
-                }
-            annotate_completed_batch(
-                spans,
-                child_intervals=interval_snapshot,
-                membership=membership_snapshot,
-                self_duration_hist=self._self_duration_hist,
-            )
+                membership_snapshot: Dict[int, TransactionMembership] = {}
+                for span in spans:
+                    if span.context is None:
+                        continue
+                    member = self._membership.get(span.context.span_id)
+                    if member is None:
+                        continue
+                    membership_snapshot[span.context.span_id] = member
+                    root_member = self._membership.get(member.root_span_id)
+                    if root_member is not None:
+                        membership_snapshot[member.root_span_id] = root_member
+
+                groups: Dict[int, List[ReadableSpan]] = {}
+                for span in spans:
+                    if span.context is None:
+                        continue
+                    member = membership_snapshot.get(span.context.span_id)
+                    root_id = (
+                        member.root_span_id
+                        if member is not None
+                        else span.context.span_id
+                    )
+                    groups.setdefault(root_id, []).append(span)
+
+                group_names: Dict[int, str] = {}
+                for root_id in groups:
+                    root_member = membership_snapshot.get(root_id)
+                    if root_member is None:
+                        continue
+                    name = (
+                        root_member.override_name
+                        or root_member.inherited_name
+                        or root_member.start_name
+                    )
+                    if name:
+                        group_names[root_id] = name
+
+            for root_id, group in groups.items():
+                annotate_completed_batch(
+                    group,
+                    child_intervals=interval_snapshot,
+                    membership=membership_snapshot,
+                    self_duration_hist=self._self_duration_hist,
+                    transaction_name=group_names.get(root_id),
+                )
         except Exception:
             _LOG.exception(
                 "TransactionSpanProcessor failed while recording metrics for "
@@ -369,17 +406,55 @@ class TransactionSpanProcessor(SpanProcessor):
             )
         finally:
             with self._lock:
+                ancestors = self._live_ancestor_ids_locked(trace_id)
                 for span in spans:
-                    if span.context is not None:
-                        self._child_intervals.pop(span.context.span_id, None)
-                        self._membership.pop(span.context.span_id, None)
+                    if span.context is None:
+                        continue
+                    sid = span.context.span_id
+                    self._child_intervals.pop(sid, None)
+                    # Keep membership while live descendants still need ancestry.
+                    if sid not in ancestors:
+                        self._membership.pop(sid, None)
+
+    def _live_ancestor_ids_locked(self, trace_id: int) -> Set[int]:
+        """Span IDs on the path from each live span up to (and including) itself."""
+        live = self._live_parents.get(trace_id) or {}
+        parent_of: Dict[int, int] = dict(live)
+        for span in self._buffers.get(trace_id) or []:
+            if (
+                span.context is not None
+                and span.parent is not None
+                and span.parent.is_valid
+            ):
+                parent_of[span.context.span_id] = span.parent.span_id
+        ancestors: Set[int] = set()
+        for live_id in live:
+            cur = live_id
+            seen: Set[int] = set()
+            while cur and cur not in seen:
+                ancestors.add(cur)
+                seen.add(cur)
+                cur = parent_of.get(cur, 0)
+        return ancestors
+
+    def _open_transaction_root_ids_locked(self, trace_id: int) -> Set[int]:
+        """Roots that still have at least one live member on this TraceID."""
+        live = self._live_parents.get(trace_id) or {}
+        open_roots: Set[int] = set()
+        for live_id in live:
+            member = self._membership.get(live_id)
+            if member is not None:
+                open_roots.add(member.root_span_id)
+            else:
+                open_roots.add(live_id)
+        return open_roots
 
     def _trim_live_buffer_locked(self, trace_id: int) -> List[ReadableSpan]:
-        """Evict surplus ended spans under live roots; return them for metrics.
+        """Evict surplus ended spans under open transactions; return for metrics.
 
-        Nested completed subtrees waiting on holdback stay untouched. Only spans
-        belonging to still-open transaction roots are subject to ``max_nodes``.
-        Caller must hold ``_lock``.
+        A transaction stays \"open\" while any live span still belongs to its
+        root (including async children that outlive the root). Nested completed
+        subtrees waiting on holdback stay untouched. Caller must hold ``_lock``.
         """
         if self._max_nodes <= 0:
             return []
@@ -388,11 +463,7 @@ class TransactionSpanProcessor(SpanProcessor):
             return []
 
         live = self._live_parents.get(trace_id) or {}
-        live_root_ids = set()
-        for span_id in live:
-            member = self._membership.get(span_id)
-            if member is not None and member.is_root:
-                live_root_ids.add(span_id)
+        open_root_ids = self._open_transaction_root_ids_locked(trace_id)
         frozen: List[ReadableSpan] = []
         open_spans: List[ReadableSpan] = []
         for span in buf:
@@ -402,23 +473,26 @@ class TransactionSpanProcessor(SpanProcessor):
             root_id = (
                 member.root_span_id if member is not None else span.context.span_id
             )
-            if root_id in live or root_id in live_root_ids:
+            if root_id in open_root_ids:
                 open_spans.append(span)
             else:
                 frozen.append(span)
 
-        reserve = max(1, len(live_root_ids))
+        # Slots reserved for roots that are still live (not yet in the buffer).
+        reserve = sum(1 for root_id in open_root_ids if root_id in live)
         child_cap = max(0, self._max_nodes - reserve)
         if len(open_spans) <= child_cap:
             return []
 
         protect: List[str] = []
+        ancestor_ids = self._live_ancestor_ids_locked(trace_id)
         for span in open_spans:
             if span.context is None:
                 continue
-            member = self._membership.get(span.context.span_id)
-            if member is not None and member.is_root:
-                protect.append(format_span_id(span.context.span_id))
+            sid = span.context.span_id
+            member = self._membership.get(sid)
+            if (member is not None and member.is_root) or sid in ancestor_ids:
+                protect.append(format_span_id(sid))
         kept_open = select_slowest_spans(
             open_spans,
             max_nodes=max(child_cap, len(protect)),
@@ -427,6 +501,15 @@ class TransactionSpanProcessor(SpanProcessor):
         kept_ids = {
             span.context.span_id for span in kept_open if span.context is not None
         }
+        # Never drop an ancestor of a still-live span.
+        for span in open_spans:
+            if span.context is not None and span.context.span_id in ancestor_ids:
+                kept_ids.add(span.context.span_id)
+        kept_open = [
+            span
+            for span in open_spans
+            if span.context is not None and span.context.span_id in kept_ids
+        ]
         dropped = [
             span
             for span in open_spans
@@ -436,7 +519,7 @@ class TransactionSpanProcessor(SpanProcessor):
         if dropped:
             _LOG.error(
                 "TransactionSpanProcessor live buffer over max_nodes=%d; "
-                "dropping %d ended span(s) under live root(s)",
+                "dropping %d ended span(s) under open transaction(s)",
                 self._max_nodes,
                 len(dropped),
             )
