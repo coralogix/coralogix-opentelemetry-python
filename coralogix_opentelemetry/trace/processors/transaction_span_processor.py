@@ -49,6 +49,7 @@ from coralogix_opentelemetry.trace.processors.harvest import (
     RegularTraceHeap,
     root_duration_ns,
 )
+from coralogix_opentelemetry.trace.processors.holdback_scheduler import HoldbackScheduler
 from coralogix_opentelemetry.trace.processors.trace_heap import select_slowest_spans
 from coralogix_opentelemetry.trace.processors.transaction_extract import (
     extract_completed_local_transactions,
@@ -75,6 +76,10 @@ from opentelemetry.trace import format_span_id, get_current_span
 _LOG = logging.getLogger(__name__)
 
 DEFAULT_MAX_NODES = DEFAULT_MAX_TXN_TRACE_NODES
+
+# HoldbackScheduler keys: distinguish idle vs nested arms for the same TraceID.
+_HOLD_IDLE = "idle"
+_HOLD_NESTED = "nested"
 
 
 class TransactionSpanProcessor(SpanProcessor):
@@ -109,8 +114,9 @@ class TransactionSpanProcessor(SpanProcessor):
         self._live_parents: Dict[int, Dict[int, int]] = {}
         self._membership: Dict[int, TransactionMembership] = {}
         self._child_intervals: Dict[int, List[Tuple[int, int]]] = {}
-        self._pending_completions: Dict[int, threading.Timer] = {}
-        self._pending_nested_completions: Dict[int, threading.Timer] = {}
+        self._pending_completions: Dict[int, int] = {}
+        self._pending_nested_completions: Dict[int, int] = {}
+        self._holdback = HoldbackScheduler()
         self._stopped = False
         self._exporter_shutdown = False
         self._shutdown_started = False
@@ -134,6 +140,14 @@ class TransactionSpanProcessor(SpanProcessor):
 
     def on_start(self, span: Span, parent_context: Optional[Context] = None) -> None:
         """Track membership + root flag only; do not freeze transaction name."""
+        try:
+            self._on_start_impl(span, parent_context)
+        except Exception:
+            _LOG.exception("TransactionSpanProcessor.on_start failed")
+
+    def _on_start_impl(
+        self, span: Span, parent_context: Optional[Context] = None
+    ) -> None:
         if span.context is None or not span.context.is_valid:
             return
 
@@ -199,6 +213,12 @@ class TransactionSpanProcessor(SpanProcessor):
             live[span_id] = parent_id
 
     def on_end(self, span: ReadableSpan) -> None:
+        try:
+            self._on_end_impl(span)
+        except Exception:
+            _LOG.exception("TransactionSpanProcessor.on_end failed")
+
+    def _on_end_impl(self, span: ReadableSpan) -> None:
         if span.context is None or not span.context.is_valid:
             return
 
@@ -253,12 +273,20 @@ class TransactionSpanProcessor(SpanProcessor):
             if self._total_live_locked() == 0 and self._pending_finalize == 0:
                 self._idle.notify_all()
         for batch in completed_batches:
-            try:
-                self._accept_completed_trace(batch)
-            finally:
-                with self._lock:
-                    self._pending_finalize -= 1
-                    self._idle.notify_all()
+            self._run_accept_completed(batch)
+
+    def _run_accept_completed(self, batch: Sequence[ReadableSpan]) -> None:
+        """Run finalize/export off the caller's contract: never raise to Span.end."""
+        try:
+            self._accept_completed_trace(batch)
+        except Exception:
+            _LOG.exception(
+                "TransactionSpanProcessor failed while accepting a completed trace"
+            )
+        finally:
+            with self._lock:
+                self._pending_finalize -= 1
+                self._idle.notify_all()
 
     def force_flush(self, timeout_millis: int = 30000) -> bool:
         with self._lock:
@@ -267,12 +295,7 @@ class TransactionSpanProcessor(SpanProcessor):
             batches = self._flush_pending_completions_locked()
             self._pending_finalize += len(batches)
         for batch in batches:
-            try:
-                self._accept_completed_trace(batch)
-            finally:
-                with self._lock:
-                    self._pending_finalize -= 1
-                    self._idle.notify_all()
+            self._run_accept_completed(batch)
         with self._lock:
             deadline = time.monotonic() + max(0.001, timeout_millis / 1000.0)
             while self._pending_finalize > 0:
@@ -331,12 +354,7 @@ class TransactionSpanProcessor(SpanProcessor):
                 self._live_parents.clear()
 
             for batch in batches:
-                try:
-                    self._accept_completed_trace(batch)
-                finally:
-                    with self._lock:
-                        self._pending_finalize -= 1
-                        self._idle.notify_all()
+                self._run_accept_completed(batch)
 
             with self._lock:
                 deadline = time.monotonic() + 30.0
@@ -355,6 +373,7 @@ class TransactionSpanProcessor(SpanProcessor):
             with self._export_lock:
                 self._exporter.shutdown()
         finally:
+            self._holdback.shutdown()
             self._shutdown_done.set()
 
     def _total_live_locked(self) -> int:
@@ -383,14 +402,12 @@ class TransactionSpanProcessor(SpanProcessor):
             self._flush_harvest()
 
     def _cancel_pending_completion_locked(self, trace_id: int) -> None:
-        timer = self._pending_completions.pop(trace_id, None)
-        if timer is not None:
-            timer.cancel()
+        if self._pending_completions.pop(trace_id, None) is not None:
+            self._holdback.cancel((_HOLD_IDLE, trace_id))
 
     def _cancel_pending_nested_completion_locked(self, trace_id: int) -> None:
-        timer = self._pending_nested_completions.pop(trace_id, None)
-        if timer is not None:
-            timer.cancel()
+        if self._pending_nested_completions.pop(trace_id, None) is not None:
+            self._holdback.cancel((_HOLD_NESTED, trace_id))
 
     def _is_local_parent_locked(self, trace_id: int, parent_id: int) -> bool:
         live = self._live_parents.get(trace_id)
@@ -429,12 +446,12 @@ class TransactionSpanProcessor(SpanProcessor):
                 trace_id, flush_leftover=True
             )
 
-        timer: Optional[threading.Timer] = None
+        token = 0
 
         def _fire() -> None:
             batches: List[List[ReadableSpan]] = []
             with self._lock:
-                if self._pending_completions.get(trace_id) is not timer:
+                if self._pending_completions.get(trace_id) != token:
                     return
                 self._pending_completions.pop(trace_id, None)
                 if self._exporter_shutdown:
@@ -446,17 +463,14 @@ class TransactionSpanProcessor(SpanProcessor):
                 )
                 self._pending_finalize += len(batches)
             for batch in batches:
-                try:
-                    self._accept_completed_trace(batch)
-                finally:
-                    with self._lock:
-                        self._pending_finalize -= 1
-                        self._idle.notify_all()
+                self._run_accept_completed(batch)
 
-        timer = threading.Timer(self._completion_holdback_millis / 1000.0, _fire)
-        timer.daemon = True
-        self._pending_completions[trace_id] = timer
-        timer.start()
+        token = self._holdback.schedule(
+            (_HOLD_IDLE, trace_id),
+            self._completion_holdback_millis / 1000.0,
+            _fire,
+        )
+        self._pending_completions[trace_id] = token
         return []
 
     def _schedule_nested_completion_locked(
@@ -474,12 +488,12 @@ class TransactionSpanProcessor(SpanProcessor):
                 trace_id, flush_leftover=False
             )
 
-        timer: Optional[threading.Timer] = None
+        token = 0
 
         def _fire() -> None:
             batches: List[List[ReadableSpan]] = []
             with self._lock:
-                if self._pending_nested_completions.get(trace_id) is not timer:
+                if self._pending_nested_completions.get(trace_id) != token:
                     return
                 self._pending_nested_completions.pop(trace_id, None)
                 if self._exporter_shutdown:
@@ -490,12 +504,7 @@ class TransactionSpanProcessor(SpanProcessor):
                     )
                 self._pending_finalize += len(batches)
             for batch in batches:
-                try:
-                    self._accept_completed_trace(batch)
-                finally:
-                    with self._lock:
-                        self._pending_finalize -= 1
-                        self._idle.notify_all()
+                self._run_accept_completed(batch)
             with self._lock:
                 if self._live_parents.get(
                     trace_id
@@ -505,10 +514,12 @@ class TransactionSpanProcessor(SpanProcessor):
                 ):
                     self._schedule_nested_completion_locked(trace_id)
 
-        timer = threading.Timer(self._completion_holdback_millis / 1000.0, _fire)
-        timer.daemon = True
-        self._pending_nested_completions[trace_id] = timer
-        timer.start()
+        token = self._holdback.schedule(
+            (_HOLD_NESTED, trace_id),
+            self._completion_holdback_millis / 1000.0,
+            _fire,
+        )
+        self._pending_nested_completions[trace_id] = token
         return []
 
     def _extract_completed_local_transactions_locked(

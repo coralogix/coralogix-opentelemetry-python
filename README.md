@@ -42,11 +42,13 @@ trace.set_tracer_provider(provider)
 
 | Option | Type | Default | Env var | Meaning |
 |---|---|---|---|---|
-| `max_nodes` | int | `256` | `OTEL_CX_TRANSACTION_MAX_NODES` | Max spans kept per completed local trace (slowest first; txn root always kept) |
-| `max_regular_traces` | int | `1` | `OTEL_CX_TRANSACTION_MAX_REGULAR_TRACES` | Slowest completed local traces kept per harvest window. `0` = export every completed trimmed trace immediately |
-| `harvest_period_millis` | int | `60000` | `OTEL_CX_TRANSACTION_HARVEST_PERIOD_MILLIS` | Harvest flush interval. `<= 0` exports every completed trace immediately (no heap) |
-| `completion_holdback_millis` | int | `100` | `OTEL_CX_TRANSACTION_COMPLETION_HOLDBACK_MILLIS` | After the last live span on a TraceID ends, wait so fire-and-forget children can join. `0` = finalize immediately |
+| `max_nodes` | int | `256` | `OTEL_CX_TRANSACTION_MAX_NODES` | Max spans kept per completed local trace (slowest first; txn root always kept). `0` = no trimming. Negative values fall back to the default |
+| `max_regular_traces` | int | `1` | `OTEL_CX_TRANSACTION_MAX_REGULAR_TRACES` | Slowest completed local traces kept per harvest window. `0` = export every completed trimmed trace immediately. Negative → default |
+| `harvest_period_millis` | int | `60000` | `OTEL_CX_TRANSACTION_HARVEST_PERIOD_MILLIS` | Harvest flush interval. `0` exports every completed trace immediately (no heap). Negative → default |
+| `completion_holdback_millis` | int | `100` | `OTEL_CX_TRANSACTION_COMPLETION_HOLDBACK_MILLIS` | After the last live span on a TraceID ends, wait so fire-and-forget children can join. `0` = finalize immediately. Negative → default |
 | `meter_provider` | MeterProvider | global | — | MeterProvider for the self-duration histogram |
+
+Requires OpenTelemetry API/SDK **1.21+** (metrics API and `ReadableSpan.instrumentation_scope`).
 
 ### Attributes
 
