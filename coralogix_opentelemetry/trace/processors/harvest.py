@@ -87,6 +87,13 @@ class RegularTraceHeap:
         self._shortest_first.clear()
         return traces
 
+    def restore(self, traces: Sequence[HarvestTrace]) -> None:
+        """Put previously drained winners back into the heap."""
+        if self._max_traces <= 0:
+            return
+        for trace in traces:
+            heapq.heappush(self._shortest_first, trace)
+
 
 def harvest_stub_spans(spans: Sequence[ReadableSpan]) -> List[ReadableSpan]:
     """Root-only spans for APM presence when a completed tree loses harvest."""

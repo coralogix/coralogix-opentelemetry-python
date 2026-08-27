@@ -88,6 +88,15 @@ _HOLD_NESTED = "nested"
 DEFAULT_MAX_FINALIZE_QUEUE = 256
 
 
+class _HarvestExport:
+    """Already-finalized harvest winner waiting only for SpanExporter.export."""
+
+    __slots__ = ("spans",)
+
+    def __init__(self, spans: List[ReadableSpan]) -> None:
+        self.spans = spans
+
+
 class TransactionSpanProcessor(SpanProcessor):
     """Full transaction tagging + self-duration + trim + harvest.
 
@@ -380,9 +389,47 @@ class TransactionSpanProcessor(SpanProcessor):
                     return
                 continue
             try:
-                self._run_accept_completed(item)
+                if isinstance(item, _HarvestExport):
+                    try:
+                        self._export_spans(item.spans)
+                    except Exception:
+                        _LOG.exception(
+                            "TransactionSpanProcessor failed exporting harvest winner"
+                        )
+                    finally:
+                        with self._lock:
+                            self._pending_finalize -= 1
+                            self._idle.notify_all()
+                else:
+                    self._run_accept_completed(item)
             finally:
                 self._finalize_queue.task_done()
+
+    def _enqueue_harvest_winners(self) -> None:
+        """Move drained harvest winners onto the finalize worker (deadline-aware path)."""
+        with self._lock:
+            if self._exporter_shutdown:
+                return
+            winners = self._harvest.drain()
+            if not winners:
+                return
+            self._pending_finalize += len(winners)
+        for index, winner in enumerate(winners):
+            try:
+                self._finalize_queue.put_nowait(_HarvestExport(list(winner.spans)))
+            except queue.Full:
+                rest = winners[index:]
+                with self._lock:
+                    self._pending_finalize -= len(rest)
+                    self._harvest.restore(rest)
+                    self._idle.notify_all()
+                _LOG.error(
+                    "TransactionSpanProcessor finalize queue full "
+                    "(max=%d); deferring %d harvest winner(s)",
+                    DEFAULT_MAX_FINALIZE_QUEUE,
+                    len(rest),
+                )
+                return
 
     def force_flush(self, timeout_millis: int = 30000) -> bool:
         deadline = time.monotonic() + max(0.001, timeout_millis / 1000.0)
@@ -403,7 +450,18 @@ class TransactionSpanProcessor(SpanProcessor):
         if timed_out:
             return False
 
-        self._flush_harvest()
+        # Harvest drain must also honor the deadline (export via finalize worker).
+        self._enqueue_harvest_winners()
+        with self._lock:
+            while self._pending_finalize > 0:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._idle.wait(timeout=remaining)
+            timed_out = self._pending_finalize > 0
+        if timed_out:
+            return False
+
         remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
         with self._export_lock:
             if self._exporter_shutdown:

@@ -62,6 +62,20 @@ def test_heap_keeps_only_slowest_when_capacity_one() -> None:
     assert winners[0].spans[0].name == "slow"
 
 
+def test_heap_restore_puts_drained_winners_back() -> None:
+    heap = RegularTraceHeap(max_traces=1)
+    winner = HarvestTrace(
+        duration_ns=500,
+        spans=[_span("slow", span_id=1, start_ns=0, end_ns=500, root=True)],
+    )
+    assert heap.witness(winner) == []
+    drained = heap.drain()
+    assert len(heap) == 0
+    heap.restore(drained)
+    assert len(heap) == 1
+    assert heap.drain()[0].spans[0].name == "slow"
+
+
 def test_heap_rejects_faster_than_current_winner() -> None:
     heap = RegularTraceHeap(max_traces=1)
     slow = HarvestTrace(
