@@ -113,6 +113,13 @@ class TransactionSpanProcessor(SpanProcessor):
         self._span_contexts: Dict[int, SpanContext] = {}
         self._span_parent_ids: Dict[int, int] = {}
         self._parent_rebind: Dict[int, int] = {}
+        # Span IDs observed on each TraceID — used to drop compact side tables
+        # once the TraceID has no live or buffered spans left.
+        self._trace_span_ids: Dict[int, Set[int]] = {}
+        # Live-trim evictions waiting on live descendants before self-duration
+        # metrics can include those children's intervals.
+        self._pending_drop_metrics: Dict[int, ReadableSpan] = {}
+        self._pending_drop_waiters: Dict[int, Set[int]] = {}
         self._child_intervals: Dict[int, List[Tuple[int, int]]] = {}
         self._pending_completions: Dict[int, int] = {}
         self._pending_nested_completions: Dict[int, int] = {}
@@ -284,6 +291,7 @@ class TransactionSpanProcessor(SpanProcessor):
                 )
 
             self._span_contexts[span_id] = span.context
+            self._trace_span_ids.setdefault(trace_id, set()).add(span_id)
             if parent_id:
                 self._span_parent_ids[span_id] = parent_id
             else:
@@ -337,15 +345,11 @@ class TransactionSpanProcessor(SpanProcessor):
                     if parent_txn is None or str(preset) != parent_txn:
                         member.override_name = str(preset)
 
-        # Live-buffer eviction may have rebound this span's parent past dropped
-        # ancestors; apply before buffering so export does not keep a dangling id.
-        with self._lock:
-            rebind_parent_id = self._parent_rebind.pop(span.context.span_id, None)
-            rebind_ctx = (
-                self._span_contexts.get(rebind_parent_id) if rebind_parent_id else None
-            )
-        if rebind_ctx is not None:
-            span = copy_with_parent(span, rebind_ctx)
+        # Record intervals against the SDK parent before any live-trim rebind so
+        # deferred eviction metrics still see async children.
+        original_parent_id = 0
+        if span.parent is not None and span.parent.is_valid:
+            original_parent_id = span.parent.span_id
 
         trace_id = span.context.trace_id
         completed_batches: List[List[ReadableSpan]] = []
@@ -357,15 +361,25 @@ class TransactionSpanProcessor(SpanProcessor):
             if self._stopped and not tracked:
                 return
             if (
-                span.parent is not None
-                and span.parent.is_valid
+                original_parent_id
                 and span.start_time is not None
                 and span.end_time is not None
-                and self._is_local_parent_locked(trace_id, span.parent.span_id)
+                and self._is_local_parent_locked(trace_id, original_parent_id)
             ):
-                self._child_intervals.setdefault(span.parent.span_id, []).append(
+                self._child_intervals.setdefault(original_parent_id, []).append(
                     (span.start_time, span.end_time)
                 )
+
+            # Live-buffer eviction may have rebound this span's parent past
+            # dropped ancestors; apply before buffering so export does not keep
+            # a dangling id.
+            rebind_parent_id = self._parent_rebind.pop(span.context.span_id, None)
+            rebind_ctx = (
+                self._span_contexts.get(rebind_parent_id) if rebind_parent_id else None
+            )
+            if rebind_ctx is not None:
+                span = copy_with_parent(span, rebind_ctx)
+
             self._buffers.setdefault(trace_id, []).append(span)
             live = self._live_parents.get(trace_id)
             if live is not None:
@@ -373,12 +387,17 @@ class TransactionSpanProcessor(SpanProcessor):
                 if not live:
                     self._live_parents.pop(trace_id, None)
 
+            # Ending a waiter may unblock deferred eviction metrics.
+            dropped_for_metrics.extend(
+                self._release_drop_metrics_for_ended_locked(span.context.span_id)
+            )
+
             still_live = bool(self._live_parents.get(trace_id))
             if still_live:
                 completed_batches = self._schedule_nested_completion_locked(trace_id)
                 # Bound ended spans under live roots so one long-lived root
                 # cannot grow `_buffers` without limit before max_nodes trim.
-                dropped_for_metrics = self._trim_live_buffer_locked(trace_id)
+                dropped_for_metrics.extend(self._trim_live_buffer_locked(trace_id))
             elif self._buffers.get(trace_id):
                 self._cancel_pending_nested_completion_locked(trace_id)
                 completed_batches = self._schedule_completion_locked(trace_id)
@@ -489,6 +508,48 @@ class TransactionSpanProcessor(SpanProcessor):
         self._span_contexts.pop(span_id, None)
         self._span_parent_ids.pop(span_id, None)
         self._parent_rebind.pop(span_id, None)
+        self._pending_drop_metrics.pop(span_id, None)
+        self._pending_drop_waiters.pop(span_id, None)
+
+    def _release_idle_trace_side_tables_locked(self, trace_id: int) -> None:
+        """Forget compact ancestry once a TraceID has nothing live or buffered."""
+        if self._live_parents.get(trace_id) or self._buffers.get(trace_id):
+            return
+        for span_id in self._trace_span_ids.pop(trace_id, set()):
+            self._child_intervals.pop(span_id, None)
+            self._forget_span_locked(span_id)
+
+    def _flush_pending_drop_metrics_locked(self, trace_id: int) -> List[ReadableSpan]:
+        """Return and clear every deferred eviction still pending on ``trace_id``."""
+        ready: List[ReadableSpan] = []
+        pending_ids = [
+            span_id
+            for span_id, span in self._pending_drop_metrics.items()
+            if span.context is not None and span.context.trace_id == trace_id
+        ]
+        for span_id in pending_ids:
+            span = self._pending_drop_metrics.pop(span_id, None)
+            self._pending_drop_waiters.pop(span_id, None)
+            if span is not None:
+                ready.append(span)
+        return ready
+
+    def _release_drop_metrics_for_ended_locked(
+        self, ended_span_id: int
+    ) -> List[ReadableSpan]:
+        """Unblock deferred eviction metrics once a waiting live child ends."""
+        ready: List[ReadableSpan] = []
+        for dropped_id, waiters in list(self._pending_drop_waiters.items()):
+            if ended_span_id not in waiters:
+                continue
+            waiters.discard(ended_span_id)
+            if waiters:
+                continue
+            self._pending_drop_waiters.pop(dropped_id, None)
+            span = self._pending_drop_metrics.pop(dropped_id, None)
+            if span is not None:
+                ready.append(span)
+        return ready
 
     def _open_transaction_root_ids_locked(self, trace_id: int) -> Set[int]:
         """Roots that still have at least one live member on this TraceID."""
@@ -578,19 +639,53 @@ class TransactionSpanProcessor(SpanProcessor):
         dropped_ids = {
             span.context.span_id for span in dropped if span.context is not None
         }
+        parent_of: Dict[int, int] = dict(self._span_parent_ids)
+        parent_of.update(live)
+        for span in buf:
+            if (
+                span.context is not None
+                and span.parent is not None
+                and span.parent.is_valid
+            ):
+                parent_of[span.context.span_id] = span.parent.span_id
+
+        # Defer metrics for dropped ancestors of still-live spans so child
+        # intervals can still be attributed before self-duration is recorded.
+        ready: List[ReadableSpan] = []
         if dropped_ids and live:
-            parent_of: Dict[int, int] = dict(self._span_parent_ids)
-            parent_of.update(live)
-            for span in buf:
-                if (
-                    span.context is not None
-                    and span.parent is not None
-                    and span.parent.is_valid
-                ):
-                    parent_of[span.context.span_id] = span.parent.span_id
+            live_ancestor_ids: Set[int] = set()
+            for live_id in live:
+                cur = live_id
+                seen: Set[int] = set()
+                while cur and cur not in seen:
+                    live_ancestor_ids.add(cur)
+                    seen.add(cur)
+                    cur = parent_of.get(cur, 0)
+            for span in dropped:
+                if span.context is None:
+                    continue
+                sid = span.context.span_id
+                if sid not in live_ancestor_ids:
+                    ready.append(span)
+                    continue
+                self._pending_drop_metrics[sid] = span
+                waiters = self._pending_drop_waiters.setdefault(sid, set())
+                for live_id in live:
+                    cur = live_id
+                    seen = set()
+                    while cur and cur not in seen:
+                        if cur == sid:
+                            waiters.add(live_id)
+                            break
+                        seen.add(cur)
+                        cur = parent_of.get(cur, 0)
+        else:
+            ready = list(dropped)
+
+        if dropped_ids and live:
             for live_id in list(live.keys()):
                 parent_id = live.get(live_id, 0)
-                seen: Set[int] = set()
+                seen = set()
                 while parent_id and parent_id in dropped_ids and parent_id not in seen:
                     seen.add(parent_id)
                     parent_id = parent_of.get(parent_id, 0)
@@ -611,7 +706,7 @@ class TransactionSpanProcessor(SpanProcessor):
                 self._max_nodes,
                 len(dropped),
             )
-        return dropped
+        return ready
 
     def _abandon_completed_batch(
         self, batch: Sequence[ReadableSpan], *, adjust_pending: bool = True
@@ -848,6 +943,9 @@ class TransactionSpanProcessor(SpanProcessor):
                 self._span_contexts.clear()
                 self._span_parent_ids.clear()
                 self._parent_rebind.clear()
+                self._trace_span_ids.clear()
+                self._pending_drop_metrics.clear()
+                self._pending_drop_waiters.clear()
             with self._export_lock:
                 self._exporter.shutdown()
         finally:
@@ -882,6 +980,9 @@ class TransactionSpanProcessor(SpanProcessor):
         for span in self._buffers.get(trace_id, []):
             if span.context is not None and span.context.span_id == parent_id:
                 return True
+        # Evicted parents awaiting deferred metrics still need child intervals.
+        if parent_id in self._pending_drop_metrics:
+            return True
         return False
 
     def _flush_pending_completions_locked(self) -> List[List[ReadableSpan]]:
@@ -1035,12 +1136,15 @@ class TransactionSpanProcessor(SpanProcessor):
             max_nodes=self._max_nodes,
             root_span_ids=root_span_ids,
         )
+        stranded_metrics: List[ReadableSpan] = []
         if not trimmed:
             with self._lock:
                 for span in annotated:
                     if span.context is not None:
                         self._child_intervals.pop(span.context.span_id, None)
                         self._forget_span_locked(span.context.span_id)
+                stranded_metrics = self._release_completed_traces_locked(annotated)
+            self._record_stranded_drop_metrics(stranded_metrics)
             return
 
         try:
@@ -1051,6 +1155,32 @@ class TransactionSpanProcessor(SpanProcessor):
                     if span.context is not None:
                         self._child_intervals.pop(span.context.span_id, None)
                         self._forget_span_locked(span.context.span_id)
+                stranded_metrics = self._release_completed_traces_locked(annotated)
+            self._record_stranded_drop_metrics(stranded_metrics)
+
+    def _record_stranded_drop_metrics(self, spans: Sequence[ReadableSpan]) -> None:
+        by_trace: Dict[int, List[ReadableSpan]] = {}
+        for span in spans:
+            if span.context is None:
+                continue
+            by_trace.setdefault(span.context.trace_id, []).append(span)
+        for trace_id, group in by_trace.items():
+            self._record_metrics_for_dropped_spans(group, trace_id=trace_id)
+
+    def _release_completed_traces_locked(
+        self, spans: Sequence[ReadableSpan]
+    ) -> List[ReadableSpan]:
+        """After a batch is done, drop idle TraceID side tables; return stranded metrics."""
+        stranded: List[ReadableSpan] = []
+        trace_ids = {
+            span.context.trace_id for span in spans if span.context is not None
+        }
+        for trace_id in trace_ids:
+            if self._live_parents.get(trace_id) or self._buffers.get(trace_id):
+                continue
+            stranded.extend(self._flush_pending_drop_metrics_locked(trace_id))
+            self._release_idle_trace_side_tables_locked(trace_id)
+        return stranded
 
     def _export_spans(self, spans: Sequence[ReadableSpan]) -> None:
         with self._export_lock:
