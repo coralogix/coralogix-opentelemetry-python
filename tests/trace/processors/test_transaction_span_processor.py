@@ -401,12 +401,16 @@ def test_slow_export_does_not_block_holdback_deadlines() -> None:
     )
     original_dispatch = processor._dispatch_accept_completed
 
-    def tracking_dispatch(batches: Sequence[Sequence[ReadableSpan]]) -> None:
+    def tracking_dispatch(
+        batches: Sequence[Sequence[ReadableSpan]],
+        *,
+        deadline: float | None = None,
+    ) -> bool:
         with dispatched_lock:
             for batch in batches:
                 if batch:
                     dispatched_names.append(batch[0].name)
-        original_dispatch(batches)
+        return original_dispatch(batches, deadline=deadline)
 
     processor._dispatch_accept_completed = tracking_dispatch  # type: ignore[method-assign]
 
@@ -625,6 +629,98 @@ def test_force_flush_timeout_covers_harvest_drain() -> None:
     assert processor.force_flush(timeout_millis=2000) is True
     provider.shutdown()  # type: ignore[no-untyped-call]
     assert any(span.name == "winner" for span in exporter.spans)
+
+
+def test_force_flush_waits_for_queue_capacity_instead_of_dropping(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """force_flush must not drop-and-succeed when the finalize queue is temporarily full."""
+    monkeypatch.setattr(
+        "coralogix_opentelemetry.trace.processors.transaction_span_processor."
+        "DEFAULT_MAX_FINALIZE_QUEUE",
+        1,
+    )
+    export_entered = threading.Event()
+    release_export = threading.Event()
+
+    class BlockingExporter(ListSpanExporter):
+        def export(self, spans: Sequence[ReadableSpan]) -> SpanExportResult:
+            export_entered.set()
+            assert release_export.wait(timeout=5.0)
+            return super().export(spans)
+
+    exporter = BlockingExporter()
+    processor = TransactionSpanProcessor(
+        exporter, max_regular_traces=0, completion_holdback_millis=60_000
+    )
+    assert processor._finalize_queue.maxsize == 1
+    provider = TracerProvider()
+    provider.add_span_processor(processor)
+    tracer = provider.get_tracer("test")
+
+    for name in ("a", "b", "c"):
+        tracer.start_span(name, kind=SpanKind.SERVER).end()
+
+    # force_flush extracts three holdback batches; with queue size 1 and a blocked
+    # exporter the second put must wait — and flush must report failure, not
+    # abandon-and-return-True.
+    started = time.monotonic()
+    assert processor.force_flush(timeout_millis=100) is False
+    assert time.monotonic() - started < 1.5
+    assert export_entered.wait(timeout=2.0)
+
+    release_export.set()
+    # A later flush with room to run should finish remaining work.
+    assert processor.force_flush(timeout_millis=2000) is True
+    provider.shutdown()  # type: ignore[no-untyped-call]
+    names = {span.name for span in exporter.spans}
+    # At least the batch that was in-flight during the timed-out flush.
+    assert "a" in names or "b" in names or "c" in names
+
+
+def test_force_flush_reports_failure_when_harvest_winners_deferred() -> None:
+    """Deferred harvest winners must not let force_flush claim success."""
+    from coralogix_opentelemetry.trace.processors.transaction_span_processor import (
+        _HarvestExport,
+    )
+
+    exporter = ListSpanExporter()
+    processor = TransactionSpanProcessor(
+        exporter,
+        max_regular_traces=3,
+        harvest_period_millis=3_600_000,
+        completion_holdback_millis=0,
+    )
+    provider = TracerProvider()
+    provider.add_span_processor(processor)
+    tracer = provider.get_tracer("test")
+
+    for name in ("w1", "w2", "w3"):
+        tracer.start_span(name, kind=SpanKind.SERVER).end()
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline and len(processor._harvest) < 3:
+        time.sleep(0.01)
+    assert len(processor._harvest) == 3
+
+    original_enqueue = processor._enqueue_finalize_item
+    block_harvest = {"on": True}
+
+    def flaky_enqueue(item: object, *, deadline: float | None = None) -> bool:
+        if block_harvest["on"] and isinstance(item, _HarvestExport):
+            return False
+        return original_enqueue(item, deadline=deadline)
+
+    processor._enqueue_finalize_item = flaky_enqueue  # type: ignore[method-assign]
+
+    started = time.monotonic()
+    assert processor.force_flush(timeout_millis=100) is False
+    assert time.monotonic() - started < 1.5
+    assert len(processor._harvest) == 3
+
+    block_harvest["on"] = False
+    assert processor.force_flush(timeout_millis=2000) is True
+    provider.shutdown()  # type: ignore[no-untyped-call]
+    assert {span.name for span in exporter.spans} >= {"w1", "w2", "w3"}
 
 
 def test_zero_holdback_end_does_not_block_on_slow_export() -> None:

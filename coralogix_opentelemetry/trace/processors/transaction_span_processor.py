@@ -368,21 +368,47 @@ class TransactionSpanProcessor(SpanProcessor):
                         self._membership.pop(span.context.span_id, None)
                 self._idle.notify_all()
 
+    def _enqueue_finalize_item(
+        self, item: object, *, deadline: Optional[float] = None
+    ) -> bool:
+        """Put one finalize/harvest item on the worker queue.
+
+        When ``deadline`` is None (Span.end / holdback path), drop immediately on
+        Full. When a deadline is set (force_flush), wait for capacity until then.
+        """
+        if deadline is None:
+            try:
+                self._finalize_queue.put_nowait(item)
+                return True
+            except queue.Full:
+                return False
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            try:
+                self._finalize_queue.put(item, timeout=remaining)
+                return True
+            except queue.Full:
+                return False
+
     def _dispatch_accept_completed(
-        self, batches: Sequence[Sequence[ReadableSpan]]
-    ) -> None:
+        self,
+        batches: Sequence[Sequence[ReadableSpan]],
+        *,
+        deadline: Optional[float] = None,
+    ) -> bool:
         """Queue finalize/export so callers never block on exporters.
 
-        If the bounded queue is full (exporter stalled under load), record
-        metrics then drop the batch — preferring bounded memory over unbounded
-        backlog growth, while keeping the "metrics for every completed local
-        trace" guarantee.
+        Hot path (no deadline): if the queue is full, record metrics then drop.
+        force_flush (deadline set): wait for capacity until the deadline; return
+        False if any batch could not be queued in time (no silent drop+success).
         """
-        for batch in batches:
+        for index, batch in enumerate(batches):
             payload = list(batch)
-            try:
-                self._finalize_queue.put_nowait(payload)
-            except queue.Full:
+            if self._enqueue_finalize_item(payload, deadline=deadline):
+                continue
+            if deadline is None:
                 _LOG.error(
                     "TransactionSpanProcessor finalize queue full "
                     "(max=%d); dropping completed batch of %d span(s)",
@@ -390,6 +416,19 @@ class TransactionSpanProcessor(SpanProcessor):
                     len(payload),
                 )
                 self._abandon_completed_batch(payload)
+                continue
+            _LOG.error(
+                "TransactionSpanProcessor finalize queue full "
+                "(max=%d); force_flush could not enqueue batch of %d span(s) "
+                "before deadline",
+                DEFAULT_MAX_FINALIZE_QUEUE,
+                len(payload),
+            )
+            self._abandon_completed_batch(payload)
+            for rest in batches[index + 1 :]:
+                self._abandon_completed_batch(list(rest))
+            return False
+        return True
 
     def _finalize_loop(self) -> None:
         while True:
@@ -416,34 +455,54 @@ class TransactionSpanProcessor(SpanProcessor):
             finally:
                 self._finalize_queue.task_done()
 
-    def _enqueue_harvest_winners(self) -> None:
-        """Move drained harvest winners onto the finalize worker (deadline-aware path)."""
-        stubs: List[ReadableSpan] = []
-        with self._lock:
-            if self._exporter_shutdown:
-                return
-            winners = self._harvest.drain()
-            if not winners:
-                return
-            self._pending_finalize += len(winners)
+    def _enqueue_harvest_winners(self, *, deadline: float) -> bool:
+        """Drain harvest winners onto the finalize worker within ``deadline``.
+
+        Retries when the queue is full so force_flush does not report success
+        while winners remain only on the heap. Returns False if any winners are
+        still unexported when the deadline expires.
+        """
+        while True:
+            stubs: List[ReadableSpan] = []
+            with self._lock:
+                if self._exporter_shutdown:
+                    return True
+                winners = self._harvest.drain()
+                if not winners:
+                    return True
+                self._pending_finalize += len(winners)
+
+            deferred = False
             for index, winner in enumerate(winners):
-                try:
-                    self._finalize_queue.put_nowait(_HarvestExport(list(winner.spans)))
-                except queue.Full:
-                    rest = winners[index:]
+                item = _HarvestExport(list(winner.spans))
+                if self._enqueue_finalize_item(item, deadline=deadline):
+                    continue
+                rest = winners[index:]
+                with self._lock:
                     self._pending_finalize -= len(rest)
-                    # Capacity-aware re-admit (concurrent witness may have filled heap).
                     stubs = self._harvest.restore(rest)
                     self._idle.notify_all()
-                    _LOG.error(
-                        "TransactionSpanProcessor finalize queue full "
-                        "(max=%d); deferring %d harvest winner(s)",
-                        DEFAULT_MAX_FINALIZE_QUEUE,
-                        len(rest),
-                    )
-                    break
-        if stubs:
-            self._export_spans(stubs)
+                _LOG.error(
+                    "TransactionSpanProcessor finalize queue full "
+                    "(max=%d); deferring %d harvest winner(s)",
+                    DEFAULT_MAX_FINALIZE_QUEUE,
+                    len(rest),
+                )
+                deferred = True
+                break
+
+            if stubs:
+                self._export_spans(stubs)
+
+            if not deferred:
+                return True
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                with self._lock:
+                    return len(self._harvest) == 0
+            with self._lock:
+                self._idle.wait(timeout=min(0.05, remaining))
 
     def force_flush(self, timeout_millis: int = 30000) -> bool:
         deadline = time.monotonic() + max(0.001, timeout_millis / 1000.0)
@@ -452,8 +511,9 @@ class TransactionSpanProcessor(SpanProcessor):
                 return True
             batches = self._flush_pending_completions_locked()
             self._pending_finalize += len(batches)
-        # Enqueue so a blocked exporter cannot stall past timeout_millis.
-        self._dispatch_accept_completed(batches)
+        # Wait for queue capacity within the deadline — do not drop-and-succeed.
+        if not self._dispatch_accept_completed(batches, deadline=deadline):
+            return False
         with self._lock:
             while self._pending_finalize > 0:
                 remaining = deadline - time.monotonic()
@@ -465,7 +525,8 @@ class TransactionSpanProcessor(SpanProcessor):
             return False
 
         # Harvest drain must also honor the deadline (export via finalize worker).
-        self._enqueue_harvest_winners()
+        if not self._enqueue_harvest_winners(deadline=deadline):
+            return False
         with self._lock:
             while self._pending_finalize > 0:
                 remaining = deadline - time.monotonic()
