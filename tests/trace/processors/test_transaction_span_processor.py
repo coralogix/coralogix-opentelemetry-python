@@ -511,6 +511,46 @@ def test_force_flush_timeout_covers_extracted_holdback_batches() -> None:
     assert {span.name for span in exporter.spans} == {"held"}
 
 
+def test_force_flush_timeout_covers_harvest_drain() -> None:
+    """Harvest winners must export via the finalize worker so force_flush can time out."""
+    export_entered = threading.Event()
+    release_export = threading.Event()
+
+    class BlockingExporter(ListSpanExporter):
+        def export(self, spans: Sequence[ReadableSpan]) -> SpanExportResult:
+            export_entered.set()
+            assert release_export.wait(timeout=5.0)
+            return super().export(spans)
+
+    exporter = BlockingExporter()
+    processor = TransactionSpanProcessor(
+        exporter,
+        max_regular_traces=1,
+        harvest_period_millis=3_600_000,
+        completion_holdback_millis=0,
+    )
+    provider = TracerProvider()
+    provider.add_span_processor(processor)
+    tracer = provider.get_tracer("test")
+
+    tracer.start_span("winner", kind=SpanKind.SERVER).end()
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline and len(processor._harvest) < 1:
+        time.sleep(0.01)
+    assert len(processor._harvest) == 1
+    assert not export_entered.is_set()
+
+    started = time.monotonic()
+    assert processor.force_flush(timeout_millis=80) is False
+    assert time.monotonic() - started < 1.5
+    assert export_entered.wait(timeout=2.0)
+
+    release_export.set()
+    assert processor.force_flush(timeout_millis=2000) is True
+    provider.shutdown()  # type: ignore[no-untyped-call]
+    assert any(span.name == "winner" for span in exporter.spans)
+
+
 def test_zero_holdback_end_does_not_block_on_slow_export() -> None:
     """With holdback=0, Span.end must still dispatch finalize instead of exporting inline."""
     first_export_entered = threading.Event()
