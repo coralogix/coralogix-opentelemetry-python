@@ -30,6 +30,7 @@ For each completed local transaction the export pipeline is:
 from __future__ import annotations
 
 import logging
+import os
 import queue
 import threading
 import time
@@ -138,12 +139,7 @@ class TransactionSpanProcessor(SpanProcessor):
             maxsize=DEFAULT_MAX_FINALIZE_QUEUE
         )
         self._finalize_stop = threading.Event()
-        self._finalize_worker = threading.Thread(
-            target=self._finalize_loop,
-            name="TransactionSpanProcessor-finalize",
-            daemon=True,
-        )
-        self._finalize_worker.start()
+        self._start_finalize_worker()
         self._stopped = False
         self._exporter_shutdown = False
         self._shutdown_started = False
@@ -156,6 +152,47 @@ class TransactionSpanProcessor(SpanProcessor):
         self._self_duration_hist: Histogram = create_self_duration_histogram(
             meter_provider
         )
+        if hasattr(os, "register_at_fork"):
+            os.register_at_fork(after_in_child=self._restart_after_fork)
+
+    def _start_finalize_worker(self) -> None:
+        self._finalize_worker = threading.Thread(
+            target=self._finalize_loop,
+            name="TransactionSpanProcessor-finalize",
+            daemon=True,
+        )
+        self._finalize_worker.start()
+
+    def _restart_after_fork(self) -> None:
+        """Discard parent-only pending work and recreate child worker state."""
+        self._lock = threading.Lock()
+        self._export_lock = threading.Lock()
+        self._idle = threading.Condition(self._lock)
+        self._holdback.restart_after_fork()
+        self._finalize_queue = queue.Queue(maxsize=DEFAULT_MAX_FINALIZE_QUEUE)
+        self._finalize_stop = threading.Event()
+        self._pending_finalize = 0
+        self._deferred_finalize = []
+        self._buffers.clear()
+        self._live_parents.clear()
+        self._membership.clear()
+        self._span_contexts.clear()
+        self._span_parent_ids.clear()
+        self._parent_rebind.clear()
+        self._trace_span_ids.clear()
+        self._pending_completions.clear()
+        self._pending_nested_completions.clear()
+        self._pending_drop_metrics.clear()
+        self._pending_drop_waiters.clear()
+        self._inflight_batches_by_trace.clear()
+        self._evicted_from_buffer.clear()
+        self._root_final_names.clear()
+        self._child_intervals.clear()
+        self._shutdown_started = False
+        self._shutdown_done = threading.Event()
+        if not self._exporter_shutdown:
+            self._stopped = False
+            self._start_finalize_worker()
 
     def on_start(self, span: Span, parent_context: Optional[Context] = None) -> None:
         """Track membership + root flag only; do not freeze transaction name."""
@@ -1052,12 +1089,8 @@ class TransactionSpanProcessor(SpanProcessor):
                 self._run_accept_completed(batch)
 
             with self._lock:
-                deadline = time.monotonic() + 30.0
                 while self._pending_finalize > 0:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        break
-                    self._idle.wait(timeout=remaining)
+                    self._idle.wait()
 
             with self._lock:
                 self._exporter_shutdown = True
