@@ -44,10 +44,8 @@ from coralogix_opentelemetry.trace.processors.defaults import (
 from coralogix_opentelemetry.trace.processors.holdback_scheduler import (
     HoldbackScheduler,
 )
-from coralogix_opentelemetry.trace.processors.trace_heap import (
-    reparent_to_kept_ancestors,
-    select_slowest_spans,
-)
+from coralogix_opentelemetry.trace.processors.span_copy import copy_with_parent
+from coralogix_opentelemetry.trace.processors.trace_heap import select_slowest_spans
 from coralogix_opentelemetry.trace.processors.transaction_extract import (
     extract_completed_local_transactions,
     has_extractable_nested_transaction,
@@ -70,7 +68,7 @@ from opentelemetry.context import Context
 from opentelemetry.metrics import Histogram, MeterProvider
 from opentelemetry.sdk.trace import ReadableSpan, Span, SpanProcessor
 from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
-from opentelemetry.trace import format_span_id, get_current_span
+from opentelemetry.trace import SpanContext, format_span_id, get_current_span
 
 _LOG = logging.getLogger(__name__)
 
@@ -110,6 +108,11 @@ class TransactionSpanProcessor(SpanProcessor):
         self._buffers: Dict[int, List[ReadableSpan]] = {}
         self._live_parents: Dict[int, Dict[int, int]] = {}
         self._membership: Dict[int, TransactionMembership] = {}
+        # Compact parent links / contexts so live-buffer eviction can rebind
+        # descendants without retaining every ended ancestor ReadableSpan.
+        self._span_contexts: Dict[int, SpanContext] = {}
+        self._span_parent_ids: Dict[int, int] = {}
+        self._parent_rebind: Dict[int, int] = {}
         self._child_intervals: Dict[int, List[Tuple[int, int]]] = {}
         self._pending_completions: Dict[int, int] = {}
         self._pending_nested_completions: Dict[int, int] = {}
@@ -160,10 +163,17 @@ class TransactionSpanProcessor(SpanProcessor):
         with self._lock:
             parent_member = self._membership.get(parent_id) if parent_id else None
             inherited_from_ts = parent_transaction_from_tracestate(parent_span)
+            trace_already_tracked = (
+                span.context.trace_id in self._live_parents
+                or span.context.trace_id in self._buffers
+            )
             parent_has_local = (
                 parent_member is not None
                 or parent_has_transaction_attrs(parent_span)
                 or inherited_from_ts is not None
+                # Parent may have been live-trimmed out of the buffer while a
+                # caller still holds its context; keep inheriting on this TraceID.
+                or (bool(parent_id) and trace_already_tracked)
             )
 
         starts = starts_new_transaction(
@@ -230,6 +240,41 @@ class TransactionSpanProcessor(SpanProcessor):
                     inherited_name = inherited_from_ts or parent_transaction_from_attrs(
                         parent_span
                     )
+                # start_new_transaction() may mark the parent as a root after
+                # the parent's on_start recorded is_root=False. Promote so
+                # children join the nested transaction and live-trim protects it.
+                if (
+                    parent_member is not None
+                    and parent_id
+                    and (
+                        (getattr(parent_span, "attributes", None) or {}).get(
+                            CoralogixAttributes.TRANSACTION_ROOT
+                        )
+                        is True
+                    )
+                ):
+                    parent_member.is_root = True
+                    parent_member.root_span_id = parent_id
+                    if explicit_transaction_override(parent_span):
+                        parent_preset = parent_transaction_from_attrs(parent_span)
+                        if parent_preset is not None:
+                            parent_member.override_name = parent_preset
+                    root_span_id = parent_id
+                elif parent_member is None and parent_id:
+                    # Walk compact links to the nearest known transaction root.
+                    cur = parent_id
+                    seen_walk: Set[int] = set()
+                    while cur and cur not in seen_walk:
+                        seen_walk.add(cur)
+                        walked = self._membership.get(cur)
+                        if walked is not None:
+                            root_span_id = walked.root_span_id
+                            break
+                        cur = self._span_parent_ids.get(cur, 0)
+                    else:
+                        open_roots = self._open_transaction_root_ids_locked(trace_id)
+                        if open_roots:
+                            root_span_id = next(iter(open_roots))
                 self._membership[span_id] = TransactionMembership(
                     root_span_id=root_span_id,
                     is_root=False,
@@ -237,6 +282,12 @@ class TransactionSpanProcessor(SpanProcessor):
                     inherited_name=inherited_name,
                     start_name=start_name,
                 )
+
+            self._span_contexts[span_id] = span.context
+            if parent_id:
+                self._span_parent_ids[span_id] = parent_id
+            else:
+                self._span_parent_ids.pop(span_id, None)
 
             self._cancel_pending_completion_locked(trace_id)
             if self._stopped:
@@ -261,6 +312,10 @@ class TransactionSpanProcessor(SpanProcessor):
         preset = attrs.get(CoralogixAttributes.TRANSACTION_IDENTIFIER)
         with self._lock:
             member = self._membership.get(span.context.span_id)
+            if member is not None and attrs.get(CoralogixAttributes.TRANSACTION_ROOT):
+                # Dynamic root (e.g. start_new_transaction on an INTERNAL child).
+                member.is_root = True
+                member.root_span_id = span.context.span_id
             if member is not None and member.is_root and preset is not None:
                 if explicit_transaction_override(span):
                     member.override_name = str(preset)
@@ -281,6 +336,16 @@ class TransactionSpanProcessor(SpanProcessor):
                     # Ignore sampler copy of the outer txn onto a nested root.
                     if parent_txn is None or str(preset) != parent_txn:
                         member.override_name = str(preset)
+
+        # Live-buffer eviction may have rebound this span's parent past dropped
+        # ancestors; apply before buffering so export does not keep a dangling id.
+        with self._lock:
+            rebind_parent_id = self._parent_rebind.pop(span.context.span_id, None)
+            rebind_ctx = (
+                self._span_contexts.get(rebind_parent_id) if rebind_parent_id else None
+            )
+        if rebind_ctx is not None:
+            span = copy_with_parent(span, rebind_ctx)
 
         trace_id = span.context.trace_id
         completed_batches: List[List[ReadableSpan]] = []
@@ -409,36 +474,21 @@ class TransactionSpanProcessor(SpanProcessor):
             )
         finally:
             with self._lock:
-                ancestors = self._live_ancestor_ids_locked(trace_id)
                 for span in spans:
                     if span.context is None:
                         continue
-                    sid = span.context.span_id
-                    self._child_intervals.pop(sid, None)
-                    # Keep membership while live descendants still need ancestry.
-                    if sid not in ancestors:
-                        self._membership.pop(sid, None)
+                    # Keep compact membership/parent links after live-trim eviction.
+                    # A child may still start under this parent via an explicit
+                    # context handle; dropping membership would spawn a spurious
+                    # new transaction root. ReadableSpans are already gone.
+                    self._child_intervals.pop(span.context.span_id, None)
 
-    def _live_ancestor_ids_locked(self, trace_id: int) -> Set[int]:
-        """Span IDs on the path from each live span up to (and including) itself."""
-        live = self._live_parents.get(trace_id) or {}
-        parent_of: Dict[int, int] = dict(live)
-        for span in self._buffers.get(trace_id) or []:
-            if (
-                span.context is not None
-                and span.parent is not None
-                and span.parent.is_valid
-            ):
-                parent_of[span.context.span_id] = span.parent.span_id
-        ancestors: Set[int] = set()
-        for live_id in live:
-            cur = live_id
-            seen: Set[int] = set()
-            while cur and cur not in seen:
-                ancestors.add(cur)
-                seen.add(cur)
-                cur = parent_of.get(cur, 0)
-        return ancestors
+    def _forget_span_locked(self, span_id: int) -> None:
+        """Drop side-table rows for a span that will not be exported."""
+        self._membership.pop(span_id, None)
+        self._span_contexts.pop(span_id, None)
+        self._span_parent_ids.pop(span_id, None)
+        self._parent_rebind.pop(span_id, None)
 
     def _open_transaction_root_ids_locked(self, trace_id: int) -> Set[int]:
         """Roots that still have at least one live member on this TraceID."""
@@ -455,20 +505,21 @@ class TransactionSpanProcessor(SpanProcessor):
     def _trim_live_buffer_locked(self, trace_id: int) -> List[ReadableSpan]:
         """Evict surplus ended spans under open transactions; return for metrics.
 
-        A transaction stays \"open\" while any live span still belongs to its
-        root (including async children that outlive the root). Nested completed
-        subtrees waiting on holdback stay untouched. Caller must hold ``_lock``.
+        Each open local transaction gets its own ``max_nodes`` budget. Transaction
+        roots are protected; ended ancestors of live spans are not retained — live
+        descendants are rebound to the nearest kept ancestor instead. Caller must
+        hold ``_lock``.
         """
         if self._max_nodes <= 0:
             return []
         buf = self._buffers.get(trace_id)
-        if buf is None or len(buf) <= self._max_nodes:
+        if buf is None:
             return []
 
         live = self._live_parents.get(trace_id) or {}
         open_root_ids = self._open_transaction_root_ids_locked(trace_id)
         frozen: List[ReadableSpan] = []
-        open_spans: List[ReadableSpan] = []
+        by_root: Dict[int, List[ReadableSpan]] = {}
         for span in buf:
             if span.context is None:
                 continue
@@ -477,50 +528,81 @@ class TransactionSpanProcessor(SpanProcessor):
                 member.root_span_id if member is not None else span.context.span_id
             )
             if root_id in open_root_ids:
-                open_spans.append(span)
+                by_root.setdefault(root_id, []).append(span)
             else:
                 frozen.append(span)
 
-        # Slots reserved for roots that are still live (not yet in the buffer).
-        reserve = sum(1 for root_id in open_root_ids if root_id in live)
-        child_cap = max(0, self._max_nodes - reserve)
-        if len(open_spans) <= child_cap:
+        needs_trim = False
+        for root_id, spans in by_root.items():
+            reserve = 1 if root_id in live else 0
+            if len(spans) > max(0, self._max_nodes - reserve):
+                needs_trim = True
+                break
+        if not needs_trim:
             return []
 
-        protect: List[str] = []
-        ancestor_ids = self._live_ancestor_ids_locked(trace_id)
-        for span in open_spans:
-            if span.context is None:
+        kept_open: List[ReadableSpan] = []
+        dropped: List[ReadableSpan] = []
+        for root_id, spans in by_root.items():
+            reserve = 1 if root_id in live else 0
+            cap = max(0, self._max_nodes - reserve)
+            if len(spans) <= cap:
+                kept_open.extend(spans)
                 continue
-            sid = span.context.span_id
-            member = self._membership.get(sid)
-            if (member is not None and member.is_root) or sid in ancestor_ids:
-                protect.append(format_span_id(sid))
-        kept_open = select_slowest_spans(
-            open_spans,
-            max_nodes=max(child_cap, len(protect)),
-            root_span_ids=protect,
-        )
-        kept_ids = {
-            span.context.span_id for span in kept_open if span.context is not None
+
+            protect: List[str] = []
+            for span in spans:
+                if span.context is None:
+                    continue
+                sid = span.context.span_id
+                member = self._membership.get(sid)
+                attrs = span.attributes or {}
+                if (member is not None and member.is_root) or attrs.get(
+                    CoralogixAttributes.TRANSACTION_ROOT
+                ):
+                    protect.append(format_span_id(sid))
+
+            # Strict per-transaction cap. Do not expand for ancestry — rebind
+            # live descendants below instead of retaining every ended parent.
+            trimmed = select_slowest_spans(spans, max_nodes=cap, root_span_ids=protect)
+            kept_ids = {
+                span.context.span_id for span in trimmed if span.context is not None
+            }
+            dropped.extend(
+                span
+                for span in spans
+                if span.context is not None and span.context.span_id not in kept_ids
+            )
+            kept_open.extend(trimmed)
+
+        dropped_ids = {
+            span.context.span_id for span in dropped if span.context is not None
         }
-        # Never drop an ancestor of a still-live span.
-        for span in open_spans:
-            if span.context is not None and span.context.span_id in ancestor_ids:
-                kept_ids.add(span.context.span_id)
-        # Rebuild from originals then reparent so an ended child whose parent
-        # was evicted does not keep a dangling parent id in the live buffer.
-        raw_kept = [
-            span
-            for span in open_spans
-            if span.context is not None and span.context.span_id in kept_ids
-        ]
-        kept_open = reparent_to_kept_ancestors(raw_kept, all_spans=open_spans)
-        dropped = [
-            span
-            for span in open_spans
-            if span.context is not None and span.context.span_id not in kept_ids
-        ]
+        if dropped_ids and live:
+            parent_of: Dict[int, int] = dict(self._span_parent_ids)
+            parent_of.update(live)
+            for span in buf:
+                if (
+                    span.context is not None
+                    and span.parent is not None
+                    and span.parent.is_valid
+                ):
+                    parent_of[span.context.span_id] = span.parent.span_id
+            for live_id in list(live.keys()):
+                parent_id = live.get(live_id, 0)
+                seen: Set[int] = set()
+                while parent_id and parent_id in dropped_ids and parent_id not in seen:
+                    seen.add(parent_id)
+                    parent_id = parent_of.get(parent_id, 0)
+                if parent_id != live.get(live_id, 0):
+                    live[live_id] = parent_id
+                    if parent_id:
+                        self._parent_rebind[live_id] = parent_id
+                        self._span_parent_ids[live_id] = parent_id
+                    else:
+                        self._parent_rebind.pop(live_id, None)
+                        self._span_parent_ids.pop(live_id, None)
+
         self._buffers[trace_id] = frozen + kept_open
         if dropped:
             _LOG.error(
@@ -568,7 +650,7 @@ class TransactionSpanProcessor(SpanProcessor):
                 for span in batch:
                     if span.context is not None:
                         self._child_intervals.pop(span.context.span_id, None)
-                        self._membership.pop(span.context.span_id, None)
+                        self._forget_span_locked(span.context.span_id)
                 self._idle.notify_all()
 
     def _retain_deferred_batches(
@@ -738,7 +820,7 @@ class TransactionSpanProcessor(SpanProcessor):
                         for span in dropped:
                             if span.context is not None:
                                 self._child_intervals.pop(span.context.span_id, None)
-                                self._membership.pop(span.context.span_id, None)
+                                self._forget_span_locked(span.context.span_id)
                         continue
                     extracted = self._extract_completed_local_transactions_locked(
                         trace_id, flush_leftover=True
@@ -763,6 +845,9 @@ class TransactionSpanProcessor(SpanProcessor):
                 self._exporter_shutdown = True
                 self._child_intervals.clear()
                 self._membership.clear()
+                self._span_contexts.clear()
+                self._span_parent_ids.clear()
+                self._parent_rebind.clear()
             with self._export_lock:
                 self._exporter.shutdown()
         finally:
@@ -955,7 +1040,7 @@ class TransactionSpanProcessor(SpanProcessor):
                 for span in annotated:
                     if span.context is not None:
                         self._child_intervals.pop(span.context.span_id, None)
-                        self._membership.pop(span.context.span_id, None)
+                        self._forget_span_locked(span.context.span_id)
             return
 
         try:
@@ -965,7 +1050,7 @@ class TransactionSpanProcessor(SpanProcessor):
                 for span in annotated:
                     if span.context is not None:
                         self._child_intervals.pop(span.context.span_id, None)
-                        self._membership.pop(span.context.span_id, None)
+                        self._forget_span_locked(span.context.span_id)
 
     def _export_spans(self, spans: Sequence[ReadableSpan]) -> None:
         with self._export_lock:
