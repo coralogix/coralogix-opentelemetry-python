@@ -83,7 +83,8 @@ DEFAULT_MAX_NODES = DEFAULT_MAX_TXN_TRACE_NODES
 # HoldbackScheduler keys: distinguish idle vs nested arms for the same TraceID.
 _HOLD_IDLE = "idle"
 _HOLD_NESTED = "nested"
-_FINALIZE_STOP = object()
+# Cap queued completed batches so a stalled exporter cannot grow memory without bound.
+DEFAULT_MAX_FINALIZE_QUEUE = 256
 
 
 class TransactionSpanProcessor(SpanProcessor):
@@ -122,7 +123,11 @@ class TransactionSpanProcessor(SpanProcessor):
         self._pending_nested_completions: Dict[int, int] = {}
         self._holdback = HoldbackScheduler()
         # Holdback deadlines must not wait on exporters; finalize/export runs here.
-        self._finalize_queue: queue.Queue = queue.Queue()
+        # Bound the queue so a stalled exporter drops overflow instead of OOM.
+        self._finalize_queue: queue.Queue = queue.Queue(
+            maxsize=DEFAULT_MAX_FINALIZE_QUEUE
+        )
+        self._finalize_stop = threading.Event()
         self._finalize_worker = threading.Thread(
             target=self._finalize_loop,
             name="TransactionSpanProcessor-finalize",
@@ -300,24 +305,52 @@ class TransactionSpanProcessor(SpanProcessor):
                 self._pending_finalize -= 1
                 self._idle.notify_all()
 
+    def _abandon_completed_batch(self, batch: Sequence[ReadableSpan]) -> None:
+        """Drop a completed batch that could not be queued; keep counters balanced."""
+        with self._lock:
+            self._pending_finalize -= 1
+            for span in batch:
+                if span.context is not None:
+                    self._child_intervals.pop(span.context.span_id, None)
+                    self._membership.pop(span.context.span_id, None)
+            self._idle.notify_all()
+
     def _dispatch_accept_completed(
         self, batches: Sequence[Sequence[ReadableSpan]]
     ) -> None:
-        """Queue finalize/export so the holdback worker never blocks on exporters."""
+        """Queue finalize/export so the holdback worker never blocks on exporters.
+
+        If the bounded queue is full (exporter stalled under load), drop the batch
+        and log — preferring bounded memory over unbounded backlog growth.
+        """
         for batch in batches:
-            self._finalize_queue.put(list(batch))
+            payload = list(batch)
+            try:
+                self._finalize_queue.put_nowait(payload)
+            except queue.Full:
+                _LOG.error(
+                    "TransactionSpanProcessor finalize queue full "
+                    "(max=%d); dropping completed batch of %d span(s)",
+                    DEFAULT_MAX_FINALIZE_QUEUE,
+                    len(payload),
+                )
+                self._abandon_completed_batch(payload)
 
     def _finalize_loop(self) -> None:
         while True:
-            item = self._finalize_queue.get()
             try:
-                if item is _FINALIZE_STOP:
+                item = self._finalize_queue.get(timeout=0.25)
+            except queue.Empty:
+                if self._finalize_stop.is_set():
                     return
+                continue
+            try:
                 self._run_accept_completed(item)
             finally:
                 self._finalize_queue.task_done()
 
     def force_flush(self, timeout_millis: int = 30000) -> bool:
+        deadline = time.monotonic() + max(0.001, timeout_millis / 1000.0)
         with self._lock:
             if self._exporter_shutdown:
                 return True
@@ -326,13 +359,17 @@ class TransactionSpanProcessor(SpanProcessor):
         for batch in batches:
             self._run_accept_completed(batch)
         with self._lock:
-            deadline = time.monotonic() + max(0.001, timeout_millis / 1000.0)
             while self._pending_finalize > 0:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
                 self._idle.wait(timeout=remaining)
+            timed_out = self._pending_finalize > 0
+        if timed_out:
+            return False
+
         self._flush_harvest()
+        remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
         with self._export_lock:
             if self._exporter_shutdown:
                 return True
@@ -340,9 +377,9 @@ class TransactionSpanProcessor(SpanProcessor):
             if force_flush_fn is None:
                 return True
             try:
-                result = force_flush_fn(timeout_millis=timeout_millis)
+                result = force_flush_fn(timeout_millis=remaining_ms)
             except TypeError:
-                result = force_flush_fn(timeout_millis)
+                result = force_flush_fn(remaining_ms)
         return True if result is None else bool(result)
 
     def shutdown(self) -> None:
@@ -403,7 +440,7 @@ class TransactionSpanProcessor(SpanProcessor):
                 self._exporter.shutdown()
         finally:
             self._holdback.shutdown()
-            self._finalize_queue.put(_FINALIZE_STOP)
+            self._finalize_stop.set()
             self._finalize_worker.join(timeout=30.0)
             self._shutdown_done.set()
 
