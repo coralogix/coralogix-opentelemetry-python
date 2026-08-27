@@ -85,6 +85,7 @@ DEFAULT_MAX_DEFERRED_FINALIZE = DEFAULT_MAX_FINALIZE_QUEUE
 # Full dropped spans wait for a root's final name only up to this cap. Overflow
 # is recorded immediately with the root's start name to keep memory bounded.
 DEFAULT_MAX_DEFERRED_DROP_METRICS = DEFAULT_MAX_FINALIZE_QUEUE
+DEFAULT_MAX_CHILD_INTERVALS = DEFAULT_MAX_FINALIZE_QUEUE
 
 
 class TransactionSpanProcessor(SpanProcessor):
@@ -435,6 +436,14 @@ class TransactionSpanProcessor(SpanProcessor):
                         )
                     else:
                         merged.append((interval_start, interval_end))
+                while len(merged) > DEFAULT_MAX_CHILD_INTERVALS:
+                    index = min(
+                        range(len(merged) - 1),
+                        key=lambda i: merged[i + 1][0] - merged[i][1],
+                    )
+                    merged[index : index + 2] = [
+                        (merged[index][0], merged[index + 1][1])
+                    ]
                 self._child_intervals[original_parent_id] = merged
 
             # Live-buffer eviction may have rebound this span's parent past
@@ -602,8 +611,16 @@ class TransactionSpanProcessor(SpanProcessor):
                     sid = span.context.span_id
                     if sid in recorded_ids and sid not in self._pending_drop_metrics:
                         self._child_intervals.pop(sid, None)
-                        self._forget_span_locked(sid)
-                        self._evicted_from_buffer.get(trace_id, set()).discard(sid)
+                        if sid in self._evicted_from_buffer.get(trace_id, set()):
+                            # Keep only the compact parent edge and eviction
+                            # marker: a late child may still start from this
+                            # span's context before the trace becomes idle.
+                            self._membership.pop(sid, None)
+                            self._span_contexts.pop(sid, None)
+                            self._parent_rebind.pop(sid, None)
+                            self._root_final_names.pop(sid, None)
+                        else:
+                            self._forget_span_locked(sid)
                         trace_ids = self._trace_span_ids.get(trace_id)
                         if trace_ids is not None:
                             trace_ids.discard(sid)
