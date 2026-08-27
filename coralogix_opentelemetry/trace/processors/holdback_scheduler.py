@@ -80,6 +80,18 @@ class HoldbackScheduler:
             self._cv.notify_all()
         self._thread.join(timeout=timeout)
 
+    def restart_after_fork(self) -> None:
+        """Replace inherited synchronization and worker state in a fork child."""
+        self._cv = threading.Condition()
+        self._seq = 0
+        self._heap = []
+        self._active = {}
+        self._stopped = False
+        self._thread = threading.Thread(
+            target=self._run, name=self._thread.name, daemon=True
+        )
+        self._thread.start()
+
     def _compact_locked(self) -> None:
         live: List[_HeapItem] = [
             item for item in self._heap if self._active.get(item[2]) == item[1]

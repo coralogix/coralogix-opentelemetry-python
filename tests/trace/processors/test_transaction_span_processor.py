@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from typing import Sequence
@@ -1552,6 +1553,61 @@ def test_shutdown_flushes_pending_completed_trace() -> None:
     time.sleep(0.05)
     processor.shutdown()
     assert any(span.name == "root" for span in exporter.spans)
+
+
+def test_shutdown_drains_accepted_queue_before_stopping_exporter(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    export_started = threading.Event()
+    release_export = threading.Event()
+
+    class BlockingExporter(ListSpanExporter):
+        def export(self, spans: Sequence[ReadableSpan]) -> SpanExportResult:
+            export_started.set()
+            release_export.wait(timeout=2.0)
+            return super().export(spans)
+
+    exporter = BlockingExporter()
+    processor = TransactionSpanProcessor(exporter, completion_holdback_millis=0)
+    provider = TracerProvider()
+    provider.add_span_processor(processor)
+    tracer = provider.get_tracer("test")
+    tracer.start_span("first", kind=SpanKind.SERVER).end()
+    assert export_started.wait(timeout=1.0)
+    tracer.start_span("second", kind=SpanKind.SERVER).end()
+    monkeypatch.setattr(processor, "_wait_for_idle_locked", lambda timeout_sec: None)
+    shutdown = threading.Thread(target=processor.shutdown)
+    shutdown.start()
+    time.sleep(0.05)
+    release_export.set()
+    shutdown.join(timeout=2.0)
+    assert not shutdown.is_alive()
+    assert {span.name for span in exporter.spans} == {"first", "second"}
+
+
+def test_processor_restarts_workers_after_fork() -> None:
+    if not hasattr(os, "fork"):
+        return
+    read_fd, write_fd = os.pipe()
+    exporter = ListSpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(
+        TransactionSpanProcessor(exporter, completion_holdback_millis=0)
+    )
+    tracer = provider.get_tracer("test")
+    pid = os.fork()
+    if pid == 0:
+        os.close(read_fd)
+        tracer.start_span("child", kind=SpanKind.SERVER).end()
+        ok = provider.force_flush(timeout_millis=1000)
+        os.write(write_fd, b"1" if ok and exporter.spans else b"0")
+        os.close(write_fd)
+        os._exit(0)
+    os.close(write_fd)
+    assert os.read(read_fd, 1) == b"1"
+    os.close(read_fd)
+    assert os.waitpid(pid, 0)[1] == 0
+    provider.shutdown()  # type: ignore[no-untyped-call]
 
 
 def test_processor_server_under_local_parent_starts_new_transaction() -> None:
