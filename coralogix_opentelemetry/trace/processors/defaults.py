@@ -14,20 +14,16 @@ import os
 from typing import Optional
 
 DEFAULT_MAX_TXN_TRACE_NODES = 256
-DEFAULT_MAX_REGULAR_TRACES = 1
-DEFAULT_HARVEST_PERIOD_MILLIS = 60_000
 DEFAULT_COMPLETION_HOLDBACK_MILLIS = 100
 
 ENV_MAX_NODES = "OTEL_CX_TRANSACTION_MAX_NODES"
-ENV_MAX_REGULAR_TRACES = "OTEL_CX_TRANSACTION_MAX_REGULAR_TRACES"
-ENV_HARVEST_PERIOD_MILLIS = "OTEL_CX_TRANSACTION_HARVEST_PERIOD_MILLIS"
 ENV_COMPLETION_HOLDBACK_MILLIS = "OTEL_CX_TRANSACTION_COMPLETION_HOLDBACK_MILLIS"
 
 
 def env_int(name: str, default: int) -> int:
     """Parse ``name`` as int; return ``default`` when missing, invalid, or negative.
 
-    Zero is valid (e.g. disable harvest / holdback / trimming).
+    Zero is valid (e.g. disable holdback / trimming).
     """
     raw = os.environ.get(name)
     if raw is None or raw.strip() == "":
@@ -61,27 +57,6 @@ def resolve_max_nodes(value: Optional[int] = None) -> int:
     if value is not None:
         return _non_negative_or_default(value, DEFAULT_MAX_TXN_TRACE_NODES)
     return env_int(ENV_MAX_NODES, DEFAULT_MAX_TXN_TRACE_NODES)
-
-
-def resolve_max_regular_traces(value: Optional[int] = None) -> int:
-    """Slowest completed traces kept per harvest window.
-
-    ``0`` exports every completed trimmed trace immediately. Negative → default.
-    """
-    if value is not None:
-        return _non_negative_or_default(value, DEFAULT_MAX_REGULAR_TRACES)
-    return env_int(ENV_MAX_REGULAR_TRACES, DEFAULT_MAX_REGULAR_TRACES)
-
-
-def resolve_harvest_period_millis(value: Optional[int] = None) -> int:
-    """Harvest flush interval in milliseconds.
-
-    ``0`` exports every completed trace immediately (no harvest heap).
-    Negative → default.
-    """
-    if value is not None:
-        return _non_negative_or_default(value, DEFAULT_HARVEST_PERIOD_MILLIS)
-    return env_int(ENV_HARVEST_PERIOD_MILLIS, DEFAULT_HARVEST_PERIOD_MILLIS)
 
 
 def resolve_completion_holdback_millis(value: Optional[int] = None) -> int:
