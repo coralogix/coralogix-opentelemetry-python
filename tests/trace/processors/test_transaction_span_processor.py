@@ -382,9 +382,15 @@ def test_finalize_queue_drops_when_full(monkeypatch: MonkeyPatch) -> None:
                 assert release_exports.wait(timeout=5.0)
             return super().export(spans)
 
+    resource = Resource.create({"service.name": "test"})
+    reader = InMemoryMetricReader()
+    meter_provider = MeterProvider(resource=resource, metric_readers=[reader])
     exporter = BlockingExporter()
     processor = TransactionSpanProcessor(
-        exporter, max_regular_traces=0, completion_holdback_millis=30
+        exporter,
+        max_regular_traces=0,
+        completion_holdback_millis=30,
+        meter_provider=meter_provider,
     )
     assert processor._finalize_queue.maxsize == 1
     original_abandon = processor._abandon_completed_batch
@@ -395,7 +401,7 @@ def test_finalize_queue_drops_when_full(monkeypatch: MonkeyPatch) -> None:
 
     processor._abandon_completed_batch = tracking_abandon  # type: ignore[method-assign]
 
-    provider = TracerProvider()
+    provider = TracerProvider(resource=resource)
     provider.add_span_processor(processor)
     tracer = provider.get_tracer("test")
 
@@ -416,7 +422,21 @@ def test_finalize_queue_drops_when_full(monkeypatch: MonkeyPatch) -> None:
 
     release_exports.set()
     provider.force_flush()
+    meter_provider.force_flush()
+    span_names = set()
+    for rm in reader.get_metrics_data().resource_metrics:
+        for sm in rm.scope_metrics:
+            for metric in sm.metrics:
+                if metric.name != METRIC_SELF_DURATION:
+                    continue
+                for point in metric.data.data_points:
+                    span_names.add(dict(point.attributes).get("span.name"))
+    assert (
+        "dropped" in span_names
+    ), "overflow drop must still record self-duration metrics"
+
     provider.shutdown()  # type: ignore[no-untyped-call]
+    meter_provider.shutdown()
     names = {span.name for span in exporter.spans}
     assert "first" in names
     assert "queued" in names
@@ -445,12 +465,50 @@ def test_force_flush_returns_false_when_finalize_times_out() -> None:
     tracer.start_span("blocked", kind=SpanKind.SERVER).end()
     assert first_export_entered.wait(timeout=2.0)
 
+    started = time.monotonic()
     assert processor.force_flush(timeout_millis=50) is False
+    assert time.monotonic() - started < 1.0, "force_flush must not wait on exporter"
 
     release_export.set()
     assert processor.force_flush(timeout_millis=2000) is True
     provider.shutdown()  # type: ignore[no-untyped-call]
     assert {span.name for span in exporter.spans} == {"blocked"}
+
+
+def test_force_flush_timeout_covers_extracted_holdback_batches() -> None:
+    """Extracted holdback batches must use the finalize queue so timeout is honored."""
+    export_entered = threading.Event()
+    release_export = threading.Event()
+
+    class BlockingExporter(ListSpanExporter):
+        def export(self, spans: Sequence[ReadableSpan]) -> SpanExportResult:
+            export_entered.set()
+            assert release_export.wait(timeout=5.0)
+            return super().export(spans)
+
+    exporter = BlockingExporter()
+    processor = TransactionSpanProcessor(
+        exporter, max_regular_traces=0, completion_holdback_millis=60_000
+    )
+    provider = TracerProvider()
+    provider.add_span_processor(processor)
+    tracer = provider.get_tracer("test")
+
+    held = tracer.start_span("held", kind=SpanKind.SERVER)
+    held.end()
+    assert processor._holdback.is_armed(("idle", held.get_span_context().trace_id))
+
+    started = time.monotonic()
+    # force_flush extracts the armed holdback batch and must not block forever
+    # inside exporter.export when that work is queued to the finalize worker.
+    assert processor.force_flush(timeout_millis=80) is False
+    assert time.monotonic() - started < 1.5
+    assert export_entered.wait(timeout=2.0)
+
+    release_export.set()
+    assert processor.force_flush(timeout_millis=2000) is True
+    provider.shutdown()  # type: ignore[no-untyped-call]
+    assert {span.name for span in exporter.spans} == {"held"}
 
 
 def test_zero_holdback_end_does_not_block_on_slow_export() -> None:
@@ -505,7 +563,7 @@ def test_inherits_transaction_name_from_parent_attributes() -> None:
             }
 
         @property
-        def attributes(self):  # type: ignore[override]
+        def attributes(self) -> dict:
             return self._attributes
 
     exporter = ListSpanExporter()

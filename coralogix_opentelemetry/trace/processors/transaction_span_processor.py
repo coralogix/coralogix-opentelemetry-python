@@ -312,22 +312,51 @@ class TransactionSpanProcessor(SpanProcessor):
                 self._idle.notify_all()
 
     def _abandon_completed_batch(self, batch: Sequence[ReadableSpan]) -> None:
-        """Drop a completed batch that could not be queued; keep counters balanced."""
-        with self._lock:
-            self._pending_finalize -= 1
-            for span in batch:
-                if span.context is not None:
-                    self._child_intervals.pop(span.context.span_id, None)
-                    self._membership.pop(span.context.span_id, None)
-            self._idle.notify_all()
+        """Drop export for an unqueued batch; still record self-duration metrics."""
+        try:
+            with self._lock:
+                interval_snapshot: Dict[int, List[Tuple[int, int]]] = {
+                    span.context.span_id: list(
+                        self._child_intervals.get(span.context.span_id, [])
+                    )
+                    for span in batch
+                    if span.context is not None
+                }
+                membership_snapshot = {
+                    span.context.span_id: self._membership[span.context.span_id]
+                    for span in batch
+                    if span.context is not None
+                    and span.context.span_id in self._membership
+                }
+            annotate_completed_batch(
+                batch,
+                child_intervals=interval_snapshot,
+                membership=membership_snapshot,
+                self_duration_hist=self._self_duration_hist,
+            )
+        except Exception:
+            _LOG.exception(
+                "TransactionSpanProcessor failed while recording metrics for "
+                "a dropped finalize batch"
+            )
+        finally:
+            with self._lock:
+                self._pending_finalize -= 1
+                for span in batch:
+                    if span.context is not None:
+                        self._child_intervals.pop(span.context.span_id, None)
+                        self._membership.pop(span.context.span_id, None)
+                self._idle.notify_all()
 
     def _dispatch_accept_completed(
         self, batches: Sequence[Sequence[ReadableSpan]]
     ) -> None:
-        """Queue finalize/export so the holdback worker never blocks on exporters.
+        """Queue finalize/export so callers never block on exporters.
 
-        If the bounded queue is full (exporter stalled under load), drop the batch
-        and log — preferring bounded memory over unbounded backlog growth.
+        If the bounded queue is full (exporter stalled under load), record
+        metrics then drop the batch — preferring bounded memory over unbounded
+        backlog growth, while keeping the "metrics for every completed local
+        trace" guarantee.
         """
         for batch in batches:
             payload = list(batch)
@@ -362,8 +391,8 @@ class TransactionSpanProcessor(SpanProcessor):
                 return True
             batches = self._flush_pending_completions_locked()
             self._pending_finalize += len(batches)
-        for batch in batches:
-            self._run_accept_completed(batch)
+        # Enqueue so a blocked exporter cannot stall past timeout_millis.
+        self._dispatch_accept_completed(batches)
         with self._lock:
             while self._pending_finalize > 0:
                 remaining = deadline - time.monotonic()
