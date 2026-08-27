@@ -100,9 +100,7 @@ def test_inherits_transaction_from_parent_tracestate_when_parent_has_no_attribut
     exporter = ListSpanExporter()
     provider = TracerProvider(resource=resource)
     provider.add_span_processor(
-        TransactionSpanProcessor(
-            exporter, completion_holdback_millis=0, max_regular_traces=0
-        )
+        TransactionSpanProcessor(exporter, completion_holdback_millis=0)
     )
     tracer = provider.get_tracer("test")
 
@@ -137,9 +135,7 @@ def test_transaction_name_uses_final_root_name_after_update_name() -> None:
     exporter = ListSpanExporter()
     provider = TracerProvider()
     provider.add_span_processor(
-        TransactionSpanProcessor(
-            exporter, max_regular_traces=0, completion_holdback_millis=0
-        )
+        TransactionSpanProcessor(exporter, completion_holdback_millis=0)
     )
     tracer = provider.get_tracer("test")
 
@@ -167,9 +163,7 @@ def test_start_new_transaction_override_wins_over_span_name() -> None:
     exporter = ListSpanExporter()
     provider = TracerProvider()
     provider.add_span_processor(
-        TransactionSpanProcessor(
-            exporter, max_regular_traces=0, completion_holdback_millis=0
-        )
+        TransactionSpanProcessor(exporter, completion_holdback_millis=0)
     )
     tracer = provider.get_tracer("test")
 
@@ -200,9 +194,7 @@ def test_sampler_echo_does_not_block_update_name() -> None:
     exporter = ListSpanExporter()
     provider = TracerProvider(sampler=CoralogixTransactionSampler())
     provider.add_span_processor(
-        TransactionSpanProcessor(
-            exporter, max_regular_traces=0, completion_holdback_millis=0
-        )
+        TransactionSpanProcessor(exporter, completion_holdback_millis=0)
     )
     tracer = provider.get_tracer("test")
 
@@ -226,9 +218,7 @@ def test_start_new_transaction_equal_name_survives_rename() -> None:
     exporter = ListSpanExporter()
     provider = TracerProvider()
     provider.add_span_processor(
-        TransactionSpanProcessor(
-            exporter, max_regular_traces=0, completion_holdback_millis=0
-        )
+        TransactionSpanProcessor(exporter, completion_holdback_millis=0)
     )
     tracer = provider.get_tracer("test")
 
@@ -248,9 +238,7 @@ def test_preset_template_name_different_from_span_name_is_override() -> None:
     exporter = ListSpanExporter()
     provider = TracerProvider()
     provider.add_span_processor(
-        TransactionSpanProcessor(
-            exporter, max_regular_traces=0, completion_holdback_millis=0
-        )
+        TransactionSpanProcessor(exporter, completion_holdback_millis=0)
     )
     tracer = provider.get_tracer("test")
 
@@ -273,13 +261,9 @@ def test_env_vars_configure_options_when_constructor_omits_them(
     monkeypatch: MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("OTEL_CX_TRANSACTION_MAX_NODES", "12")
-    monkeypatch.setenv("OTEL_CX_TRANSACTION_MAX_REGULAR_TRACES", "3")
-    monkeypatch.setenv("OTEL_CX_TRANSACTION_HARVEST_PERIOD_MILLIS", "5000")
     monkeypatch.setenv("OTEL_CX_TRANSACTION_COMPLETION_HOLDBACK_MILLIS", "25")
     processor = TransactionSpanProcessor(ListSpanExporter())
     assert processor._max_nodes == 12
-    assert processor._max_regular_traces == 3
-    assert processor._harvest_period_millis == 5000
     assert processor._completion_holdback_millis == 25
     processor.shutdown()
 
@@ -315,7 +299,7 @@ def test_zero_max_nodes_disables_trimming() -> None:
     exporter = ListSpanExporter()
     provider = TracerProvider()
     processor = TransactionSpanProcessor(
-        exporter, max_nodes=0, max_regular_traces=0, completion_holdback_millis=0
+        exporter, max_nodes=0, completion_holdback_millis=0
     )
     provider.add_span_processor(processor)
     tracer = provider.get_tracer("test")
@@ -336,9 +320,7 @@ def test_accept_completed_failure_does_not_escape_on_end(
 ) -> None:
     exporter = ListSpanExporter()
     provider = TracerProvider()
-    processor = TransactionSpanProcessor(
-        exporter, max_regular_traces=0, completion_holdback_millis=0
-    )
+    processor = TransactionSpanProcessor(exporter, completion_holdback_millis=0)
     provider.add_span_processor(processor)
     tracer = provider.get_tracer("test")
 
@@ -356,9 +338,7 @@ def test_accept_completed_failure_does_not_escape_on_end(
 def test_holdback_uses_single_scheduler_thread() -> None:
     exporter = ListSpanExporter()
     processors = [
-        TransactionSpanProcessor(
-            exporter, max_regular_traces=0, completion_holdback_millis=200
-        )
+        TransactionSpanProcessor(exporter, completion_holdback_millis=200)
         for _ in range(3)
     ]
     provider = TracerProvider()
@@ -396,9 +376,7 @@ def test_slow_export_does_not_block_holdback_deadlines() -> None:
             return super().export(spans)
 
     exporter = BlockingExporter()
-    processor = TransactionSpanProcessor(
-        exporter, max_regular_traces=0, completion_holdback_millis=40
-    )
+    processor = TransactionSpanProcessor(exporter, completion_holdback_millis=40)
     original_dispatch = processor._dispatch_accept_completed
 
     def tracking_dispatch(
@@ -468,7 +446,6 @@ def test_finalize_queue_drops_when_full(monkeypatch: MonkeyPatch) -> None:
     exporter = BlockingExporter()
     processor = TransactionSpanProcessor(
         exporter,
-        max_regular_traces=0,
         completion_holdback_millis=30,
         meter_provider=meter_provider,
     )
@@ -535,9 +512,7 @@ def test_force_flush_returns_false_when_finalize_times_out() -> None:
             return super().export(spans)
 
     exporter = BlockingExporter()
-    processor = TransactionSpanProcessor(
-        exporter, max_regular_traces=0, completion_holdback_millis=20
-    )
+    processor = TransactionSpanProcessor(exporter, completion_holdback_millis=20)
     provider = TracerProvider()
     provider.add_span_processor(processor)
     tracer = provider.get_tracer("test")
@@ -567,9 +542,7 @@ def test_force_flush_timeout_covers_extracted_holdback_batches() -> None:
             return super().export(spans)
 
     exporter = BlockingExporter()
-    processor = TransactionSpanProcessor(
-        exporter, max_regular_traces=0, completion_holdback_millis=60_000
-    )
+    processor = TransactionSpanProcessor(exporter, completion_holdback_millis=60_000)
     provider = TracerProvider()
     provider.add_span_processor(processor)
     tracer = provider.get_tracer("test")
@@ -591,46 +564,6 @@ def test_force_flush_timeout_covers_extracted_holdback_batches() -> None:
     assert {span.name for span in exporter.spans} == {"held"}
 
 
-def test_force_flush_timeout_covers_harvest_drain() -> None:
-    """Harvest winners must export via the finalize worker so force_flush can time out."""
-    export_entered = threading.Event()
-    release_export = threading.Event()
-
-    class BlockingExporter(ListSpanExporter):
-        def export(self, spans: Sequence[ReadableSpan]) -> SpanExportResult:
-            export_entered.set()
-            assert release_export.wait(timeout=5.0)
-            return super().export(spans)
-
-    exporter = BlockingExporter()
-    processor = TransactionSpanProcessor(
-        exporter,
-        max_regular_traces=1,
-        harvest_period_millis=3_600_000,
-        completion_holdback_millis=0,
-    )
-    provider = TracerProvider()
-    provider.add_span_processor(processor)
-    tracer = provider.get_tracer("test")
-
-    tracer.start_span("winner", kind=SpanKind.SERVER).end()
-    deadline = time.monotonic() + 2.0
-    while time.monotonic() < deadline and len(processor._harvest) < 1:
-        time.sleep(0.01)
-    assert len(processor._harvest) == 1
-    assert not export_entered.is_set()
-
-    started = time.monotonic()
-    assert processor.force_flush(timeout_millis=80) is False
-    assert time.monotonic() - started < 1.5
-    assert export_entered.wait(timeout=2.0)
-
-    release_export.set()
-    assert processor.force_flush(timeout_millis=2000) is True
-    provider.shutdown()  # type: ignore[no-untyped-call]
-    assert any(span.name == "winner" for span in exporter.spans)
-
-
 def test_force_flush_waits_for_queue_capacity_instead_of_dropping(
     monkeypatch: MonkeyPatch,
 ) -> None:
@@ -650,9 +583,7 @@ def test_force_flush_waits_for_queue_capacity_instead_of_dropping(
             return super().export(spans)
 
     exporter = BlockingExporter()
-    processor = TransactionSpanProcessor(
-        exporter, max_regular_traces=0, completion_holdback_millis=60_000
-    )
+    processor = TransactionSpanProcessor(exporter, completion_holdback_millis=60_000)
     assert processor._finalize_queue.maxsize == 1
     provider = TracerProvider()
     provider.add_span_processor(processor)
@@ -678,60 +609,49 @@ def test_force_flush_waits_for_queue_capacity_instead_of_dropping(
     assert {"a", "b", "c"} <= names
 
 
-def test_force_flush_reports_failure_when_harvest_winners_deferred() -> None:
-    """Deferred harvest winners must not let force_flush claim success."""
-    from coralogix_opentelemetry.trace.processors.transaction_span_processor import (
-        _HarvestExport,
+def test_deferred_finalize_is_bounded(monkeypatch: MonkeyPatch) -> None:
+    """Timed-out force_flush retention must not grow without a cap."""
+    monkeypatch.setattr(
+        "coralogix_opentelemetry.trace.processors.transaction_span_processor."
+        "DEFAULT_MAX_FINALIZE_QUEUE",
+        1,
     )
+    monkeypatch.setattr(
+        "coralogix_opentelemetry.trace.processors.transaction_span_processor."
+        "DEFAULT_MAX_DEFERRED_FINALIZE",
+        1,
+    )
+    release_export = threading.Event()
 
-    exporter = ListSpanExporter()
-    processor = TransactionSpanProcessor(
-        exporter,
-        max_regular_traces=3,
-        harvest_period_millis=3_600_000,
-        completion_holdback_millis=0,
-    )
+    class BlockingExporter(ListSpanExporter):
+        def export(self, spans: Sequence[ReadableSpan]) -> SpanExportResult:
+            assert release_export.wait(timeout=5.0)
+            return super().export(spans)
+
+    exporter = BlockingExporter()
+    processor = TransactionSpanProcessor(exporter, completion_holdback_millis=60_000)
     provider = TracerProvider()
     provider.add_span_processor(processor)
     tracer = provider.get_tracer("test")
 
-    for name in ("w1", "w2", "w3"):
+    for name in ("a", "b", "c", "d"):
         tracer.start_span(name, kind=SpanKind.SERVER).end()
-    deadline = time.monotonic() + 2.0
-    while time.monotonic() < deadline and len(processor._harvest) < 3:
-        time.sleep(0.01)
-    assert len(processor._harvest) == 3
 
-    original_enqueue = processor._enqueue_finalize_item
-    block_harvest = {"on": True}
+    assert processor.force_flush(timeout_millis=50) is False
+    assert len(processor._deferred_finalize) <= 1
 
-    def flaky_enqueue(item: object, *, deadline: float | None = None) -> bool:
-        if block_harvest["on"] and isinstance(item, _HarvestExport):
-            return False
-        return original_enqueue(item, deadline=deadline)
-
-    processor._enqueue_finalize_item = flaky_enqueue  # type: ignore[method-assign]
-
-    started = time.monotonic()
-    assert processor.force_flush(timeout_millis=100) is False
-    assert time.monotonic() - started < 1.5
-    assert len(processor._harvest) == 3
-
-    block_harvest["on"] = False
-    assert processor.force_flush(timeout_millis=2000) is True
+    release_export.set()
+    processor.force_flush(timeout_millis=2000)
     provider.shutdown()  # type: ignore[no-untyped-call]
-    assert {span.name for span in exporter.spans} >= {"w1", "w2", "w3"}
 
 
 def test_force_flush_export_lock_respects_deadline() -> None:
-    """force_flush must not block forever waiting on a harvester held export lock."""
+    """force_flush must not block forever waiting on a held export lock."""
     lock_held = threading.Event()
     release_lock = threading.Event()
 
     exporter = ListSpanExporter()
-    processor = TransactionSpanProcessor(
-        exporter, max_regular_traces=0, completion_holdback_millis=0
-    )
+    processor = TransactionSpanProcessor(exporter, completion_holdback_millis=0)
 
     def hold_lock() -> None:
         with processor._export_lock:
@@ -765,9 +685,7 @@ def test_zero_holdback_end_does_not_block_on_slow_export() -> None:
             return super().export(spans)
 
     exporter = BlockingExporter()
-    processor = TransactionSpanProcessor(
-        exporter, max_regular_traces=0, completion_holdback_millis=0
-    )
+    processor = TransactionSpanProcessor(exporter, completion_holdback_millis=0)
     provider = TracerProvider()
     provider.add_span_processor(processor)
     tracer = provider.get_tracer("test")
@@ -810,9 +728,7 @@ def test_inherits_transaction_name_from_parent_attributes() -> None:
     exporter = ListSpanExporter()
     provider = TracerProvider()
     provider.add_span_processor(
-        TransactionSpanProcessor(
-            exporter, completion_holdback_millis=0, max_regular_traces=0
-        )
+        TransactionSpanProcessor(exporter, completion_holdback_millis=0)
     )
     tracer = provider.get_tracer("test")
 
@@ -841,9 +757,7 @@ def test_inherits_transaction_name_from_parent_attributes() -> None:
 
 def test_on_start_after_shutdown_does_not_grow_membership() -> None:
     exporter = ListSpanExporter()
-    processor = TransactionSpanProcessor(
-        exporter, max_regular_traces=0, completion_holdback_millis=0
-    )
+    processor = TransactionSpanProcessor(exporter, completion_holdback_millis=0)
     provider = TracerProvider()
     provider.add_span_processor(processor)
     tracer = provider.get_tracer("test")
@@ -854,14 +768,26 @@ def test_on_start_after_shutdown_does_not_grow_membership() -> None:
     assert len(processor._membership) == before
 
 
+def test_on_start_during_shutdown_rejects_new_trace_membership() -> None:
+    """While `_stopped` but before exporter shutdown, new TraceIDs must not leak membership."""
+    exporter = ListSpanExporter()
+    processor = TransactionSpanProcessor(exporter, completion_holdback_millis=0)
+    provider = TracerProvider()
+    provider.add_span_processor(processor)
+    tracer = provider.get_tracer("test")
+
+    processor._stopped = True
+    before = len(processor._membership)
+    tracer.start_span("during-shutdown", kind=SpanKind.SERVER).end()
+    assert len(processor._membership) == before
+    provider.shutdown()  # type: ignore[no-untyped-call]
+
+
 def test_force_flush_does_not_finalize_incomplete_traces() -> None:
     exporter = ListSpanExporter()
     provider = TracerProvider()
-    # max_regular_traces=0 disables harvest sampling so a completed trace is
-    # exported immediately (no waiting on the next harvest flush).
-    processor = TransactionSpanProcessor(
-        exporter, max_regular_traces=0, completion_holdback_millis=0
-    )
+    # max_nodes / holdback only — every completed local tree is exported.
+    processor = TransactionSpanProcessor(exporter, completion_holdback_millis=0)
     provider.add_span_processor(processor)
     tracer = provider.get_tracer("test")
 
@@ -881,9 +807,7 @@ def test_force_flush_does_not_finalize_incomplete_traces() -> None:
 
 def test_shutdown_waits_for_in_flight_spans() -> None:
     exporter = ListSpanExporter()
-    processor = TransactionSpanProcessor(
-        exporter, max_regular_traces=0, completion_holdback_millis=0
-    )
+    processor = TransactionSpanProcessor(exporter, completion_holdback_millis=0)
     provider = TracerProvider()
     provider.add_span_processor(processor)
     tracer = provider.get_tracer("test")
@@ -934,9 +858,7 @@ def test_export_is_serialized_across_concurrent_callers() -> None:
             return None
 
     exporter = BlockingExporter()
-    processor = TransactionSpanProcessor(
-        exporter, max_regular_traces=0, completion_holdback_millis=0
-    )
+    processor = TransactionSpanProcessor(exporter, completion_holdback_millis=0)
     provider = TracerProvider()
     provider.add_span_processor(processor)
     tracer = provider.get_tracer("test")
@@ -971,9 +893,7 @@ def test_export_is_serialized_across_concurrent_callers() -> None:
 
 def test_shutdown_tracks_post_stop_child_of_in_flight_trace() -> None:
     exporter = ListSpanExporter()
-    processor = TransactionSpanProcessor(
-        exporter, max_regular_traces=0, completion_holdback_millis=0
-    )
+    processor = TransactionSpanProcessor(exporter, completion_holdback_millis=0)
     provider = TracerProvider()
     provider.add_span_processor(processor)
     tracer = provider.get_tracer("test")
@@ -1003,8 +923,8 @@ def test_shutdown_tracks_post_stop_child_of_in_flight_trace() -> None:
     provider.shutdown()  # type: ignore[no-untyped-call]
 
 
-def test_processor_records_metrics_even_when_trace_not_harvested() -> None:
-    """Self-duration metrics fire for every completed local trace; harvest only gates export."""
+def test_processor_records_self_duration_metrics_for_every_completed_trace() -> None:
+    """Self-duration metrics fire for every completed local trace."""
     resource = Resource.create({"service.name": "test"})
     exporter = ListSpanExporter()
     reader = InMemoryMetricReader()
@@ -1013,8 +933,6 @@ def test_processor_records_metrics_even_when_trace_not_harvested() -> None:
     provider.add_span_processor(
         TransactionSpanProcessor(
             exporter,
-            max_regular_traces=1,
-            harvest_period_millis=3_600_000,
             completion_holdback_millis=0,
             meter_provider=meter_provider,
         )
@@ -1026,13 +944,7 @@ def test_processor_records_metrics_even_when_trace_not_harvested() -> None:
     with tracer.start_as_current_span("slow", kind=SpanKind.SERVER):
         time.sleep(0.04)
 
-    # Wait for async finalize (not force_flush — that would also drain harvest).
-    deadline = time.monotonic() + 2.0
-    while time.monotonic() < deadline and len(exporter.spans) < 1:
-        time.sleep(0.01)
-    assert len(exporter.spans) == 1
-    assert exporter.spans[0].name == "fast"
-
+    provider.force_flush()
     meter_provider.force_flush()
     span_names = set()
     for rm in reader.get_metrics_data().resource_metrics:
@@ -1044,26 +956,17 @@ def test_processor_records_metrics_even_when_trace_not_harvested() -> None:
                     span_names.add(dict(point.attributes).get("span.name"))
     assert "fast" in span_names
     assert "slow" in span_names
-
-    provider.force_flush()
-    roots = [
-        span
-        for span in exporter.spans
-        if (span.attributes or {}).get(CoralogixAttributes.TRANSACTION_ROOT)
-    ]
-    assert {span.name for span in roots} == {"fast", "slow"}
+    assert {span.name for span in exporter.spans} >= {"fast", "slow"}
     provider.shutdown()  # type: ignore[no-untyped-call]
     meter_provider.shutdown()
 
 
-def test_processor_immediate_export_when_max_regular_traces_zero() -> None:
+def test_processor_exports_completed_traces_immediately() -> None:
     exporter = ListSpanExporter()
     provider = TracerProvider()
     provider.add_span_processor(
         TransactionSpanProcessor(
             exporter,
-            max_regular_traces=0,
-            harvest_period_millis=0,
             completion_holdback_millis=0,
         )
     )
@@ -1081,9 +984,7 @@ def test_processor_trims_to_max_nodes_keeping_root() -> None:
     exporter = ListSpanExporter()
     provider = TracerProvider()
     provider.add_span_processor(
-        TransactionSpanProcessor(
-            exporter, max_nodes=2, max_regular_traces=0, completion_holdback_millis=0
-        )
+        TransactionSpanProcessor(exporter, max_nodes=2, completion_holdback_millis=0)
     )
     tracer = provider.get_tracer("test")
 
@@ -1102,13 +1003,11 @@ def test_processor_trims_to_max_nodes_keeping_root() -> None:
     provider.shutdown()  # type: ignore[no-untyped-call]
 
 
-def test_shutdown_flushes_pending_harvest_winner() -> None:
+def test_shutdown_flushes_pending_completed_trace() -> None:
     exporter = ListSpanExporter()
     provider = TracerProvider()
     processor = TransactionSpanProcessor(
         exporter,
-        max_regular_traces=1,
-        harvest_period_millis=3_600_000,
         completion_holdback_millis=0,
     )
     provider.add_span_processor(processor)
@@ -1117,7 +1016,8 @@ def test_shutdown_flushes_pending_harvest_winner() -> None:
     with tracer.start_as_current_span("root", kind=SpanKind.SERVER):
         pass
 
-    assert exporter.spans == []
+    # Give the finalize worker a moment; shutdown must still flush if pending.
+    time.sleep(0.05)
     processor.shutdown()
     assert any(span.name == "root" for span in exporter.spans)
 
@@ -1126,9 +1026,7 @@ def test_processor_server_under_local_parent_starts_new_transaction() -> None:
     exporter = ListSpanExporter()
     provider = TracerProvider()
     provider.add_span_processor(
-        TransactionSpanProcessor(
-            exporter, max_regular_traces=0, completion_holdback_millis=0
-        )
+        TransactionSpanProcessor(exporter, completion_holdback_millis=0)
     )
     tracer = provider.get_tracer("test")
 
@@ -1166,9 +1064,7 @@ def test_nested_server_finalizes_while_outer_still_open() -> None:
     exporter = ListSpanExporter()
     provider = TracerProvider()
     provider.add_span_processor(
-        TransactionSpanProcessor(
-            exporter, max_regular_traces=0, completion_holdback_millis=0
-        )
+        TransactionSpanProcessor(exporter, completion_holdback_millis=0)
     )
     tracer = provider.get_tracer("test")
 
@@ -1194,9 +1090,7 @@ def test_nested_server_finalizes_while_outer_still_open() -> None:
 
 def test_completion_holdback_keeps_fire_and_forget_child() -> None:
     exporter = ListSpanExporter()
-    processor = TransactionSpanProcessor(
-        exporter, max_regular_traces=0, completion_holdback_millis=80
-    )
+    processor = TransactionSpanProcessor(exporter, completion_holdback_millis=80)
     provider = TracerProvider()
     provider.add_span_processor(processor)
     tracer = provider.get_tracer("test")
@@ -1320,9 +1214,7 @@ def _readable(
 def test_stale_cancelled_holdback_does_not_pop_replacement() -> None:
     """Cancelling an idle holdback must not drop a replacement arm for the same TraceID."""
     exporter = ListSpanExporter()
-    processor = TransactionSpanProcessor(
-        exporter, max_regular_traces=0, completion_holdback_millis=60_000
-    )
+    processor = TransactionSpanProcessor(exporter, completion_holdback_millis=60_000)
     trace_id = 0xABC
     outer = _readable("outer", span_id=1, root=True, end=10)
 
@@ -1349,9 +1241,7 @@ def test_stale_cancelled_holdback_does_not_pop_replacement() -> None:
 def test_extract_completed_roots_deepest_first_excludes_extracted() -> None:
     """Nested SERVER root extracts before outer; outer must not re-export nested IDs."""
     exporter = ListSpanExporter()
-    processor = TransactionSpanProcessor(
-        exporter, max_regular_traces=0, completion_holdback_millis=0
-    )
+    processor = TransactionSpanProcessor(exporter, completion_holdback_millis=0)
     trace_id = 0xDEF
     outer = _readable("outer", span_id=1, root=True, start=0, end=100)
     nested = _readable("inner", span_id=2, parent_id=1, root=True, start=10, end=60)
@@ -1377,9 +1267,7 @@ def test_nested_and_outer_finalize_separately_when_trace_goes_idle() -> None:
     exporter = ListSpanExporter()
     provider = TracerProvider()
     provider.add_span_processor(
-        TransactionSpanProcessor(
-            exporter, max_regular_traces=0, completion_holdback_millis=0
-        )
+        TransactionSpanProcessor(exporter, completion_holdback_millis=0)
     )
     tracer = provider.get_tracer("test")
 

@@ -1,4 +1,4 @@
-"""Transaction SpanProcessor: naming, self-duration, metric, trim, and harvest.
+"""Transaction SpanProcessor: naming, self-duration, metric, and trim.
 
 This processor is the supported path going forward. The legacy
 ``CoralogixTransactionSampler`` remains for backward compatibility only.
@@ -25,10 +25,7 @@ For each completed local transaction the export pipeline is:
    ``cgx.transaction.self_duration`` (seconds), and record the matching
    histogram (unit ``s``, always on).
 3. Trim to the ``max_nodes`` slowest spans (default 256); root always kept.
-4. Harvest: if ``max_regular_traces <= 0``, export immediately; else keep only
-   the slowest N completed local traces per harvest window (default 1 / 60s).
-   Harvest losers export root stubs; self-duration metrics still record for
-   every completed local trace.
+4. Export the trimmed batch immediately (no client-side harvest sampling).
 """
 from __future__ import annotations
 
@@ -42,14 +39,7 @@ from coralogix_opentelemetry.trace.common import CoralogixAttributes
 from coralogix_opentelemetry.trace.processors.defaults import (
     DEFAULT_MAX_TXN_TRACE_NODES,
     resolve_completion_holdback_millis,
-    resolve_harvest_period_millis,
     resolve_max_nodes,
-    resolve_max_regular_traces,
-)
-from coralogix_opentelemetry.trace.processors.harvest import (
-    HarvestTrace,
-    RegularTraceHeap,
-    root_duration_ns,
 )
 from coralogix_opentelemetry.trace.processors.holdback_scheduler import (
     HoldbackScheduler,
@@ -88,19 +78,12 @@ _HOLD_IDLE = "idle"
 _HOLD_NESTED = "nested"
 # Cap queued completed batches so a stalled exporter cannot grow memory without bound.
 DEFAULT_MAX_FINALIZE_QUEUE = 256
-
-
-class _HarvestExport:
-    """Already-finalized harvest winner waiting only for SpanExporter.export."""
-
-    __slots__ = ("spans",)
-
-    def __init__(self, spans: List[ReadableSpan]) -> None:
-        self.spans = spans
+# Cap batches retained across timed-out force_flush calls (same order as the queue).
+DEFAULT_MAX_DEFERRED_FINALIZE = DEFAULT_MAX_FINALIZE_QUEUE
 
 
 class TransactionSpanProcessor(SpanProcessor):
-    """Full transaction tagging + self-duration + trim + harvest.
+    """Full transaction tagging + self-duration + trim + export.
 
     Constructor options override env vars. Omitted options read
     ``OTEL_CX_TRANSACTION_*`` (see README), then fall back to defaults.
@@ -111,17 +94,11 @@ class TransactionSpanProcessor(SpanProcessor):
         span_exporter: SpanExporter,
         *,
         max_nodes: Optional[int] = None,
-        max_regular_traces: Optional[int] = None,
-        harvest_period_millis: Optional[int] = None,
         completion_holdback_millis: Optional[int] = None,
         meter_provider: Optional[MeterProvider] = None,
     ) -> None:
         self._exporter = span_exporter
         self._max_nodes = resolve_max_nodes(max_nodes)
-        self._max_regular_traces = resolve_max_regular_traces(max_regular_traces)
-        self._harvest_period_millis = resolve_harvest_period_millis(
-            harvest_period_millis
-        )
         self._completion_holdback_millis = resolve_completion_holdback_millis(
             completion_holdback_millis
         )
@@ -158,17 +135,6 @@ class TransactionSpanProcessor(SpanProcessor):
         self._self_duration_hist: Histogram = create_self_duration_histogram(
             meter_provider
         )
-
-        self._harvest = RegularTraceHeap(self._max_regular_traces)
-        self._harvest_stop = threading.Event()
-        self._harvester: Optional[threading.Thread] = None
-        if self._max_regular_traces > 0 and self._harvest_period_millis > 0:
-            self._harvester = threading.Thread(
-                target=self._harvest_loop,
-                name="TransactionSpanProcessor-harvester",
-                daemon=True,
-            )
-            self._harvester.start()
 
     def on_start(self, span: Span, parent_context: Optional[Context] = None) -> None:
         """Track membership + root flag only; do not freeze transaction name."""
@@ -217,6 +183,14 @@ class TransactionSpanProcessor(SpanProcessor):
             # no-op and would never clean these entries up.
             if self._exporter_shutdown:
                 return
+            # During shutdown, only continue tracking in-flight TraceIDs. Do not
+            # insert membership for brand-new traces (on_end would never clear it).
+            if (
+                self._stopped
+                and trace_id not in self._live_parents
+                and trace_id not in self._buffers
+            ):
+                return
             if starts:
                 self._membership[span_id] = TransactionMembership(
                     root_span_id=span_id,
@@ -246,8 +220,6 @@ class TransactionSpanProcessor(SpanProcessor):
 
             self._cancel_pending_completion_locked(trace_id)
             if self._stopped:
-                if trace_id not in self._live_parents and trace_id not in self._buffers:
-                    return
                 live = self._live_parents.setdefault(trace_id, {})
                 live[span_id] = parent_id
                 return
@@ -334,7 +306,9 @@ class TransactionSpanProcessor(SpanProcessor):
                 self._pending_finalize -= 1
                 self._idle.notify_all()
 
-    def _abandon_completed_batch(self, batch: Sequence[ReadableSpan]) -> None:
+    def _abandon_completed_batch(
+        self, batch: Sequence[ReadableSpan], *, adjust_pending: bool = True
+    ) -> None:
         """Drop export for an unqueued batch; still record self-duration metrics."""
         try:
             with self._lock:
@@ -364,17 +338,42 @@ class TransactionSpanProcessor(SpanProcessor):
             )
         finally:
             with self._lock:
-                self._pending_finalize -= 1
+                if adjust_pending:
+                    self._pending_finalize -= 1
                 for span in batch:
                     if span.context is not None:
                         self._child_intervals.pop(span.context.span_id, None)
                         self._membership.pop(span.context.span_id, None)
                 self._idle.notify_all()
 
+    def _retain_deferred_batches(
+        self, batches: Sequence[Sequence[ReadableSpan]]
+    ) -> None:
+        """Keep unqueued force_flush batches for retry, within a bounded cap."""
+        overflow: List[List[ReadableSpan]] = []
+        with self._lock:
+            for batch in batches:
+                payload = list(batch)
+                if len(self._deferred_finalize) >= DEFAULT_MAX_DEFERRED_FINALIZE:
+                    overflow.append(payload)
+                    continue
+                self._deferred_finalize.append(payload)
+            self._pending_finalize -= len(batches)
+            self._idle.notify_all()
+        for batch in overflow:
+            _LOG.error(
+                "TransactionSpanProcessor deferred finalize full "
+                "(max=%d); dropping retained batch of %d span(s)",
+                DEFAULT_MAX_DEFERRED_FINALIZE,
+                len(batch),
+            )
+            # pending already adjusted above for these batches.
+            self._abandon_completed_batch(batch, adjust_pending=False)
+
     def _enqueue_finalize_item(
         self, item: object, *, deadline: Optional[float] = None
     ) -> bool:
-        """Put one finalize/harvest item on the worker queue.
+        """Put one finalize item on the worker queue.
 
         When ``deadline`` is None (Span.end / holdback path), drop immediately on
         Full. When a deadline is set (force_flush), wait for capacity until then.
@@ -422,15 +421,12 @@ class TransactionSpanProcessor(SpanProcessor):
                 self._abandon_completed_batch(payload)
                 continue
             unqueued = [payload] + [list(rest) for rest in batches[index + 1 :]]
-            with self._lock:
-                self._deferred_finalize.extend(unqueued)
-                self._pending_finalize -= len(unqueued)
-                self._idle.notify_all()
+            self._retain_deferred_batches(unqueued)
             _LOG.error(
                 "TransactionSpanProcessor finalize queue full "
-                "(max=%d); retaining %d batch(es) for a later force_flush",
+                "(max=%d); retaining up to %d batch(es) for a later force_flush",
                 DEFAULT_MAX_FINALIZE_QUEUE,
-                len(unqueued),
+                DEFAULT_MAX_DEFERRED_FINALIZE,
             )
             return False
         return True
@@ -444,72 +440,9 @@ class TransactionSpanProcessor(SpanProcessor):
                     return
                 continue
             try:
-                if isinstance(item, _HarvestExport):
-                    try:
-                        self._export_spans(item.spans)
-                    except Exception:
-                        _LOG.exception(
-                            "TransactionSpanProcessor failed exporting harvest winner"
-                        )
-                    finally:
-                        with self._lock:
-                            self._pending_finalize -= 1
-                            self._idle.notify_all()
-                else:
-                    self._run_accept_completed(item)
+                self._run_accept_completed(item)
             finally:
                 self._finalize_queue.task_done()
-
-    def _enqueue_harvest_winners(self, *, deadline: float) -> bool:
-        """Drain harvest winners onto the finalize worker within ``deadline``.
-
-        Retries when the queue is full so force_flush does not report success
-        while winners remain only on the heap. Returns False if any winners are
-        still unexported when the deadline expires.
-        """
-        while True:
-            stubs: List[ReadableSpan] = []
-            with self._lock:
-                if self._exporter_shutdown:
-                    return True
-                winners = self._harvest.drain()
-                if not winners:
-                    return True
-                self._pending_finalize += len(winners)
-
-            deferred = False
-            for index, winner in enumerate(winners):
-                item = _HarvestExport(list(winner.spans))
-                if self._enqueue_finalize_item(item, deadline=deadline):
-                    continue
-                rest = winners[index:]
-                with self._lock:
-                    self._pending_finalize -= len(rest)
-                    stubs = self._harvest.restore(rest)
-                    self._idle.notify_all()
-                _LOG.error(
-                    "TransactionSpanProcessor finalize queue full "
-                    "(max=%d); deferring %d harvest winner(s)",
-                    DEFAULT_MAX_FINALIZE_QUEUE,
-                    len(rest),
-                )
-                deferred = True
-                break
-
-            if stubs:
-                # Stubs from capacity eviction during restore — try under deadline.
-                if not self._try_export_spans(stubs, deadline=deadline):
-                    return False
-
-            if not deferred:
-                return True
-
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                with self._lock:
-                    return len(self._harvest) == 0
-            with self._lock:
-                self._idle.wait(timeout=min(0.05, remaining))
 
     def force_flush(self, timeout_millis: int = 30000) -> bool:
         deadline = time.monotonic() + max(0.001, timeout_millis / 1000.0)
@@ -522,19 +455,6 @@ class TransactionSpanProcessor(SpanProcessor):
             self._pending_finalize += len(batches)
         # Wait for queue capacity within the deadline — retain on timeout.
         if not self._dispatch_accept_completed(batches, deadline=deadline):
-            return False
-        with self._lock:
-            while self._pending_finalize > 0:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                self._idle.wait(timeout=remaining)
-            timed_out = self._pending_finalize > 0
-        if timed_out:
-            return False
-
-        # Harvest drain must also honor the deadline (export via finalize worker).
-        if not self._enqueue_harvest_winners(deadline=deadline):
             return False
         with self._lock:
             while self._pending_finalize > 0:
@@ -580,9 +500,6 @@ class TransactionSpanProcessor(SpanProcessor):
             return
 
         try:
-            self._stop_harvester()
-            self._flush_harvest()
-
             with self._lock:
                 self._wait_for_idle_locked(timeout_sec=30.0)
                 holdback_batches = self._flush_pending_completions_locked()
@@ -617,8 +534,6 @@ class TransactionSpanProcessor(SpanProcessor):
                         break
                     self._idle.wait(timeout=remaining)
 
-            self._flush_harvest()
-
             with self._lock:
                 self._exporter_shutdown = True
                 self._child_intervals.clear()
@@ -641,20 +556,6 @@ class TransactionSpanProcessor(SpanProcessor):
             if remaining <= 0:
                 return
             self._idle.wait(timeout=remaining)
-
-    def _stop_harvester(self) -> None:
-        self._harvest_stop.set()
-        if self._harvester is not None:
-            self._harvester.join(
-                timeout=max(30.0, self._harvest_period_millis / 1000.0 + 5.0)
-            )
-
-    def _harvest_loop(self) -> None:
-        period_s = self._harvest_period_millis / 1000.0
-        while not self._harvest_stop.is_set():
-            if self._harvest_stop.wait(timeout=period_s):
-                break
-            self._flush_harvest()
 
     def _cancel_pending_completion_locked(self, trace_id: int) -> None:
         if self._pending_completions.pop(trace_id, None) is not None:
@@ -833,47 +734,13 @@ class TransactionSpanProcessor(SpanProcessor):
             return
 
         try:
-            if self._max_regular_traces <= 0 or self._harvest_period_millis <= 0:
-                self._export_spans(trimmed)
-                return
-
-            candidate = HarvestTrace(
-                duration_ns=root_duration_ns(trimmed),
-                spans=list(trimmed),
-            )
-            with self._lock:
-                shutdown = self._shutdown_started or self._exporter_shutdown
-                if shutdown:
-                    stubs: List[ReadableSpan] = []
-                else:
-                    stubs = self._harvest.witness(candidate)
-                    if not stubs:
-                        return
-            if shutdown:
-                self._export_spans(trimmed)
-            else:
-                self._export_spans(stubs)
+            self._export_spans(trimmed)
         finally:
             with self._lock:
                 for span in annotated:
                     if span.context is not None:
                         self._child_intervals.pop(span.context.span_id, None)
                         self._membership.pop(span.context.span_id, None)
-
-    def _flush_harvest(self) -> None:
-        with self._export_lock:
-            if self._exporter_shutdown:
-                return
-            with self._lock:
-                winners = self._harvest.drain()
-            for winner in winners:
-                try:
-                    result = self._exporter.export(list(winner.spans))
-                except Exception:
-                    _LOG.exception("TransactionSpanProcessor failed to export spans")
-                    continue
-                if result is SpanExportResult.FAILURE:
-                    _LOG.warning("TransactionSpanProcessor exporter returned FAILURE")
 
     def _export_spans(self, spans: Sequence[ReadableSpan]) -> None:
         with self._export_lock:
@@ -886,27 +753,3 @@ class TransactionSpanProcessor(SpanProcessor):
                 return
             if result is SpanExportResult.FAILURE:
                 _LOG.warning("TransactionSpanProcessor exporter returned FAILURE")
-
-    def _try_export_spans(
-        self, spans: Sequence[ReadableSpan], *, deadline: float
-    ) -> bool:
-        """Export under ``_export_lock`` without waiting past ``deadline``."""
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return False
-        acquired = self._export_lock.acquire(timeout=remaining)
-        if not acquired:
-            return False
-        try:
-            if self._exporter_shutdown:
-                return True
-            try:
-                result = self._exporter.export(list(spans))
-            except Exception:
-                _LOG.exception("TransactionSpanProcessor failed to export spans")
-                return True
-            if result is SpanExportResult.FAILURE:
-                _LOG.warning("TransactionSpanProcessor exporter returned FAILURE")
-            return True
-        finally:
-            self._export_lock.release()

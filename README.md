@@ -8,21 +8,12 @@ Use `TransactionSpanProcessor` for transaction tagging, exclusive self-duration,
 and the self-duration metric. The legacy `CoralogixTransactionSampler` remains
 available for backward compatibility only.
 
-### Defaults and harvest (read carefully)
+### Defaults
 
 By default the processor keeps at most **256** slowest spans per local trace
-(`max_nodes`) and exports only the **slowest** completed local trace every
-**60s** (`max_regular_traces=1`). That is intentional harvest
-sampling: most completed local traces are **not** exported as full waterfalls.
-
-Harvest samples that do not win the window still:
-
-- record `cgx.transaction.self_duration` histogram points for every span in the
-  completed local tree
-- export a **root stub** span so APM still sees the transaction name
-
-Set `max_regular_traces=0` (or `harvest_period_millis=0`) to export every
-completed (trimmed) local trace immediately with no harvest sampling.
+(`max_nodes`) and **exports every completed local trace** immediately after
+trim. There is no client-side harvest sampling: Coralogix APM expects every
+trace so spanmetrics can be built from the full span set.
 
 Constructor keyword arguments override environment variables. When a keyword is
 omitted, the matching env var is read; invalid values fall back to the default.
@@ -43,8 +34,6 @@ trace.set_tracer_provider(provider)
 | Option | Type | Default | Env var | Meaning |
 |---|---|---|---|---|
 | `max_nodes` | int | `256` | `OTEL_CX_TRANSACTION_MAX_NODES` | Max spans kept per completed local trace (slowest first; txn root always kept). `0` = no trimming. Negative values fall back to the default |
-| `max_regular_traces` | int | `1` | `OTEL_CX_TRANSACTION_MAX_REGULAR_TRACES` | Slowest completed local traces kept per harvest window. `0` = export every completed trimmed trace immediately. Negative → default |
-| `harvest_period_millis` | int | `60000` | `OTEL_CX_TRANSACTION_HARVEST_PERIOD_MILLIS` | Harvest flush interval. `0` exports every completed trace immediately (no heap). Negative → default |
 | `completion_holdback_millis` | int | `100` | `OTEL_CX_TRANSACTION_COMPLETION_HOLDBACK_MILLIS` | After the last live span on a TraceID ends, wait so fire-and-forget children can join. `0` = finalize immediately. Negative → default |
 | `meter_provider` | MeterProvider | global | — | MeterProvider for the self-duration histogram |
 
@@ -61,7 +50,7 @@ Requires OpenTelemetry API/SDK **1.21+** (metrics API and `ReadableSpan.instrume
 ### Metric
 
 Histogram `cgx.transaction.self_duration` (unit `s`) is always recorded for every
-span in every completed local trace, including harvest losers.
+span in every completed local trace.
 
 ### Transaction boundaries
 
@@ -78,4 +67,4 @@ wins over the root’s final span name.
 
 Self-duration is the span’s wall duration minus time covered by direct children.
 Child intervals are clamped to the parent and merged so overlapping children are
-not double-counted.
+not double-subtracted.

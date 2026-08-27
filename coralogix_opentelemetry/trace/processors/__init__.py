@@ -1,7 +1,5 @@
 from coralogix_opentelemetry.trace.processors.defaults import (
     DEFAULT_COMPLETION_HOLDBACK_MILLIS,
-    DEFAULT_HARVEST_PERIOD_MILLIS,
-    DEFAULT_MAX_REGULAR_TRACES,
     DEFAULT_MAX_TXN_TRACE_NODES,
 )
 from coralogix_opentelemetry.trace.processors.start_new_transaction import (
@@ -19,9 +17,7 @@ DEFAULT_MAX_NODES = DEFAULT_MAX_TXN_TRACE_NODES
 
 __all__ = [
     "DEFAULT_COMPLETION_HOLDBACK_MILLIS",
-    "DEFAULT_HARVEST_PERIOD_MILLIS",
     "DEFAULT_MAX_NODES",
-    "DEFAULT_MAX_REGULAR_TRACES",
     "DEFAULT_MAX_TXN_TRACE_NODES",
     "METRIC_SELF_DURATION",
     "SELF_DURATION_ATTRIBUTE",
