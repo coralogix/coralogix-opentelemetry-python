@@ -193,6 +193,82 @@ def test_start_new_transaction_override_wins_over_span_name() -> None:
     provider.shutdown()  # type: ignore[no-untyped-call]
 
 
+def test_sampler_echo_does_not_block_update_name() -> None:
+    """Legacy sampler copies start name into cgx.transaction; update_name must still win."""
+    from coralogix_opentelemetry.trace.samplers import CoralogixTransactionSampler
+
+    exporter = ListSpanExporter()
+    provider = TracerProvider(sampler=CoralogixTransactionSampler())
+    provider.add_span_processor(
+        TransactionSpanProcessor(
+            exporter, max_regular_traces=0, completion_holdback_millis=0
+        )
+    )
+    tracer = provider.get_tracer("test")
+
+    root = tracer.start_span("GET", kind=SpanKind.SERVER)
+    root.update_name("GET /myroute")
+    root.end()
+    provider.force_flush()
+
+    assert len(exporter.spans) == 1
+    assert (
+        exporter.spans[0].attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER]
+        == "GET /myroute"
+    )
+    assert CoralogixAttributes.TRANSACTION_EXPLICIT not in (
+        exporter.spans[0].attributes or {}
+    )
+    provider.shutdown()  # type: ignore[no-untyped-call]
+
+
+def test_start_new_transaction_equal_name_survives_rename() -> None:
+    exporter = ListSpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(
+        TransactionSpanProcessor(
+            exporter, max_regular_traces=0, completion_holdback_millis=0
+        )
+    )
+    tracer = provider.get_tracer("test")
+
+    root = tracer.start_span("flow", kind=SpanKind.INTERNAL)
+    start_new_transaction(root, "flow")
+    root.update_name("flow-renamed")
+    root.end()
+    provider.force_flush()
+
+    assert exporter.spans[0].attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER] == (
+        "flow"
+    )
+    provider.shutdown()  # type: ignore[no-untyped-call]
+
+
+def test_preset_template_name_different_from_span_name_is_override() -> None:
+    exporter = ListSpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(
+        TransactionSpanProcessor(
+            exporter, max_regular_traces=0, completion_holdback_millis=0
+        )
+    )
+    tracer = provider.get_tracer("test")
+
+    root = tracer.start_span(
+        "GET /users/123",
+        kind=SpanKind.SERVER,
+        attributes={CoralogixAttributes.TRANSACTION_IDENTIFIER: "GET /users/:id"},
+    )
+    root.end()
+    provider.force_flush()
+
+    assert (
+        exporter.spans[0].attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER]
+        == "GET /users/:id"
+    )
+    provider.shutdown()  # type: ignore[no-untyped-call]
+
+
 def test_env_vars_configure_options_when_constructor_omits_them(
     monkeypatch: MonkeyPatch,
 ) -> None:

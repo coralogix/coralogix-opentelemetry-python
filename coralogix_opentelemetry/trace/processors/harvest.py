@@ -87,12 +87,17 @@ class RegularTraceHeap:
         self._shortest_first.clear()
         return traces
 
-    def restore(self, traces: Sequence[HarvestTrace]) -> None:
-        """Put previously drained winners back into the heap."""
-        if self._max_traces <= 0:
-            return
+    def restore(self, traces: Sequence[HarvestTrace]) -> List[ReadableSpan]:
+        """Re-admit drained winners with capacity-aware eviction.
+
+        Returns root stubs for any trace that loses to the current heap (same
+        policy as ``witness``), so restore cannot grow the heap past
+        ``max_regular_traces``.
+        """
+        stubs: List[ReadableSpan] = []
         for trace in traces:
-            heapq.heappush(self._shortest_first, trace)
+            stubs.extend(self.witness(trace))
+        return stubs
 
 
 def harvest_stub_spans(spans: Sequence[ReadableSpan]) -> List[ReadableSpan]:

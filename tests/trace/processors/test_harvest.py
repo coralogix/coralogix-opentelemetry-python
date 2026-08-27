@@ -71,9 +71,28 @@ def test_heap_restore_puts_drained_winners_back() -> None:
     assert heap.witness(winner) == []
     drained = heap.drain()
     assert len(heap) == 0
-    heap.restore(drained)
+    assert heap.restore(drained) == []
     assert len(heap) == 1
     assert heap.drain()[0].spans[0].name == "slow"
+
+
+def test_heap_restore_respects_capacity_against_newer_candidates() -> None:
+    heap = RegularTraceHeap(max_traces=1)
+    old = HarvestTrace(
+        duration_ns=100,
+        spans=[_span("old", span_id=1, start_ns=0, end_ns=100, root=True)],
+    )
+    newer = HarvestTrace(
+        duration_ns=500,
+        spans=[_span("newer", span_id=2, start_ns=0, end_ns=500, root=True)],
+    )
+    assert heap.witness(old) == []
+    drained = heap.drain()
+    assert heap.witness(newer) == []
+    stubs = heap.restore(drained)
+    assert [s.name for s in stubs] == ["old"]
+    assert len(heap) == 1
+    assert heap.drain()[0].spans[0].name == "newer"
 
 
 def test_heap_rejects_faster_than_current_winner() -> None:

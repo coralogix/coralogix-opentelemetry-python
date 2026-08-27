@@ -8,8 +8,9 @@ Flow
 **on_start** — track only. Decide new vs inherit (no parent local txn / remote /
 SERVER / CONSUMER). Set ``cgx.transaction.root`` for starters. Record side-table
 membership. Do **not** freeze ``cgx.transaction`` from the early span name
-(frameworks may ``update_name`` later). Explicit ``start_new_transaction`` /
-pre-set ``cgx.transaction`` is stored as ``override_name``.
+(frameworks may ``update_name`` later). Explicit ``start_new_transaction`` / route-template overrides (name ≠ start
+span name) are stored as ``override_name``. Sampler echoes of the start name
+are not treated as overrides so ``update_name`` can still win.
 
 **on_end / finalize** — buffer by ``trace_id``. When a local-transaction subtree
 has no live spans left, finalize that subtree even if an outer ancestor is
@@ -65,6 +66,7 @@ from coralogix_opentelemetry.trace.processors.transaction_finalize import (
 from coralogix_opentelemetry.trace.processors.transaction_naming import (
     TransactionMembership,
     apply_on_start_root_flag,
+    explicit_transaction_override,
     parent_has_transaction_attrs,
     parent_transaction_from_attrs,
     parent_transaction_from_tracestate,
@@ -198,7 +200,11 @@ class TransactionSpanProcessor(SpanProcessor):
             parent_has_local_transaction=parent_has_local,
         )
         apply_on_start_root_flag(span, starts)
-        override = preset_transaction_name(span)
+        start_name = span.name
+        preset = preset_transaction_name(span)
+        # Sampler echoes start name into cgx.transaction; only treat a pre-set
+        # value as override when it differs (route template / explicit rename).
+        override = preset if (preset is not None and preset != start_name) else None
 
         trace_id = span.context.trace_id
         span_id = span.context.span_id
@@ -213,6 +219,7 @@ class TransactionSpanProcessor(SpanProcessor):
                     root_span_id=span_id,
                     is_root=True,
                     override_name=override,
+                    start_name=start_name,
                 )
             else:
                 root_span_id = (
@@ -231,6 +238,7 @@ class TransactionSpanProcessor(SpanProcessor):
                     is_root=False,
                     override_name=None,
                     inherited_name=inherited_name,
+                    start_name=start_name,
                 )
 
             self._cancel_pending_completion_locked(trace_id)
@@ -253,18 +261,21 @@ class TransactionSpanProcessor(SpanProcessor):
         if span.context is None or not span.context.is_valid:
             return
 
-        # start_new_transaction may set override after on_start.
+        # start_new_transaction may set an explicit override after on_start.
         attrs = span.attributes or {}
         preset = attrs.get(CoralogixAttributes.TRANSACTION_IDENTIFIER)
         with self._lock:
             member = self._membership.get(span.context.span_id)
-            if (
-                member is not None
-                and member.is_root
-                and preset is not None
-                and not member.override_name
-            ):
-                member.override_name = str(preset)
+            if member is not None and member.is_root and preset is not None:
+                if explicit_transaction_override(span):
+                    member.override_name = str(preset)
+                elif (
+                    not member.override_name
+                    and member.start_name is not None
+                    and str(preset) != member.start_name
+                ):
+                    # Template / late attr different from the on_start name.
+                    member.override_name = str(preset)
 
         trace_id = span.context.trace_id
         completed_batches: List[List[ReadableSpan]] = []
@@ -407,6 +418,7 @@ class TransactionSpanProcessor(SpanProcessor):
 
     def _enqueue_harvest_winners(self) -> None:
         """Move drained harvest winners onto the finalize worker (deadline-aware path)."""
+        stubs: List[ReadableSpan] = []
         with self._lock:
             if self._exporter_shutdown:
                 return
@@ -414,22 +426,24 @@ class TransactionSpanProcessor(SpanProcessor):
             if not winners:
                 return
             self._pending_finalize += len(winners)
-        for index, winner in enumerate(winners):
-            try:
-                self._finalize_queue.put_nowait(_HarvestExport(list(winner.spans)))
-            except queue.Full:
-                rest = winners[index:]
-                with self._lock:
+            for index, winner in enumerate(winners):
+                try:
+                    self._finalize_queue.put_nowait(_HarvestExport(list(winner.spans)))
+                except queue.Full:
+                    rest = winners[index:]
                     self._pending_finalize -= len(rest)
-                    self._harvest.restore(rest)
+                    # Capacity-aware re-admit (concurrent witness may have filled heap).
+                    stubs = self._harvest.restore(rest)
                     self._idle.notify_all()
-                _LOG.error(
-                    "TransactionSpanProcessor finalize queue full "
-                    "(max=%d); deferring %d harvest winner(s)",
-                    DEFAULT_MAX_FINALIZE_QUEUE,
-                    len(rest),
-                )
-                return
+                    _LOG.error(
+                        "TransactionSpanProcessor finalize queue full "
+                        "(max=%d); deferring %d harvest winner(s)",
+                        DEFAULT_MAX_FINALIZE_QUEUE,
+                        len(rest),
+                    )
+                    break
+        if stubs:
+            self._export_spans(stubs)
 
     def force_flush(self, timeout_millis: int = 30000) -> bool:
         deadline = time.monotonic() + max(0.001, timeout_millis / 1000.0)

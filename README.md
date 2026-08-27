@@ -12,10 +12,10 @@ available for backward compatibility only.
 
 By default the processor keeps at most **256** slowest spans per local trace
 (`max_nodes`) and exports only the **slowest** completed local trace every
-**60s** (`max_regular_traces=1`). That is intentional New Relic-style harvest
+**60s** (`max_regular_traces=1`). That is intentional harvest
 sampling: most completed local traces are **not** exported as full waterfalls.
 
-Harvest losers still:
+Harvest samples that do not win the window still:
 
 - record `cgx.transaction.self_duration` histogram points for every span in the
   completed local tree
