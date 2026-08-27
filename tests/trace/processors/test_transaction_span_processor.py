@@ -1915,6 +1915,34 @@ def _readable(
     )
 
 
+def test_folded_child_coverage_keeps_live_overlap_geometry() -> None:
+    processor = TransactionSpanProcessor(ListSpanExporter())
+    with processor._lock:
+        # A child that began at 5 remains live while two siblings finish.
+        processor._live_child_starts[1] = {4: 5}
+        processor._add_child_interval_locked(1, 1, 0, 10)
+        processor._add_child_interval_locked(1, 1, 20, 30)
+        assert processor._child_covered_ns[1] == 5
+        assert processor._child_intervals[1] == [(5, 10), (20, 30)]
+
+        processor._live_child_starts.pop(1)
+        processor._add_child_interval_locked(1, 1, 5, 40)
+        assert processor._child_covered_ns[1] == 40
+        assert 1 not in processor._child_intervals
+    processor.shutdown()
+
+
+def test_folded_child_coverage_clamps_to_ended_parent() -> None:
+    processor = TransactionSpanProcessor(ListSpanExporter())
+    with processor._lock:
+        processor._buffers[1] = [_readable("root", span_id=1, root=True, end=100)]
+        processor._add_child_interval_locked(1, 1, 0, 60)
+        processor._add_child_interval_locked(1, 1, 80, 200)
+        assert processor._child_covered_ns[1] == 80
+        assert 1 not in processor._child_intervals
+    processor.shutdown()
+
+
 def test_stale_cancelled_holdback_does_not_pop_replacement() -> None:
     """Cancelling an idle holdback must not drop a replacement arm for the same TraceID."""
     exporter = ListSpanExporter()
