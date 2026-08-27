@@ -633,16 +633,17 @@ class TransactionSpanProcessor(SpanProcessor):
         sibling can still overlap any later interval. Once no such sibling is
         live, all residual geometry folds into the scalar.
         """
-        for parent in self._buffers.get(trace_id, []):
-            if (
-                parent.context is not None
-                and parent.context.span_id == parent_id
-                and parent.start_time is not None
-                and parent.end_time is not None
-            ):
+        parents = list(self._buffers.get(trace_id, []))
+        pending_parent = self._pending_drop_metrics.get(parent_id)
+        if pending_parent is not None:
+            parents.append(pending_parent)
+        for parent in parents:
+            if parent.context is None or parent.context.span_id != parent_id:
+                continue
+            if parent.start_time is not None and parent.end_time is not None:
                 start = max(start, parent.start_time)
                 end = min(end, parent.end_time)
-                break
+            break
         if end <= start:
             return
         prior = list(self._child_intervals.get(parent_id, []))
