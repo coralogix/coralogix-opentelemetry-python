@@ -668,14 +668,14 @@ def test_force_flush_waits_for_queue_capacity_instead_of_dropping(
     assert processor.force_flush(timeout_millis=100) is False
     assert time.monotonic() - started < 1.5
     assert export_entered.wait(timeout=2.0)
+    assert processor._deferred_finalize, "unqueued batches must be retained for retry"
 
     release_export.set()
-    # A later flush with room to run should finish remaining work.
+    # A later flush should export the retained batches after the exporter recovers.
     assert processor.force_flush(timeout_millis=2000) is True
     provider.shutdown()  # type: ignore[no-untyped-call]
     names = {span.name for span in exporter.spans}
-    # At least the batch that was in-flight during the timed-out flush.
-    assert "a" in names or "b" in names or "c" in names
+    assert {"a", "b", "c"} <= names
 
 
 def test_force_flush_reports_failure_when_harvest_winners_deferred() -> None:
@@ -721,6 +721,35 @@ def test_force_flush_reports_failure_when_harvest_winners_deferred() -> None:
     assert processor.force_flush(timeout_millis=2000) is True
     provider.shutdown()  # type: ignore[no-untyped-call]
     assert {span.name for span in exporter.spans} >= {"w1", "w2", "w3"}
+
+
+def test_force_flush_export_lock_respects_deadline() -> None:
+    """force_flush must not block forever waiting on a harvester held export lock."""
+    lock_held = threading.Event()
+    release_lock = threading.Event()
+
+    exporter = ListSpanExporter()
+    processor = TransactionSpanProcessor(
+        exporter, max_regular_traces=0, completion_holdback_millis=0
+    )
+
+    def hold_lock() -> None:
+        with processor._export_lock:
+            lock_held.set()
+            assert release_lock.wait(timeout=5.0)
+
+    holder = threading.Thread(target=hold_lock)
+    holder.start()
+    assert lock_held.wait(timeout=2.0)
+
+    started = time.monotonic()
+    assert processor.force_flush(timeout_millis=80) is False
+    assert time.monotonic() - started < 1.5
+
+    release_lock.set()
+    holder.join(timeout=2.0)
+    assert processor.force_flush(timeout_millis=2000) is True
+    processor.shutdown()
 
 
 def test_zero_holdback_end_does_not_block_on_slow_export() -> None:

@@ -152,6 +152,9 @@ class TransactionSpanProcessor(SpanProcessor):
         self._shutdown_done = threading.Event()
         self._pending_finalize = 0
         self._idle = threading.Condition(self._lock)
+        # Batches extracted by force_flush that could not be queued before the
+        # deadline — retained for a later flush instead of being abandoned.
+        self._deferred_finalize: List[List[ReadableSpan]] = []
         self._self_duration_hist: Histogram = create_self_duration_histogram(
             meter_provider
         )
@@ -402,7 +405,8 @@ class TransactionSpanProcessor(SpanProcessor):
 
         Hot path (no deadline): if the queue is full, record metrics then drop.
         force_flush (deadline set): wait for capacity until the deadline; return
-        False if any batch could not be queued in time (no silent drop+success).
+        False if any batch could not be queued in time. Unqueued force_flush
+        batches are retained in ``_deferred_finalize`` for a later retry.
         """
         for index, batch in enumerate(batches):
             payload = list(batch)
@@ -417,16 +421,17 @@ class TransactionSpanProcessor(SpanProcessor):
                 )
                 self._abandon_completed_batch(payload)
                 continue
+            unqueued = [payload] + [list(rest) for rest in batches[index + 1 :]]
+            with self._lock:
+                self._deferred_finalize.extend(unqueued)
+                self._pending_finalize -= len(unqueued)
+                self._idle.notify_all()
             _LOG.error(
                 "TransactionSpanProcessor finalize queue full "
-                "(max=%d); force_flush could not enqueue batch of %d span(s) "
-                "before deadline",
+                "(max=%d); retaining %d batch(es) for a later force_flush",
                 DEFAULT_MAX_FINALIZE_QUEUE,
-                len(payload),
+                len(unqueued),
             )
-            self._abandon_completed_batch(payload)
-            for rest in batches[index + 1 :]:
-                self._abandon_completed_batch(list(rest))
             return False
         return True
 
@@ -492,7 +497,9 @@ class TransactionSpanProcessor(SpanProcessor):
                 break
 
             if stubs:
-                self._export_spans(stubs)
+                # Stubs from capacity eviction during restore — try under deadline.
+                if not self._try_export_spans(stubs, deadline=deadline):
+                    return False
 
             if not deferred:
                 return True
@@ -509,9 +516,11 @@ class TransactionSpanProcessor(SpanProcessor):
         with self._lock:
             if self._exporter_shutdown:
                 return True
-            batches = self._flush_pending_completions_locked()
+            batches = list(self._deferred_finalize)
+            self._deferred_finalize = []
+            batches.extend(self._flush_pending_completions_locked())
             self._pending_finalize += len(batches)
-        # Wait for queue capacity within the deadline — do not drop-and-succeed.
+        # Wait for queue capacity within the deadline — retain on timeout.
         if not self._dispatch_accept_completed(batches, deadline=deadline):
             return False
         with self._lock:
@@ -537,8 +546,14 @@ class TransactionSpanProcessor(SpanProcessor):
         if timed_out:
             return False
 
-        remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
-        with self._export_lock:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        acquired = self._export_lock.acquire(timeout=remaining)
+        if not acquired:
+            return False
+        try:
+            remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
             if self._exporter_shutdown:
                 return True
             force_flush_fn = getattr(self._exporter, "force_flush", None)
@@ -548,7 +563,9 @@ class TransactionSpanProcessor(SpanProcessor):
                 result = force_flush_fn(timeout_millis=remaining_ms)
             except TypeError:
                 result = force_flush_fn(remaining_ms)
-        return True if result is None else bool(result)
+            return True if result is None else bool(result)
+        finally:
+            self._export_lock.release()
 
     def shutdown(self) -> None:
         with self._lock:
@@ -569,7 +586,9 @@ class TransactionSpanProcessor(SpanProcessor):
             with self._lock:
                 self._wait_for_idle_locked(timeout_sec=30.0)
                 holdback_batches = self._flush_pending_completions_locked()
-                batches: List[List[ReadableSpan]] = list(holdback_batches)
+                batches: List[List[ReadableSpan]] = list(self._deferred_finalize)
+                self._deferred_finalize = []
+                batches.extend(holdback_batches)
                 for trace_id in list(self._buffers.keys()):
                     if self._live_parents.get(trace_id):
                         dropped = self._buffers.pop(trace_id, None) or []
@@ -867,3 +886,27 @@ class TransactionSpanProcessor(SpanProcessor):
                 return
             if result is SpanExportResult.FAILURE:
                 _LOG.warning("TransactionSpanProcessor exporter returned FAILURE")
+
+    def _try_export_spans(
+        self, spans: Sequence[ReadableSpan], *, deadline: float
+    ) -> bool:
+        """Export under ``_export_lock`` without waiting past ``deadline``."""
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        acquired = self._export_lock.acquire(timeout=remaining)
+        if not acquired:
+            return False
+        try:
+            if self._exporter_shutdown:
+                return True
+            try:
+                result = self._exporter.export(list(spans))
+            except Exception:
+                _LOG.exception("TransactionSpanProcessor failed to export spans")
+                return True
+            if result is SpanExportResult.FAILURE:
+                _LOG.warning("TransactionSpanProcessor exporter returned FAILURE")
+            return True
+        finally:
+            self._export_lock.release()
