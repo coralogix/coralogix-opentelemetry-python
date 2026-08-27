@@ -4,6 +4,9 @@ High-throughput services can complete many traces per second. Creating a
 ``threading.Timer`` per completion (and another for nested holdback) scales
 threads one-for-one with in-flight holdbacks. This module keeps one daemon
 worker and a min-heap of deadlines instead.
+
+Callbacks must return quickly (extract / enqueue only). Do not call exporters
+from a deadline callback — that would stall every other holdback.
 """
 
 from __future__ import annotations

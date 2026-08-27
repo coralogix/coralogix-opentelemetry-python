@@ -5,7 +5,9 @@ from __future__ import annotations
 import threading
 import time
 
-from coralogix_opentelemetry.trace.processors.holdback_scheduler import HoldbackScheduler
+from coralogix_opentelemetry.trace.processors.holdback_scheduler import (
+    HoldbackScheduler,
+)
 
 
 def test_scheduler_fires_once_and_cancel_prevents_fire() -> None:

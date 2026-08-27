@@ -304,6 +304,66 @@ def test_holdback_uses_single_scheduler_thread() -> None:
     provider.shutdown()  # type: ignore[no-untyped-call]
 
 
+def test_slow_export_does_not_block_holdback_deadlines() -> None:
+    """Holdback worker must enqueue finalize work, not wait on exporters."""
+    first_export_entered = threading.Event()
+    release_first_export = threading.Event()
+    dispatched_names: list = []
+    dispatched_lock = threading.Lock()
+
+    class BlockingExporter(ListSpanExporter):
+        def export(self, spans: Sequence[ReadableSpan]) -> SpanExportResult:
+            names = [span.name for span in spans]
+            if "first" in names:
+                first_export_entered.set()
+                assert release_first_export.wait(timeout=5.0)
+            return super().export(spans)
+
+    exporter = BlockingExporter()
+    processor = TransactionSpanProcessor(
+        exporter, max_regular_traces=0, completion_holdback_millis=40
+    )
+    original_dispatch = processor._dispatch_accept_completed
+
+    def tracking_dispatch(batches: Sequence[Sequence[ReadableSpan]]) -> None:
+        with dispatched_lock:
+            for batch in batches:
+                if batch:
+                    dispatched_names.append(batch[0].name)
+        original_dispatch(batches)
+
+    processor._dispatch_accept_completed = tracking_dispatch  # type: ignore[method-assign]
+
+    provider = TracerProvider()
+    provider.add_span_processor(processor)
+    tracer = provider.get_tracer("test")
+
+    first = tracer.start_span("first", kind=SpanKind.SERVER)
+    first.end()
+    assert first_export_entered.wait(timeout=2.0), "first export should start"
+
+    second = tracer.start_span("second", kind=SpanKind.SERVER)
+    second.end()
+
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        with dispatched_lock:
+            if "second" in dispatched_names:
+                break
+        time.sleep(0.02)
+    with dispatched_lock:
+        assert (
+            "second" in dispatched_names
+        ), "second holdback must dispatch while first export is still blocked: " + str(
+            dispatched_names
+        )
+
+    release_first_export.set()
+    provider.force_flush()
+    provider.shutdown()  # type: ignore[no-untyped-call]
+    assert {span.name for span in exporter.spans} == {"first", "second"}
+
+
 def test_force_flush_does_not_finalize_incomplete_traces() -> None:
     exporter = ListSpanExporter()
     provider = TracerProvider()
