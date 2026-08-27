@@ -633,6 +633,129 @@ def test_live_buffer_defers_metrics_until_live_child_ends() -> None:
     meter_provider.shutdown()
 
 
+def test_side_tables_survive_until_last_inflight_batch() -> None:
+    """Nested then outer batches on one TraceID must not drop membership early."""
+    exporter = ListSpanExporter()
+    processor = TransactionSpanProcessor(
+        exporter, max_nodes=256, completion_holdback_millis=0
+    )
+    provider = TracerProvider()
+    provider.add_span_processor(processor)
+    tracer = provider.get_tracer("test")
+
+    outer = tracer.start_span("outer", kind=SpanKind.SERVER)
+    outer_ctx = trace.set_span_in_context(outer)
+    nested = tracer.start_span("nested", context=outer_ctx)
+    start_new_transaction(nested, "fulfill")
+    with trace.use_span(nested, end_on_exit=False):
+        tracer.start_span("child").end()
+    nested.end()
+    provider.force_flush()
+    # Outer still open; nested exported. Side tables for this TraceID must remain
+    # so outer finalize can still resolve names/intervals.
+    trace_id = outer.get_span_context().trace_id
+    with processor._lock:
+        assert processor._membership.get(outer.get_span_context().span_id) is not None
+        assert trace_id in processor._trace_span_ids
+    outer.end()
+    provider.force_flush()
+    fulfill = [
+        span
+        for span in exporter.spans
+        if (span.attributes or {}).get(CoralogixAttributes.TRANSACTION_IDENTIFIER)
+        == "fulfill"
+    ]
+    outer_spans = [span for span in exporter.spans if span.name == "outer"]
+    assert fulfill
+    assert outer_spans
+    assert (
+        outer_spans[0].attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER] == "outer"
+    )
+    provider.shutdown()  # type: ignore[no-untyped-call]
+
+
+def test_rebind_child_started_under_evicted_parent() -> None:
+    exporter = ListSpanExporter()
+    processor = TransactionSpanProcessor(
+        exporter, max_nodes=3, completion_holdback_millis=0
+    )
+    provider = TracerProvider()
+    provider.add_span_processor(processor)
+    tracer = provider.get_tracer("test")
+
+    root = tracer.start_span("root", kind=SpanKind.SERVER)
+    root_ctx = trace.set_span_in_context(root)
+    root_id = root.get_span_context().span_id
+    mid = tracer.start_span("mid", context=root_ctx)
+    mid_ctx = trace.set_span_in_context(mid)
+    mid.end()
+    for i in range(8):
+        child = tracer.start_span("sib-{}".format(i), context=root_ctx)
+        time.sleep(0.01)
+        child.end()
+    mid_id = mid.get_span_context().span_id
+    trace_id = root.get_span_context().trace_id
+    with processor._lock:
+        assert mid_id in processor._evicted_from_buffer.get(trace_id, set())
+    # mid evicted; start a late child from the retained mid context.
+    late = tracer.start_span("late", context=mid_ctx)
+    with processor._lock:
+        assert processor._parent_rebind.get(late.get_span_context().span_id) == root_id
+        assert processor._live_parents[trace_id][late.get_span_context().span_id] == root_id
+    late.end()
+    with processor._lock:
+        buffered = processor._buffers.get(trace_id, [])
+        late_buf = [span for span in buffered if span.name == "late"]
+        if late_buf:
+            assert late_buf[0].parent is not None
+            assert late_buf[0].parent.span_id == root_id
+    root.end()
+    provider.force_flush()
+    provider.shutdown()  # type: ignore[no-untyped-call]
+
+
+def test_eviction_metrics_wait_for_root_rename() -> None:
+    resource = Resource.create({"service.name": "test"})
+    exporter = ListSpanExporter()
+    reader = InMemoryMetricReader()
+    meter_provider = MeterProvider(resource=resource, metric_readers=[reader])
+    processor = TransactionSpanProcessor(
+        exporter,
+        max_nodes=2,
+        completion_holdback_millis=0,
+        meter_provider=meter_provider,
+    )
+    provider = TracerProvider(resource=resource)
+    provider.add_span_processor(processor)
+    tracer = provider.get_tracer("test")
+
+    root = tracer.start_span("GET", kind=SpanKind.SERVER)
+    root_ctx = trace.set_span_in_context(root)
+    for i in range(8):
+        tracer.start_span("c{}".format(i), context=root_ctx).end()
+    root.update_name("GET /route")
+    root.end()
+    provider.force_flush()
+    meter_provider.force_flush()
+
+    txn_names = set()
+    for rm in reader.get_metrics_data().resource_metrics:
+        for sm in rm.scope_metrics:
+            for metric in sm.metrics:
+                if metric.name != METRIC_SELF_DURATION:
+                    continue
+                for point in metric.data.data_points:
+                    txn_names.add(
+                        dict(point.attributes).get(
+                            CoralogixAttributes.TRANSACTION_IDENTIFIER
+                        )
+                    )
+    assert "GET /route" in txn_names
+    assert "GET" not in txn_names
+    provider.shutdown()  # type: ignore[no-untyped-call]
+    meter_provider.shutdown()
+
+
 def test_preset_template_name_different_from_span_name_is_override() -> None:
     exporter = ListSpanExporter()
     provider = TracerProvider()
