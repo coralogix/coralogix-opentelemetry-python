@@ -364,6 +364,95 @@ def test_slow_export_does_not_block_holdback_deadlines() -> None:
     assert {span.name for span in exporter.spans} == {"first", "second"}
 
 
+def test_finalize_queue_drops_when_full(monkeypatch: MonkeyPatch) -> None:
+    """Bounded finalize queue must drop overflow instead of growing without bound."""
+    monkeypatch.setattr(
+        "coralogix_opentelemetry.trace.processors.transaction_span_processor."
+        "DEFAULT_MAX_FINALIZE_QUEUE",
+        1,
+    )
+    first_export_entered = threading.Event()
+    release_exports = threading.Event()
+    abandoned: list = []
+
+    class BlockingExporter(ListSpanExporter):
+        def export(self, spans: Sequence[ReadableSpan]) -> SpanExportResult:
+            if not first_export_entered.is_set():
+                first_export_entered.set()
+                assert release_exports.wait(timeout=5.0)
+            return super().export(spans)
+
+    exporter = BlockingExporter()
+    processor = TransactionSpanProcessor(
+        exporter, max_regular_traces=0, completion_holdback_millis=30
+    )
+    assert processor._finalize_queue.maxsize == 1
+    original_abandon = processor._abandon_completed_batch
+
+    def tracking_abandon(batch: Sequence[ReadableSpan]) -> None:
+        abandoned.append([span.name for span in batch])
+        original_abandon(batch)
+
+    processor._abandon_completed_batch = tracking_abandon  # type: ignore[method-assign]
+
+    provider = TracerProvider()
+    provider.add_span_processor(processor)
+    tracer = provider.get_tracer("test")
+
+    tracer.start_span("first", kind=SpanKind.SERVER).end()
+    assert first_export_entered.wait(timeout=2.0), "first export should block worker"
+
+    tracer.start_span("queued", kind=SpanKind.SERVER).end()
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline and processor._finalize_queue.qsize() < 1:
+        time.sleep(0.01)
+    assert processor._finalize_queue.qsize() == 1
+
+    tracer.start_span("dropped", kind=SpanKind.SERVER).end()
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline and not abandoned:
+        time.sleep(0.01)
+    assert abandoned and "dropped" in abandoned[0]
+
+    release_exports.set()
+    provider.force_flush()
+    provider.shutdown()  # type: ignore[no-untyped-call]
+    names = {span.name for span in exporter.spans}
+    assert "first" in names
+    assert "queued" in names
+    assert "dropped" not in names
+
+
+def test_force_flush_returns_false_when_finalize_times_out() -> None:
+    """force_flush must report failure if finalize work is still pending at deadline."""
+    first_export_entered = threading.Event()
+    release_export = threading.Event()
+
+    class BlockingExporter(ListSpanExporter):
+        def export(self, spans: Sequence[ReadableSpan]) -> SpanExportResult:
+            first_export_entered.set()
+            assert release_export.wait(timeout=5.0)
+            return super().export(spans)
+
+    exporter = BlockingExporter()
+    processor = TransactionSpanProcessor(
+        exporter, max_regular_traces=0, completion_holdback_millis=20
+    )
+    provider = TracerProvider()
+    provider.add_span_processor(processor)
+    tracer = provider.get_tracer("test")
+
+    tracer.start_span("blocked", kind=SpanKind.SERVER).end()
+    assert first_export_entered.wait(timeout=2.0)
+
+    assert processor.force_flush(timeout_millis=50) is False
+
+    release_export.set()
+    assert processor.force_flush(timeout_millis=2000) is True
+    provider.shutdown()  # type: ignore[no-untyped-call]
+    assert {span.name for span in exporter.spans} == {"blocked"}
+
+
 def test_force_flush_does_not_finalize_incomplete_traces() -> None:
     exporter = ListSpanExporter()
     provider = TracerProvider()
