@@ -654,6 +654,25 @@ def test_live_root_with_one_node_drops_ended_children() -> None:
     provider.shutdown()  # type: ignore[no-untyped-call]
 
 
+def test_unnamed_live_root_bounds_deferred_eviction_metrics() -> None:
+    exporter = ListSpanExporter()
+    processor = TransactionSpanProcessor(
+        exporter, max_nodes=1, completion_holdback_millis=0
+    )
+    provider = TracerProvider()
+    provider.add_span_processor(processor)
+    tracer = provider.get_tracer("test")
+    root = tracer.start_span("root", kind=SpanKind.SERVER)
+    root_ctx = trace.set_span_in_context(root)
+    for index in range(300):
+        tracer.start_span("child-{}".format(index), context=root_ctx).end()
+    with processor._lock:
+        assert len(processor._pending_drop_metrics) <= 256
+    root.end()
+    provider.force_flush()
+    provider.shutdown()  # type: ignore[no-untyped-call]
+
+
 def test_side_tables_survive_until_last_inflight_batch() -> None:
     """Nested then outer batches on one TraceID must not drop membership early."""
     exporter = ListSpanExporter()
