@@ -47,6 +47,9 @@ def select_slowest_spans(
     roots than ``max_nodes``, all roots are kept. Remaining slots are filled
     with a duration min-heap.
 
+    ``max_nodes <= 0`` disables trimming and returns every span (caller should
+    normally pass a validated non-negative value; ``0`` means unlimited).
+
     ``root_span_ids`` must be a sequence of span-id hex strings (never a bare
     string — a string would be iterated as characters).
     """
@@ -108,7 +111,12 @@ def reparent_to_kept_ancestors(
     *,
     all_spans: Sequence[ReadableSpan],
 ) -> List[ReadableSpan]:
-    """Point each kept span at the nearest kept ancestor (or no parent)."""
+    """Point each kept span at the nearest kept ancestor.
+
+    Parents outside ``all_spans`` (remote parents, or outer local transactions
+    not in this batch) are preserved — only climb past ancestors known to have
+    been trimmed from this batch.
+    """
     by_id: Dict[str, ReadableSpan] = {
         format_span_id(span.context.span_id): span
         for span in all_spans
@@ -146,6 +154,7 @@ def _nearest_kept_parent_context(
             return kept_parent.context if kept_parent is not None else parent
         ancestor = by_id.get(parent_id)
         if ancestor is None:
-            break
+            # Parent is outside this local batch (e.g. remote / outer txn).
+            return parent
         parent = ancestor.parent
     return None

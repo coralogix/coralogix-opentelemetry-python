@@ -9,8 +9,11 @@ packages = [{ include = "coralogix_opentelemetry" }]
 
 [tool.poetry.dependencies]
 python = "^3.8"
-opentelemetry-api = "^1.0.0"
-opentelemetry-sdk = "^1.0.0"
+# Floor matches metrics API + ReadableSpan.instrumentation_scope (needed by
+# TransactionSpanProcessor / span_copy). Align with the locked 1.21.x line and
+# the optional OTLP extra so allowed versions cannot fail at import/export.
+opentelemetry-api = "^1.21.0"
+opentelemetry-sdk = "^1.21.0"
 # Optional: Coralogix/demo OTLP path (`pip install 'coralogix-opentelemetry[otlp]'`).
 # Pin to the locked SDK line (1.21.x) so CI on Python 3.8 stays solvable.
 opentelemetry-exporter-otlp-proto-grpc = { version = "1.21.0", optional = true }

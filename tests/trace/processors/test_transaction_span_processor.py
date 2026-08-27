@@ -229,6 +229,81 @@ def test_negative_env_falls_back_to_default(monkeypatch: MonkeyPatch) -> None:
     processor.shutdown()
 
 
+def test_negative_constructor_max_nodes_falls_back_to_default() -> None:
+    processor = TransactionSpanProcessor(ListSpanExporter(), max_nodes=-7)
+    assert processor._max_nodes == 256
+    processor.shutdown()
+
+
+def test_zero_max_nodes_disables_trimming() -> None:
+    exporter = ListSpanExporter()
+    provider = TracerProvider()
+    processor = TransactionSpanProcessor(
+        exporter, max_nodes=0, max_regular_traces=0, completion_holdback_millis=0
+    )
+    provider.add_span_processor(processor)
+    tracer = provider.get_tracer("test")
+
+    root = tracer.start_span("root", kind=SpanKind.SERVER)
+    root_ctx = trace.set_span_in_context(root)
+    for i in range(5):
+        child = tracer.start_span("c{}".format(i), context=root_ctx)
+        child.end()
+    root.end()
+    provider.force_flush()
+    assert len(exporter.spans) == 6
+    provider.shutdown()  # type: ignore[no-untyped-call]
+
+
+def test_accept_completed_failure_does_not_escape_on_end(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    exporter = ListSpanExporter()
+    provider = TracerProvider()
+    processor = TransactionSpanProcessor(
+        exporter, max_regular_traces=0, completion_holdback_millis=0
+    )
+    provider.add_span_processor(processor)
+    tracer = provider.get_tracer("test")
+
+    def boom(_spans: Sequence[ReadableSpan]) -> None:
+        raise RuntimeError("annotate failed")
+
+    monkeypatch.setattr(processor, "_accept_completed_trace", boom)
+
+    span = tracer.start_span("root", kind=SpanKind.SERVER)
+    span.end()  # must not raise
+    provider.force_flush()
+    provider.shutdown()  # type: ignore[no-untyped-call]
+
+
+def test_holdback_uses_single_scheduler_thread() -> None:
+    exporter = ListSpanExporter()
+    processors = [
+        TransactionSpanProcessor(
+            exporter, max_regular_traces=0, completion_holdback_millis=200
+        )
+        for _ in range(3)
+    ]
+    provider = TracerProvider()
+    for processor in processors:
+        provider.add_span_processor(processor)
+    tracer = provider.get_tracer("test")
+
+    for i in range(20):
+        span = tracer.start_span("s{}".format(i), kind=SpanKind.SERVER)
+        span.end()
+
+    holdback_threads = [
+        t
+        for t in threading.enumerate()
+        if t.name == "TransactionSpanProcessor-holdback"
+    ]
+    # One scheduler thread per processor instance (not per completed trace).
+    assert len(holdback_threads) == 3
+    provider.shutdown()  # type: ignore[no-untyped-call]
+
+
 def test_force_flush_does_not_finalize_incomplete_traces() -> None:
     exporter = ListSpanExporter()
     provider = TracerProvider()
@@ -684,8 +759,8 @@ def _readable(
     )
 
 
-def test_stale_cancelled_timer_does_not_pop_replacement() -> None:
-    """A cancelled holdback timer must not pop a replacement timer for the same TraceID."""
+def test_stale_cancelled_holdback_does_not_pop_replacement() -> None:
+    """Cancelling an idle holdback must not drop a replacement arm for the same TraceID."""
     exporter = ListSpanExporter()
     processor = TransactionSpanProcessor(
         exporter, max_regular_traces=0, completion_holdback_millis=60_000
@@ -700,16 +775,16 @@ def test_stale_cancelled_timer_does_not_pop_replacement() -> None:
         processor._cancel_pending_completion_locked(trace_id)
         processor._schedule_completion_locked(trace_id)
         replacement = processor._pending_completions[trace_id]
-        assert replacement is not stale
+        assert replacement != stale
+        assert processor._holdback.is_armed(("idle", trace_id))
 
-    stale.function(*stale.args, **stale.kwargs)
+    time.sleep(0.05)
 
     with processor._lock:
-        assert processor._pending_completions.get(trace_id) is replacement
+        assert processor._pending_completions.get(trace_id) == replacement
         assert processor._buffers.get(trace_id) == [outer]
     assert exporter.spans == []
 
-    replacement.cancel()
     processor.shutdown()
 
 

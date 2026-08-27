@@ -130,3 +130,54 @@ def test_no_root_span_id_uses_all_slots_for_heap() -> None:
 
     kept = select_slowest_spans([a, b, c], max_nodes=2, root_span_ids=None)
     assert {span.name for span in kept} == {"b", "c"}
+
+
+def test_zero_max_nodes_keeps_all_spans() -> None:
+    spans = [
+        _span("a", span_id=1, start_ns=0, end_ns=10),
+        _span("b", span_id=2, start_ns=0, end_ns=50),
+        _span("c", span_id=3, start_ns=0, end_ns=30),
+    ]
+    kept = select_slowest_spans(spans, max_nodes=0, root_span_ids=["0000000000000001"])
+    assert [span.name for span in kept] == ["a", "b", "c"]
+
+
+def test_preserves_parent_outside_trimmed_batch() -> None:
+    """Remote / outer parents absent from the batch must not become None."""
+    # Nested SERVER root (span 2) has parent 0x99 which is not in this batch.
+    # Cap=2 keeps root+db; mid is dropped. Root must keep parent 0x99.
+    remote_parent = SpanContext(
+        trace_id=1,
+        span_id=0x99,
+        is_remote=True,
+        trace_flags=TraceFlags(0x01),
+    )
+    root = ReadableSpan(
+        name="nested-server",
+        context=_ctx(1, 2),
+        parent=remote_parent,
+        resource=Resource.create({"service.name": "test"}),
+        attributes={CoralogixAttributes.TRANSACTION_ROOT.value: True},
+        events=(),
+        links=(),
+        kind=SpanKind.SERVER,
+        status=Status(StatusCode.UNSET),
+        start_time=0,
+        end_time=100,
+    )
+    mid = _span("middleware", span_id=3, start_ns=1, end_ns=2, parent_span_id=2)
+    db = _span("db", span_id=4, start_ns=5, end_ns=90, parent_span_id=3)
+
+    kept = select_slowest_spans(
+        [root, mid, db],
+        max_nodes=2,
+        root_span_ids=["0000000000000002"],
+    )
+    assert {span.name for span in kept} == {"nested-server", "db"}
+    root_kept = next(span for span in kept if span.name == "nested-server")
+    assert root_kept.parent is not None
+    assert root_kept.parent.span_id == 0x99
+    assert root_kept.parent.is_remote is True
+    db_kept = next(span for span in kept if span.name == "db")
+    assert db_kept.parent is not None
+    assert db_kept.parent.span_id == 2
