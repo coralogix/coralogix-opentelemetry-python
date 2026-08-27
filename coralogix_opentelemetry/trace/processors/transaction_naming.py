@@ -143,15 +143,6 @@ def resolve_batch_transaction_name(
             return member.override_name
 
         attrs = root.attributes or {}
-        preset = attrs.get(CoralogixAttributes.TRANSACTION_IDENTIFIER)
-        if (
-            member is not None
-            and preset is not None
-            and member.start_name is not None
-            and str(preset) != member.start_name
-        ):
-            return str(preset)
-
         if attrs.get(CoralogixAttributes.TRANSACTION_ROOT) or (
             member is not None and member.is_root
         ):

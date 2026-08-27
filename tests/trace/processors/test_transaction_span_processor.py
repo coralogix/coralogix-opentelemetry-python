@@ -234,6 +234,67 @@ def test_start_new_transaction_equal_name_survives_rename() -> None:
     provider.shutdown()  # type: ignore[no-untyped-call]
 
 
+def test_nested_server_with_sampler_does_not_inherit_outer_override() -> None:
+    """Sampler copies outer txn onto nested SERVER; nested must keep its own name."""
+    from coralogix_opentelemetry.trace.samplers import CoralogixTransactionSampler
+
+    exporter = ListSpanExporter()
+    provider = TracerProvider(sampler=CoralogixTransactionSampler())
+    provider.add_span_processor(
+        TransactionSpanProcessor(exporter, completion_holdback_millis=0)
+    )
+    tracer = provider.get_tracer("test")
+
+    outer = tracer.start_span("outer", kind=SpanKind.SERVER)
+    with trace.use_span(outer, end_on_exit=False):
+        with tracer.start_as_current_span("inner", kind=SpanKind.SERVER):
+            pass
+        provider.force_flush()
+        inner_spans = [span for span in exporter.spans if span.name == "inner"]
+        assert len(inner_spans) == 1
+        assert (
+            inner_spans[0].attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER]
+            == "inner"
+        )
+        assert inner_spans[0].attributes[CoralogixAttributes.TRANSACTION_ROOT] is True
+
+    outer.end()
+    provider.force_flush()
+    outer_spans = [span for span in exporter.spans if span.name == "outer"]
+    assert (
+        outer_spans[0].attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER] == "outer"
+    )
+    provider.shutdown()  # type: ignore[no-untyped-call]
+
+
+def test_live_buffer_trimmed_while_root_still_open() -> None:
+    """Ended children under a live root must not grow `_buffers` past max_nodes."""
+    exporter = ListSpanExporter()
+    processor = TransactionSpanProcessor(
+        exporter, max_nodes=3, completion_holdback_millis=0
+    )
+    provider = TracerProvider()
+    provider.add_span_processor(processor)
+    tracer = provider.get_tracer("test")
+
+    root = tracer.start_span("root", kind=SpanKind.SERVER)
+    root_ctx = trace.set_span_in_context(root)
+    # Reserve 1 slot for the live root; at most 2 ended children may remain.
+    for i in range(8):
+        child = tracer.start_span("c{}".format(i), context=root_ctx)
+        child.end()
+    trace_id = root.get_span_context().trace_id
+    with processor._lock:
+        buffered = processor._buffers.get(trace_id, [])
+        assert len(buffered) <= 2
+    root.end()
+    provider.force_flush()
+    names = {span.name for span in exporter.spans}
+    assert "root" in names
+    assert len(exporter.spans) <= 3
+    provider.shutdown()  # type: ignore[no-untyped-call]
+
+
 def test_preset_template_name_different_from_span_name_is_override() -> None:
     exporter = ListSpanExporter()
     provider = TracerProvider()
