@@ -66,6 +66,7 @@ from coralogix_opentelemetry.trace.processors.transaction_naming import (
     TransactionMembership,
     apply_on_start_root_flag,
     parent_has_transaction_attrs,
+    parent_transaction_from_attrs,
     parent_transaction_from_tracestate,
     preset_transaction_name,
     starts_new_transaction,
@@ -194,6 +195,10 @@ class TransactionSpanProcessor(SpanProcessor):
         span_id = span.context.span_id
 
         with self._lock:
+            # After exporter shutdown, do not grow membership — on_end will also
+            # no-op and would never clean these entries up.
+            if self._exporter_shutdown:
+                return
             if starts:
                 self._membership[span_id] = TransactionMembership(
                     root_span_id=span_id,
@@ -208,8 +213,10 @@ class TransactionSpanProcessor(SpanProcessor):
                 )
                 inherited_name = None
                 # Name from TraceState / attrs without a locally tracked root.
-                if parent_member is None and inherited_from_ts:
-                    inherited_name = inherited_from_ts
+                if parent_member is None:
+                    inherited_name = inherited_from_ts or parent_transaction_from_attrs(
+                        parent_span
+                    )
                 self._membership[span_id] = TransactionMembership(
                     root_span_id=root_span_id,
                     is_root=False,
@@ -217,8 +224,6 @@ class TransactionSpanProcessor(SpanProcessor):
                     inherited_name=inherited_name,
                 )
 
-            if self._exporter_shutdown:
-                return
             self._cancel_pending_completion_locked(trace_id)
             if self._stopped:
                 if trace_id not in self._live_parents and trace_id not in self._buffers:
@@ -289,8 +294,9 @@ class TransactionSpanProcessor(SpanProcessor):
             self._pending_finalize += len(completed_batches)
             if self._total_live_locked() == 0 and self._pending_finalize == 0:
                 self._idle.notify_all()
-        for batch in completed_batches:
-            self._run_accept_completed(batch)
+        # Always queue finalize/export (including zero-holdback) so Span.end
+        # never blocks on a slow exporter and the bounded backlog applies.
+        self._dispatch_accept_completed(completed_batches)
 
     def _run_accept_completed(self, batch: Sequence[ReadableSpan]) -> None:
         """Run finalize/export off the caller's contract: never raise to Span.end."""

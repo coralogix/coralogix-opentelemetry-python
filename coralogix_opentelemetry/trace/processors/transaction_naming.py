@@ -102,6 +102,15 @@ def parent_transaction_from_tracestate(parent_span: Optional[object]) -> Optiona
     return str(value)
 
 
+def parent_transaction_from_attrs(parent_span: Optional[object]) -> Optional[str]:
+    """Return ``cgx.transaction`` from parent span attributes, if any."""
+    attrs = (
+        getattr(parent_span, "attributes", None) if parent_span is not None else None
+    )
+    value = _attr_get(attrs, CoralogixAttributes.TRANSACTION_IDENTIFIER.value)
+    return str(value) if value is not None else None
+
+
 def resolve_batch_transaction_name(
     spans: Sequence[ReadableSpan],
     membership: Mapping[int, TransactionMembership],

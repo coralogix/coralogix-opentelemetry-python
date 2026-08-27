@@ -453,6 +453,108 @@ def test_force_flush_returns_false_when_finalize_times_out() -> None:
     assert {span.name for span in exporter.spans} == {"blocked"}
 
 
+def test_zero_holdback_end_does_not_block_on_slow_export() -> None:
+    """With holdback=0, Span.end must still dispatch finalize instead of exporting inline."""
+    first_export_entered = threading.Event()
+    release_export = threading.Event()
+    ended = threading.Event()
+
+    class BlockingExporter(ListSpanExporter):
+        def export(self, spans: Sequence[ReadableSpan]) -> SpanExportResult:
+            first_export_entered.set()
+            assert release_export.wait(timeout=5.0)
+            return super().export(spans)
+
+    exporter = BlockingExporter()
+    processor = TransactionSpanProcessor(
+        exporter, max_regular_traces=0, completion_holdback_millis=0
+    )
+    provider = TracerProvider()
+    provider.add_span_processor(processor)
+    tracer = provider.get_tracer("test")
+
+    def end_first() -> None:
+        tracer.start_span("first", kind=SpanKind.SERVER).end()
+        ended.set()
+
+    t = threading.Thread(target=end_first)
+    t.start()
+    assert first_export_entered.wait(
+        timeout=2.0
+    ), "export should start on finalize worker"
+    assert ended.wait(timeout=1.0), "Span.end must return while export is still blocked"
+    t.join(timeout=1.0)
+
+    tracer.start_span("second", kind=SpanKind.SERVER).end()
+    release_export.set()
+    assert processor.force_flush(timeout_millis=2000) is True
+    provider.shutdown()  # type: ignore[no-untyped-call]
+    assert {span.name for span in exporter.spans} == {"first", "second"}
+
+
+def test_inherits_transaction_name_from_parent_attributes() -> None:
+    """Untracked parent with cgx.transaction attrs must still supply the txn name."""
+    from opentelemetry.trace import SpanContext, TraceFlags, set_span_in_context
+    from opentelemetry.trace.span import NonRecordingSpan
+
+    class ParentWithTxnAttrs(NonRecordingSpan):
+        def __init__(self, context: SpanContext) -> None:
+            super().__init__(context)
+            self._attributes = {
+                CoralogixAttributes.TRANSACTION_IDENTIFIER: "from-parent-attrs"
+            }
+
+        @property
+        def attributes(self):  # type: ignore[override]
+            return self._attributes
+
+    exporter = ListSpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(
+        TransactionSpanProcessor(
+            exporter, completion_holdback_millis=0, max_regular_traces=0
+        )
+    )
+    tracer = provider.get_tracer("test")
+
+    parent_sc = SpanContext(
+        trace_id=0x2,
+        span_id=0x2,
+        is_remote=False,
+        trace_flags=TraceFlags(0x01),
+    )
+    parent_ctx = set_span_in_context(ParentWithTxnAttrs(parent_sc))
+    with tracer.start_as_current_span(
+        "internal-child", kind=SpanKind.INTERNAL, context=parent_ctx
+    ):
+        pass
+
+    provider.force_flush()
+    assert len(exporter.spans) == 1
+    child = exporter.spans[0]
+    assert (
+        child.attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER]
+        == "from-parent-attrs"
+    )
+    assert CoralogixAttributes.TRANSACTION_ROOT not in (child.attributes or {})
+    provider.shutdown()  # type: ignore[no-untyped-call]
+
+
+def test_on_start_after_shutdown_does_not_grow_membership() -> None:
+    exporter = ListSpanExporter()
+    processor = TransactionSpanProcessor(
+        exporter, max_regular_traces=0, completion_holdback_millis=0
+    )
+    provider = TracerProvider()
+    provider.add_span_processor(processor)
+    tracer = provider.get_tracer("test")
+
+    provider.shutdown()  # type: ignore[no-untyped-call]
+    before = len(processor._membership)
+    tracer.start_span("after-shutdown", kind=SpanKind.SERVER).end()
+    assert len(processor._membership) == before
+
+
 def test_force_flush_does_not_finalize_incomplete_traces() -> None:
     exporter = ListSpanExporter()
     provider = TracerProvider()
@@ -473,6 +575,7 @@ def test_force_flush_does_not_finalize_incomplete_traces() -> None:
             exporter.spans == []
         ), "ForceFlush must not finalize incomplete local traces"
 
+    assert processor.force_flush() is True
     assert {span.name for span in exporter.spans} == {"parent", "child"}
     provider.shutdown()  # type: ignore[no-untyped-call]
 
@@ -624,6 +727,10 @@ def test_processor_records_metrics_even_when_trace_not_harvested() -> None:
     with tracer.start_as_current_span("slow", kind=SpanKind.SERVER):
         time.sleep(0.04)
 
+    # Wait for async finalize (not force_flush — that would also drain harvest).
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline and len(exporter.spans) < 1:
+        time.sleep(0.01)
     assert len(exporter.spans) == 1
     assert exporter.spans[0].name == "fast"
 
@@ -666,6 +773,7 @@ def test_processor_immediate_export_when_max_regular_traces_zero() -> None:
     with tracer.start_as_current_span("now", kind=SpanKind.SERVER):
         pass
 
+    provider.force_flush()
     assert any(span.name == "now" for span in exporter.spans)
     provider.shutdown()  # type: ignore[no-untyped-call]
 
@@ -686,6 +794,7 @@ def test_processor_trims_to_max_nodes_keeping_root() -> None:
         with tracer.start_as_current_span("long"):
             time.sleep(0.02)
 
+    provider.force_flush()
     names = {span.name for span in exporter.spans}
     assert "root" in names
     assert "long" in names
@@ -770,6 +879,7 @@ def test_nested_server_finalizes_while_outer_still_open() -> None:
             with tracer.start_as_current_span("db"):
                 time.sleep(0.005)
 
+        provider.force_flush()
         names = {span.name for span in exporter.spans}
         assert names == {
             "inner",
