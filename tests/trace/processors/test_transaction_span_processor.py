@@ -39,6 +39,23 @@ class ListSpanExporter(SpanExporter):
         return None
 
 
+def _self_duration_metric_span_names(reader: InMemoryMetricReader) -> set[str]:
+    names: set[str] = set()
+    metrics_data = reader.get_metrics_data()
+    if metrics_data is None:
+        return names
+    for resource_metrics in metrics_data.resource_metrics:
+        for scope_metrics in resource_metrics.scope_metrics:
+            for metric in scope_metrics.metrics:
+                if metric.name != METRIC_SELF_DURATION:
+                    continue
+                for point in metric.data.data_points:
+                    name = dict(point.attributes).get("span.name")
+                    if isinstance(name, str):
+                        names.add(name)
+    return names
+
+
 def test_self_duration_nested_fixture() -> None:
     spans = [
         ("1", "", "root", 0, 100),
@@ -268,417 +285,95 @@ def test_nested_server_with_sampler_does_not_inherit_outer_override() -> None:
     provider.shutdown()  # type: ignore[no-untyped-call]
 
 
-def test_live_buffer_trimmed_while_root_still_open() -> None:
-    """Ended children under a live root must not grow `_buffers` past max_nodes."""
-    exporter = ListSpanExporter()
-    processor = TransactionSpanProcessor(
-        exporter, max_nodes=3, completion_holdback_millis=0
-    )
-    provider = TracerProvider()
-    provider.add_span_processor(processor)
-    tracer = provider.get_tracer("test")
-
-    root = tracer.start_span("root", kind=SpanKind.SERVER)
-    root_ctx = trace.set_span_in_context(root)
-    # Reserve 1 slot for the live root; at most 2 ended children may remain.
-    for i in range(8):
-        child = tracer.start_span("c{}".format(i), context=root_ctx)
-        child.end()
-    trace_id = root.get_span_context().trace_id
-    with processor._lock:
-        buffered = processor._buffers.get(trace_id, [])
-        assert len(buffered) <= 2
-    root.end()
-    provider.force_flush()
-    names = {span.name for span in exporter.spans}
-    assert "root" in names
-    assert len(exporter.spans) <= 3
-    provider.shutdown()  # type: ignore[no-untyped-call]
-
-
-def test_live_buffer_trimmed_after_root_ends_with_async_child() -> None:
-    """Ended root plus async live child must still cap the buffer."""
-    exporter = ListSpanExporter()
-    processor = TransactionSpanProcessor(
-        exporter, max_nodes=3, completion_holdback_millis=0
-    )
-    provider = TracerProvider()
-    provider.add_span_processor(processor)
-    tracer = provider.get_tracer("test")
-
-    root = tracer.start_span("root", kind=SpanKind.SERVER)
-    root_ctx = trace.set_span_in_context(root)
-    late = tracer.start_span("late", context=root_ctx)
-    root.end()
-    # Root ended; late still live. Extra siblings must not freeze uncapped.
-    for i in range(8):
-        child = tracer.start_span("c{}".format(i), context=root_ctx)
-        child.end()
-    trace_id = root.get_span_context().trace_id
-    with processor._lock:
-        buffered = processor._buffers.get(trace_id, [])
-        assert len(buffered) <= 3
-        assert any(span.name == "root" for span in buffered)
-    late.end()
-    provider.force_flush()
-    assert "root" in {span.name for span in exporter.spans}
-    provider.shutdown()  # type: ignore[no-untyped-call]
-
-
-def test_live_buffer_eviction_metrics_use_root_transaction_name() -> None:
+def test_257th_ended_span_flushes_trace_raw_and_enables_passthrough() -> None:
     resource = Resource.create({"service.name": "test"})
     exporter = ListSpanExporter()
     reader = InMemoryMetricReader()
     meter_provider = MeterProvider(resource=resource, metric_readers=[reader])
-    processor = TransactionSpanProcessor(
-        exporter,
-        max_nodes=2,
-        completion_holdback_millis=0,
-        meter_provider=meter_provider,
-    )
     provider = TracerProvider(resource=resource)
-    provider.add_span_processor(processor)
-    tracer = provider.get_tracer("test")
-
-    root = tracer.start_span("root-txn", kind=SpanKind.SERVER)
-    root_ctx = trace.set_span_in_context(root)
-    for i in range(6):
-        tracer.start_span("leaf-{}".format(i), context=root_ctx).end()
-    root.end()
-    provider.force_flush()
-    meter_provider.force_flush()
-
-    txn_names = set()
-    for rm in reader.get_metrics_data().resource_metrics:
-        for sm in rm.scope_metrics:
-            for metric in sm.metrics:
-                if metric.name != METRIC_SELF_DURATION:
-                    continue
-                for point in metric.data.data_points:
-                    txn_names.add(
-                        dict(point.attributes).get(
-                            CoralogixAttributes.TRANSACTION_IDENTIFIER
-                        )
-                    )
-    assert "root-txn" in txn_names
-    assert "leaf-0" not in txn_names
-    provider.shutdown()  # type: ignore[no-untyped-call]
-    meter_provider.shutdown()
-
-
-def test_live_buffer_keeps_ancestor_of_live_child() -> None:
-    exporter = ListSpanExporter()
-    processor = TransactionSpanProcessor(
-        exporter, max_nodes=2, completion_holdback_millis=0
-    )
-    provider = TracerProvider()
-    provider.add_span_processor(processor)
-    tracer = provider.get_tracer("test")
-
-    root = tracer.start_span("root", kind=SpanKind.SERVER)
-    root_ctx = trace.set_span_in_context(root)
-    mid = tracer.start_span("mid", context=root_ctx)
-    mid_ctx = trace.set_span_in_context(mid)
-    leaf = tracer.start_span("leaf", context=mid_ctx)
-    mid.end()
-    # Fill buffer with short siblings so mid would be eviction-prone without protect.
-    for i in range(6):
-        tracer.start_span("sib-{}".format(i), context=root_ctx).end()
-    mid_id = mid.get_span_context().span_id
-    with processor._lock:
-        assert mid_id in processor._membership
-    leaf.end()
-    root.end()
-    provider.force_flush()
-    names = {span.name for span in exporter.spans}
-    assert "root" in names
-    provider.shutdown()  # type: ignore[no-untyped-call]
-
-
-def test_live_buffer_reparents_when_ended_parent_evicted() -> None:
-    """After a live child ends, its parent can be evicted; re-link survivors."""
-    exporter = ListSpanExporter()
-    processor = TransactionSpanProcessor(
-        exporter, max_nodes=2, completion_holdback_millis=0
-    )
-    provider = TracerProvider()
-    provider.add_span_processor(processor)
-    tracer = provider.get_tracer("test")
-
-    root = tracer.start_span("root", kind=SpanKind.SERVER)
-    root_ctx = trace.set_span_in_context(root)
-    root_id = root.get_span_context().span_id
-    mid = tracer.start_span("mid", context=root_ctx)
-    mid_ctx = trace.set_span_in_context(mid)
-    leaf = tracer.start_span("leaf", context=mid_ctx)
-    time.sleep(0.03)
-    mid.end()
-    leaf.end()
-    # Longer siblings displace the short mid while leaf may remain.
-    for i in range(8):
-        child = tracer.start_span("sib-{}".format(i), context=root_ctx)
-        time.sleep(0.01)
-        child.end()
-
-    trace_id = root.get_span_context().trace_id
-    with processor._lock:
-        buffered = processor._buffers.get(trace_id, [])
-        by_name = {span.name: span for span in buffered if span.context is not None}
-        assert "leaf" in by_name
-        assert "mid" not in by_name
-        leaf_span = by_name["leaf"]
-        assert leaf_span.parent is not None
-        assert leaf_span.parent.span_id == root_id
-
-    root.end()
-    provider.force_flush()
-    provider.shutdown()  # type: ignore[no-untyped-call]
-
-
-def test_live_buffer_does_not_retain_unbounded_ancestor_chain() -> None:
-    """Long async parent chains must not expand the buffer past max_nodes."""
-    exporter = ListSpanExporter()
-    processor = TransactionSpanProcessor(
-        exporter, max_nodes=3, completion_holdback_millis=0
-    )
-    provider = TracerProvider()
-    provider.add_span_processor(processor)
-    tracer = provider.get_tracer("test")
-
-    root = tracer.start_span("root", kind=SpanKind.SERVER)
-    parent_ctx = trace.set_span_in_context(root)
-    tip = tracer.start_span("tip-0", context=parent_ctx)
-    for i in range(12):
-        ended = tip
-        ended.end()
-        parent_ctx = trace.set_span_in_context(ended)
-        tip = tracer.start_span("tip-{}".format(i + 1), context=parent_ctx)
-
-    trace_id = root.get_span_context().trace_id
-    with processor._lock:
-        buffered = processor._buffers.get(trace_id, [])
-        assert len(buffered) <= 3
-
-    tip.end()
-    root.end()
-    provider.force_flush()
-    provider.shutdown()  # type: ignore[no-untyped-call]
-
-
-def test_live_buffer_protects_start_new_transaction_root() -> None:
-    exporter = ListSpanExporter()
-    processor = TransactionSpanProcessor(
-        exporter, max_nodes=2, completion_holdback_millis=0
-    )
-    provider = TracerProvider()
-    provider.add_span_processor(processor)
-    tracer = provider.get_tracer("test")
-
-    outer = tracer.start_span("outer", kind=SpanKind.SERVER)
-    outer_ctx = trace.set_span_in_context(outer)
-    nested = tracer.start_span("nested", context=outer_ctx)
-    start_new_transaction(nested, "fulfill")
-    nested_ctx = trace.set_span_in_context(nested)
-    child = tracer.start_span("child", context=nested_ctx)
-    nested.end()
-    for i in range(8):
-        tracer.start_span("outer-sib-{}".format(i), context=outer_ctx).end()
-    nested_id = nested.get_span_context().span_id
-    with processor._lock:
-        buffered = processor._buffers.get(outer.get_span_context().trace_id, [])
-        assert any(
-            span.context is not None and span.context.span_id == nested_id
-            for span in buffered
+    provider.add_span_processor(
+        TransactionSpanProcessor(
+            exporter,
+            completion_holdback_millis=0,
+            meter_provider=meter_provider,
         )
-    child.end()
-    outer.end()
-    provider.force_flush()
-    fulfill = [
-        span
+    )
+    tracer = provider.get_tracer("test")
+
+    root = tracer.start_span("large-root", kind=SpanKind.SERVER)
+    root_ctx = trace.set_span_in_context(root)
+    for index in range(257):
+        tracer.start_span("large-{}".format(index), context=root_ctx).end()
+    assert provider.force_flush() is True
+    assert meter_provider.force_flush() is True
+    assert len(exporter.spans) == 257
+    assert all(
+        CoralogixAttributes.TRANSACTION_IDENTIFIER not in (span.attributes or {})
+        and CoralogixAttributes.TRANSACTION_ROOT not in (span.attributes or {})
+        and SELF_DURATION_ATTRIBUTE not in (span.attributes or {})
         for span in exporter.spans
-        if (span.attributes or {}).get(CoralogixAttributes.TRANSACTION_IDENTIFIER)
-        == "fulfill"
-    ]
-    assert fulfill
-    assert any(
-        (span.attributes or {}).get(CoralogixAttributes.TRANSACTION_ROOT)
-        for span in fulfill
     )
-    provider.shutdown()  # type: ignore[no-untyped-call]
+    assert not _self_duration_metric_span_names(reader)
 
-
-def test_live_buffer_applies_max_nodes_per_open_transaction() -> None:
-    exporter = ListSpanExporter()
-    processor = TransactionSpanProcessor(
-        exporter, max_nodes=3, completion_holdback_millis=0
-    )
-    provider = TracerProvider()
-    provider.add_span_processor(processor)
-    tracer = provider.get_tracer("test")
-
-    outer = tracer.start_span("outer", kind=SpanKind.SERVER)
-    outer_ctx = trace.set_span_in_context(outer)
-    nested = tracer.start_span("nested", context=outer_ctx)
-    start_new_transaction(nested, "inner-txn")
-    nested_ctx = trace.set_span_in_context(nested)
-    # Two open transactions, each with many ended children.
-    for i in range(6):
-        tracer.start_span("outer-c{}".format(i), context=outer_ctx).end()
-        tracer.start_span("inner-c{}".format(i), context=nested_ctx).end()
-
-    trace_id = outer.get_span_context().trace_id
-    with processor._lock:
-        buffered = processor._buffers.get(trace_id, [])
-        outer_id = outer.get_span_context().span_id
-        nested_id = nested.get_span_context().span_id
-        outer_spans = []
-        nested_spans = []
-        for span in buffered:
-            if span.context is None:
-                continue
-            member = processor._membership.get(span.context.span_id)
-            root_id = (
-                member.root_span_id if member is not None else span.context.span_id
-            )
-            if root_id == nested_id:
-                nested_spans.append(span)
-            elif root_id == outer_id:
-                outer_spans.append(span)
-        # Each open txn keeps up to max_nodes-1 ended spans (1 reserved for live root).
-        assert len(outer_spans) <= 2
-        assert len(nested_spans) <= 2
-
-    nested.end()
-    outer.end()
-    provider.force_flush()
-    provider.shutdown()  # type: ignore[no-untyped-call]
-
-
-def test_live_buffer_releases_side_tables_after_trace_completes() -> None:
-    exporter = ListSpanExporter()
-    processor = TransactionSpanProcessor(
-        exporter, max_nodes=2, completion_holdback_millis=0
-    )
-    provider = TracerProvider()
-    provider.add_span_processor(processor)
-    tracer = provider.get_tracer("test")
-
-    root = tracer.start_span("root", kind=SpanKind.SERVER)
-    root_ctx = trace.set_span_in_context(root)
-    for i in range(8):
-        tracer.start_span("c{}".format(i), context=root_ctx).end()
-    trace_id = root.get_span_context().trace_id
-    with processor._lock:
-        assert processor._trace_span_ids.get(trace_id)
+    for index in range(257, 300):
+        tracer.start_span("large-{}".format(index), context=root_ctx).end()
     root.end()
-    provider.force_flush()
-    with processor._lock:
-        assert trace_id not in processor._trace_span_ids
-        assert not any(
-            ctx.trace_id == trace_id for ctx in processor._span_contexts.values()
-        )
-    provider.shutdown()  # type: ignore[no-untyped-call]
-
-
-def test_live_buffer_defers_metrics_until_live_child_ends() -> None:
-    resource = Resource.create({"service.name": "test"})
-    exporter = ListSpanExporter()
-    reader = InMemoryMetricReader()
-    meter_provider = MeterProvider(resource=resource, metric_readers=[reader])
-    processor = TransactionSpanProcessor(
-        exporter,
-        max_nodes=2,
-        completion_holdback_millis=0,
-        meter_provider=meter_provider,
+    assert provider.force_flush() is True
+    assert meter_provider.force_flush() is True
+    assert len(exporter.spans) == 301
+    assert {span.name for span in exporter.spans} == {
+        "large-root",
+        *("large-{}".format(index) for index in range(300)),
+    }
+    assert all(
+        CoralogixAttributes.TRANSACTION_IDENTIFIER not in (span.attributes or {})
+        and CoralogixAttributes.TRANSACTION_ROOT not in (span.attributes or {})
+        and SELF_DURATION_ATTRIBUTE not in (span.attributes or {})
+        for span in exporter.spans
     )
-    provider = TracerProvider(resource=resource)
-    provider.add_span_processor(processor)
-    tracer = provider.get_tracer("test")
-
-    root = tracer.start_span("root", kind=SpanKind.SERVER)
-    root_ctx = trace.set_span_in_context(root)
-    mid = tracer.start_span("mid", context=root_ctx)
-    mid_ctx = trace.set_span_in_context(mid)
-    leaf = tracer.start_span("leaf", context=mid_ctx)
-    mid.end()  # short mid; leaf stays live
-    # Longer siblings displace mid while leaf is still live.
-    for i in range(8):
-        child = tracer.start_span("sib-{}".format(i), context=root_ctx)
-        time.sleep(0.01)
-        child.end()
-    mid_id = mid.get_span_context().span_id
-    with processor._lock:
-        assert mid_id in processor._pending_drop_metrics
-    time.sleep(0.02)
-    leaf.end()
-    root.end()
-    provider.force_flush()
-    meter_provider.force_flush()
-
-    with processor._lock:
-        assert mid_id not in processor._pending_drop_metrics
-
-    mid_points = []
-    for rm in reader.get_metrics_data().resource_metrics:
-        for sm in rm.scope_metrics:
-            for metric in sm.metrics:
-                if metric.name != METRIC_SELF_DURATION:
-                    continue
-                for point in metric.data.data_points:
-                    if dict(point.attributes).get("span.name") == "mid":
-                        mid_points.append(point)
-    assert mid_points
-    # Child leaf outlived mid; exclusive self-duration must exclude that overlap.
-    assert mid_points[0].sum < 0.02
+    assert not _self_duration_metric_span_names(reader)
     provider.shutdown()  # type: ignore[no-untyped-call]
     meter_provider.shutdown()
 
 
-def test_live_root_with_one_node_drops_ended_children() -> None:
+def test_256_ended_spans_remain_buffered_and_are_enriched() -> None:
+    resource = Resource.create({"service.name": "test"})
     exporter = ListSpanExporter()
-    processor = TransactionSpanProcessor(
-        exporter, max_nodes=1, completion_holdback_millis=0
+    reader = InMemoryMetricReader()
+    meter_provider = MeterProvider(resource=resource, metric_readers=[reader])
+    provider = TracerProvider(resource=resource)
+    provider.add_span_processor(
+        TransactionSpanProcessor(
+            exporter,
+            completion_holdback_millis=0,
+            meter_provider=meter_provider,
+        )
     )
-    provider = TracerProvider()
-    provider.add_span_processor(processor)
     tracer = provider.get_tracer("test")
-    root = tracer.start_span("root", kind=SpanKind.SERVER)
+
+    root = tracer.start_span("small-root", kind=SpanKind.SERVER)
     root_ctx = trace.set_span_in_context(root)
-    for index in range(5):
-        tracer.start_span("child-{}".format(index), context=root_ctx).end()
-    with processor._lock:
-        assert not processor._buffers.get(root.get_span_context().trace_id)
+    for index in range(255):
+        tracer.start_span("small-{}".format(index), context=root_ctx).end()
+    assert exporter.spans == []
     root.end()
-    provider.force_flush()
-    assert [span.name for span in exporter.spans] == ["root"]
-    provider.shutdown()  # type: ignore[no-untyped-call]
-
-
-def test_unnamed_live_root_bounds_deferred_eviction_metrics() -> None:
-    exporter = ListSpanExporter()
-    processor = TransactionSpanProcessor(
-        exporter, max_nodes=1, completion_holdback_millis=0
+    assert provider.force_flush() is True
+    assert meter_provider.force_flush() is True
+    assert len(exporter.spans) == 256
+    assert all(
+        CoralogixAttributes.TRANSACTION_IDENTIFIER in (span.attributes or {})
+        and SELF_DURATION_ATTRIBUTE in (span.attributes or {})
+        for span in exporter.spans
     )
-    provider = TracerProvider()
-    provider.add_span_processor(processor)
-    tracer = provider.get_tracer("test")
-    root = tracer.start_span("root", kind=SpanKind.SERVER)
-    root_ctx = trace.set_span_in_context(root)
-    for index in range(300):
-        tracer.start_span("child-{}".format(index), context=root_ctx).end()
-    with processor._lock:
-        assert len(processor._pending_drop_metrics) <= 256
-    root.end()
-    provider.force_flush()
+    assert len(_self_duration_metric_span_names(reader)) == 256
     provider.shutdown()  # type: ignore[no-untyped-call]
+    meter_provider.shutdown()
 
 
 def test_side_tables_survive_until_last_inflight_batch() -> None:
     """Nested then outer batches on one TraceID must not drop membership early."""
     exporter = ListSpanExporter()
-    processor = TransactionSpanProcessor(
-        exporter, max_nodes=256, completion_holdback_millis=0
-    )
+    processor = TransactionSpanProcessor(exporter, completion_holdback_millis=0)
     provider = TracerProvider()
     provider.add_span_processor(processor)
     tracer = provider.get_tracer("test")
@@ -693,10 +388,8 @@ def test_side_tables_survive_until_last_inflight_batch() -> None:
     provider.force_flush()
     # Outer still open; nested exported. Side tables for this TraceID must remain
     # so outer finalize can still resolve names/intervals.
-    trace_id = outer.get_span_context().trace_id
     with processor._lock:
         assert processor._membership.get(outer.get_span_context().span_id) is not None
-        assert trace_id in processor._trace_span_ids
     outer.end()
     provider.force_flush()
     fulfill = [
@@ -714,55 +407,10 @@ def test_side_tables_survive_until_last_inflight_batch() -> None:
     provider.shutdown()  # type: ignore[no-untyped-call]
 
 
-def test_rebind_child_started_under_evicted_parent() -> None:
-    exporter = ListSpanExporter()
-    processor = TransactionSpanProcessor(
-        exporter, max_nodes=3, completion_holdback_millis=0
-    )
-    provider = TracerProvider()
-    provider.add_span_processor(processor)
-    tracer = provider.get_tracer("test")
-
-    root = tracer.start_span("root", kind=SpanKind.SERVER)
-    root_ctx = trace.set_span_in_context(root)
-    root_id = root.get_span_context().span_id
-    mid = tracer.start_span("mid", context=root_ctx)
-    mid_ctx = trace.set_span_in_context(mid)
-    mid.end()
-    for i in range(8):
-        child = tracer.start_span("sib-{}".format(i), context=root_ctx)
-        time.sleep(0.01)
-        child.end()
-    mid_id = mid.get_span_context().span_id
-    trace_id = root.get_span_context().trace_id
-    with processor._lock:
-        assert mid_id in processor._evicted_from_buffer.get(trace_id, set())
-    # mid evicted; start a late child from the retained mid context.
-    late = tracer.start_span("late", context=mid_ctx)
-    with processor._lock:
-        assert processor._parent_rebind.get(late.get_span_context().span_id) == root_id
-        assert (
-            processor._live_parents[trace_id][late.get_span_context().span_id]
-            == root_id
-        )
-    late.end()
-    with processor._lock:
-        buffered = processor._buffers.get(trace_id, [])
-        late_buf = [span for span in buffered if span.name == "late"]
-        if late_buf:
-            assert late_buf[0].parent is not None
-            assert late_buf[0].parent.span_id == root_id
-    root.end()
-    provider.force_flush()
-    provider.shutdown()  # type: ignore[no-untyped-call]
-
-
 def test_disjoint_child_intervals_use_bounded_covered_aggregate() -> None:
     """Sequential children under a live root must not grow an interval list."""
     exporter = ListSpanExporter()
-    processor = TransactionSpanProcessor(
-        exporter, max_nodes=1, completion_holdback_millis=0
-    )
+    processor = TransactionSpanProcessor(exporter, completion_holdback_millis=0)
     provider = TracerProvider()
     provider.add_span_processor(processor)
     tracer = provider.get_tracer("test")
@@ -793,55 +441,13 @@ def test_disjoint_child_intervals_use_bounded_covered_aggregate() -> None:
     provider.shutdown()  # type: ignore[no-untyped-call]
 
 
-def test_evicted_ancestry_retained_after_metrics_until_idle() -> None:
-    """Compact ancestry/marker survive eviction metrics for late rebind."""
-    exporter = ListSpanExporter()
-    processor = TransactionSpanProcessor(
-        exporter, max_nodes=2, completion_holdback_millis=0
-    )
-    provider = TracerProvider()
-    provider.add_span_processor(processor)
-    tracer = provider.get_tracer("test")
-
-    root = tracer.start_span("root", kind=SpanKind.SERVER)
-    start_new_transaction(root, "named-txn")
-    root_ctx = trace.set_span_in_context(root)
-    root_id = root.get_span_context().span_id
-    mid = tracer.start_span("mid", context=root_ctx)
-    mid_ctx = trace.set_span_in_context(mid)
-    mid.end()
-    for i in range(8):
-        child = tracer.start_span("sib-{}".format(i), context=root_ctx)
-        time.sleep(0.01)
-        child.end()
-    mid_id = mid.get_span_context().span_id
-    trace_id = root.get_span_context().trace_id
-    with processor._lock:
-        assert mid_id in processor._evicted_from_buffer.get(trace_id, set())
-        assert mid_id in processor._span_contexts
-        assert mid_id in processor._span_parent_ids
-        assert mid_id not in processor._pending_drop_metrics
-    late = tracer.start_span("late", context=mid_ctx)
-    with processor._lock:
-        assert processor._parent_rebind.get(late.get_span_context().span_id) == root_id
-    late.end()
-    root.end()
-    provider.force_flush()
-    with processor._lock:
-        assert mid_id not in processor._span_contexts
-        assert mid_id not in processor._span_parent_ids
-        assert mid_id not in processor._evicted_from_buffer.get(trace_id, set())
-    provider.shutdown()  # type: ignore[no-untyped-call]
-
-
-def test_eviction_metrics_wait_for_root_rename() -> None:
+def test_metrics_use_final_root_name() -> None:
     resource = Resource.create({"service.name": "test"})
     exporter = ListSpanExporter()
     reader = InMemoryMetricReader()
     meter_provider = MeterProvider(resource=resource, metric_readers=[reader])
     processor = TransactionSpanProcessor(
         exporter,
-        max_nodes=2,
         completion_holdback_millis=0,
         meter_provider=meter_provider,
     )
@@ -896,64 +502,6 @@ def test_preset_template_name_different_from_span_name_is_override() -> None:
         exporter.spans[0].attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER]
         == "GET /users/:id"
     )
-    provider.shutdown()  # type: ignore[no-untyped-call]
-
-
-def test_env_vars_configure_options_when_constructor_omits_them(
-    monkeypatch: MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("OTEL_CX_TRANSACTION_MAX_NODES", "12")
-    monkeypatch.setenv("OTEL_CX_TRANSACTION_COMPLETION_HOLDBACK_MILLIS", "25")
-    processor = TransactionSpanProcessor(ListSpanExporter())
-    assert processor._max_nodes == 12
-    assert processor._completion_holdback_millis == 25
-    processor.shutdown()
-
-
-def test_constructor_options_override_env(monkeypatch: MonkeyPatch) -> None:
-    monkeypatch.setenv("OTEL_CX_TRANSACTION_MAX_NODES", "12")
-    processor = TransactionSpanProcessor(ListSpanExporter(), max_nodes=99)
-    assert processor._max_nodes == 99
-    processor.shutdown()
-
-
-def test_invalid_env_falls_back_to_default(monkeypatch: MonkeyPatch) -> None:
-    monkeypatch.setenv("OTEL_CX_TRANSACTION_MAX_NODES", "nope")
-    processor = TransactionSpanProcessor(ListSpanExporter())
-    assert processor._max_nodes == 256
-    processor.shutdown()
-
-
-def test_negative_env_falls_back_to_default(monkeypatch: MonkeyPatch) -> None:
-    monkeypatch.setenv("OTEL_CX_TRANSACTION_MAX_NODES", "-1")
-    processor = TransactionSpanProcessor(ListSpanExporter())
-    assert processor._max_nodes == 256
-    processor.shutdown()
-
-
-def test_negative_constructor_max_nodes_falls_back_to_default() -> None:
-    processor = TransactionSpanProcessor(ListSpanExporter(), max_nodes=-7)
-    assert processor._max_nodes == 256
-    processor.shutdown()
-
-
-def test_zero_max_nodes_disables_trimming() -> None:
-    exporter = ListSpanExporter()
-    provider = TracerProvider()
-    processor = TransactionSpanProcessor(
-        exporter, max_nodes=0, completion_holdback_millis=0
-    )
-    provider.add_span_processor(processor)
-    tracer = provider.get_tracer("test")
-
-    root = tracer.start_span("root", kind=SpanKind.SERVER)
-    root_ctx = trace.set_span_in_context(root)
-    for i in range(5):
-        child = tracer.start_span("c{}".format(i), context=root_ctx)
-        child.end()
-    root.end()
-    provider.force_flush()
-    assert len(exporter.spans) == 6
     provider.shutdown()  # type: ignore[no-untyped-call]
 
 
@@ -1435,7 +983,7 @@ def test_on_start_during_shutdown_rejects_new_trace_membership() -> None:
 def test_force_flush_does_not_finalize_incomplete_traces() -> None:
     exporter = ListSpanExporter()
     provider = TracerProvider()
-    # max_nodes / holdback only — every completed local tree is exported.
+    # Holdback only — every completed local tree is exported.
     processor = TransactionSpanProcessor(exporter, completion_holdback_millis=0)
     provider.add_span_processor(processor)
     tracer = provider.get_tracer("test")
@@ -1629,27 +1177,80 @@ def test_processor_exports_completed_traces_immediately() -> None:
     provider.shutdown()  # type: ignore[no-untyped-call]
 
 
-def test_processor_trims_to_max_nodes_keeping_root() -> None:
+def test_processor_skips_all_enrichment_for_a_260_span_transaction() -> None:
+    reader = InMemoryMetricReader()
+    meter_provider = MeterProvider(metric_readers=[reader])
     exporter = ListSpanExporter()
     provider = TracerProvider()
     provider.add_span_processor(
-        TransactionSpanProcessor(exporter, max_nodes=2, completion_holdback_millis=0)
+        TransactionSpanProcessor(
+            exporter,
+            meter_provider=meter_provider,
+            completion_holdback_millis=0,
+        )
     )
     tracer = provider.get_tracer("test")
 
-    with tracer.start_as_current_span("root", kind=SpanKind.SERVER):
-        with tracer.start_as_current_span("short"):
-            pass
-        with tracer.start_as_current_span("long"):
-            time.sleep(0.02)
-
+    root = tracer.start_span("root", kind=SpanKind.SERVER)
+    root_ctx = trace.set_span_in_context(root)
+    for index in range(259):
+        tracer.start_span("child-{}".format(index), context=root_ctx).end()
+    root.end()
     provider.force_flush()
-    names = {span.name for span in exporter.spans}
-    assert "root" in names
-    assert "long" in names
-    assert "short" not in names
-    assert len(exporter.spans) == 2
+    meter_provider.force_flush()
+
+    assert len(exporter.spans) == 260
+    assert all(
+        CoralogixAttributes.TRANSACTION_IDENTIFIER not in (span.attributes or {})
+        and CoralogixAttributes.TRANSACTION_ROOT not in (span.attributes or {})
+        and SELF_DURATION_ATTRIBUTE not in (span.attributes or {})
+        for span in exporter.spans
+    )
+    assert not _self_duration_metric_span_names(reader)
     provider.shutdown()  # type: ignore[no-untyped-call]
+    meter_provider.shutdown()
+
+
+def test_processor_records_self_duration_for_all_130_spans() -> None:
+    reader = InMemoryMetricReader()
+    meter_provider = MeterProvider(metric_readers=[reader])
+    exporter = ListSpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(
+        TransactionSpanProcessor(
+            exporter,
+            meter_provider=meter_provider,
+            completion_holdback_millis=0,
+        )
+    )
+    tracer = provider.get_tracer("test")
+
+    root = tracer.start_span("root", kind=SpanKind.SERVER)
+    root_ctx = trace.set_span_in_context(root)
+    for index in range(129):
+        tracer.start_span("child-{}".format(index), context=root_ctx).end()
+    root.end()
+    provider.force_flush()
+    meter_provider.force_flush()
+
+    assert len(exporter.spans) == 130
+    assert all(
+        CoralogixAttributes.TRANSACTION_IDENTIFIER in (span.attributes or {})
+        for span in exporter.spans
+    )
+    assert (
+        sum(
+            (span.attributes or {}).get(CoralogixAttributes.TRANSACTION_ROOT) is True
+            for span in exporter.spans
+        )
+        == 1
+    )
+    assert all(
+        SELF_DURATION_ATTRIBUTE in (span.attributes or {}) for span in exporter.spans
+    )
+    assert len(_self_duration_metric_span_names(reader)) == 130
+    provider.shutdown()  # type: ignore[no-untyped-call]
+    meter_provider.shutdown()
 
 
 def test_shutdown_flushes_pending_completed_trace() -> None:
@@ -1812,63 +1413,6 @@ def test_completion_holdback_keeps_fire_and_forget_child() -> None:
     provider.shutdown()  # type: ignore[no-untyped-call]
 
 
-def test_select_slowest_protects_all_transaction_roots() -> None:
-    from coralogix_opentelemetry.trace.processors.trace_heap import select_slowest_spans
-    from opentelemetry.sdk.resources import Resource
-    from opentelemetry.sdk.trace import ReadableSpan
-    from opentelemetry.trace import (
-        SpanContext,
-        SpanKind,
-        Status,
-        StatusCode,
-        TraceFlags,
-    )
-
-    def ctx(span_id: int) -> SpanContext:
-        return SpanContext(
-            trace_id=1,
-            span_id=span_id,
-            is_remote=False,
-            trace_flags=TraceFlags(0x01),
-        )
-
-    def span(
-        name: str,
-        span_id: int,
-        start: int,
-        end: int,
-        parent: int | None = None,
-        root: bool = False,
-    ) -> ReadableSpan:
-        return ReadableSpan(
-            name=name,
-            context=ctx(span_id),
-            parent=ctx(parent) if parent is not None else None,
-            resource=Resource.create({}),
-            attributes=(
-                {CoralogixAttributes.TRANSACTION_ROOT.value: True} if root else {}
-            ),
-            events=(),
-            links=(),
-            kind=SpanKind.INTERNAL,
-            status=Status(StatusCode.UNSET),
-            start_time=start,
-            end_time=end,
-        )
-
-    spans = [
-        span("root-a", 1, 0, 1, root=True),
-        span("root-b", 2, 0, 1, parent=1, root=True),
-        span("slow", 3, 0, 100, parent=1),
-    ]
-    kept = select_slowest_spans(
-        spans,
-        max_nodes=2,
-        root_span_ids=["0000000000000001", "0000000000000002"],
-    )
-    assert {s.name for s in kept} == {"root-a", "root-b"}
-
-
 def _readable(
     name: str,
     *,
@@ -1936,19 +1480,6 @@ def test_folded_child_coverage_clamps_to_ended_parent() -> None:
     processor = TransactionSpanProcessor(ListSpanExporter())
     with processor._lock:
         processor._buffers[1] = [_readable("root", span_id=1, root=True, end=100)]
-        processor._add_child_interval_locked(1, 1, 0, 60)
-        processor._add_child_interval_locked(1, 1, 80, 200)
-        assert processor._child_covered_ns[1] == 80
-        assert 1 not in processor._child_intervals
-    processor.shutdown()
-
-
-def test_folded_child_coverage_clamps_to_deferred_parent() -> None:
-    processor = TransactionSpanProcessor(ListSpanExporter())
-    with processor._lock:
-        processor._pending_drop_metrics[1] = _readable(
-            "root", span_id=1, root=True, end=100
-        )
         processor._add_child_interval_locked(1, 1, 0, 60)
         processor._add_child_interval_locked(1, 1, 80, 200)
         assert processor._child_covered_ns[1] == 80

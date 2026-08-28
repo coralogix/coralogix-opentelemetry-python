@@ -33,8 +33,9 @@ def annotate_completed_batch(
     self_duration_hist: Histogram,
     transaction_name: Optional[str] = None,
     child_covered_ns: Optional[Dict[int, int]] = None,
+    max_enriched_spans: Optional[int] = None,
 ) -> List[ReadableSpan]:
-    """Stamp final txn name, exclusive self-duration, and record the histogram.
+    """Enrich a bounded batch, or export a larger batch without enrichment.
 
     Order matters: transaction attrs are stamped first so metric labels see the
     final ``cgx.transaction`` value (not an early start-time name).
@@ -45,10 +46,16 @@ def annotate_completed_batch(
     ``child_covered_ns`` is folded prior-child coverage that no longer has
     residual interval geometry (bounded live-parent aggregate).
     """
+    if max_enriched_spans is not None and len(spans) > max_enriched_spans:
+        return [strip_transaction_enrichment(span) for span in spans]
+
     txn_name = transaction_name or resolve_batch_transaction_name(spans, membership)
     named = stamp_transaction_attributes(spans, txn_name)
     return _annotate_with_self_duration_and_metrics(
-        named, child_intervals, self_duration_hist, child_covered_ns or {}
+        named,
+        child_intervals,
+        self_duration_hist,
+        child_covered_ns or {},
     )
 
 
@@ -127,13 +134,26 @@ def _annotate_with_self_duration_and_metrics(
 
 
 def _copy_with_self_duration(
-    span: ReadableSpan, self_durations: Dict[str, int]
+    span: ReadableSpan,
+    self_durations: Dict[str, int],
 ) -> ReadableSpan:
     attrs = dict(span.attributes or {})
     if span.context is not None:
         sid = format_span_id(span.context.span_id)
         if sid in self_durations:
             attrs[SELF_DURATION_ATTRIBUTE] = self_durations[sid] / 1_000_000_000.0
+    return copy_with_attributes(span, attrs)
+
+
+def strip_transaction_enrichment(span: ReadableSpan) -> ReadableSpan:
+    attrs = dict(span.attributes or {})
+    for attribute in (
+        CoralogixAttributes.TRANSACTION_IDENTIFIER,
+        CoralogixAttributes.TRANSACTION_ROOT,
+        CoralogixAttributes.TRANSACTION_EXPLICIT,
+        SELF_DURATION_ATTRIBUTE,
+    ):
+        attrs.pop(attribute, None)
     return copy_with_attributes(span, attrs)
 
 
