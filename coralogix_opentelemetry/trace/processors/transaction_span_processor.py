@@ -292,7 +292,11 @@ class TransactionSpanProcessor(SpanProcessor):
                     parent_txn = inherited_from_ts
                 else:
                     parent_txn = parent_transaction_from_attrs(parent_span)
-                if not (starts and parent_txn is not None and preset == parent_txn):
+                if not (
+                    starts
+                    and parent_member is not None
+                    and (preset == parent_txn or preset == parent_member.start_name)
+                ):
                     override = preset
 
             if starts:
@@ -389,7 +393,10 @@ class TransactionSpanProcessor(SpanProcessor):
                                 or parent_member.start_name
                             )
                     # Ignore sampler copy of the outer txn onto a nested root.
-                    if parent_txn is None or str(preset) != parent_txn:
+                    if parent_member is None or (
+                        str(preset) != parent_txn
+                        and str(preset) != parent_member.start_name
+                    ):
                         member.override_name = str(preset)
         original_parent_id = 0
         if span.parent is not None and span.parent.is_valid:
