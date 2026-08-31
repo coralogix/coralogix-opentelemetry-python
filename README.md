@@ -14,7 +14,8 @@ The processor **exports every completed local trace in full**. Transactions of
 at most **256** spans receive transaction tags, self-duration attributes, and
 metrics. On the next ended span, larger transactions flush the buffered spans
 raw and proxy later spans without processor-added tags or self-duration metrics.
-At most 1,000 traces are buffered concurrently; further traces pass through raw.
+By default, concurrently buffered traces are unlimited; set
+`CORALOGIX_MAX_TRANSACTION_TRACES` to a positive value to bound them.
 Constructor keyword arguments override environment variables. When a keyword is
 omitted, the matching env var is read; invalid values fall back to the default.
 

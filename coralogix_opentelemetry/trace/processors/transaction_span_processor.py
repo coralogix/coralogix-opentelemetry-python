@@ -229,13 +229,19 @@ class TransactionSpanProcessor(SpanProcessor):
             parent_member = self._membership.get(parent_id) if parent_id else None
             inherited_from_ts = parent_transaction_from_tracestate(parent_span)
             trace_already_tracked = (
-                trace_id in self._live_parents or trace_id in self._buffers
+                trace_id in self._live_parents
+                or trace_id in self._buffers
+                or trace_id in self._inflight_batches_by_trace
             )
             if (
                 self._max_traces > 0
                 and not trace_already_tracked
                 and len(
-                    (set(self._live_parents) | set(self._buffers))
+                    (
+                        set(self._live_parents)
+                        | set(self._buffers)
+                        | set(self._inflight_batches_by_trace)
+                    )
                     - self._passthrough_traces
                 )
                 >= self._max_traces
