@@ -425,9 +425,9 @@ class TransactionSpanProcessor(SpanProcessor):
                     if not self._live_parents.get(trace_id):
                         self._schedule_passthrough_cleanup_locked(trace_id)
                 elif self._live_parents.get(trace_id):
-                    completed_batches = self._schedule_nested_completion_locked(
-                        trace_id
-                    )
+                    # Wait for the complete trace so a later overflow cannot
+                    # leave an already-exported nested batch enriched.
+                    pass
                 elif self._buffers.get(trace_id):
                     self._cancel_pending_nested_completion_locked(trace_id)
                     completed_batches = self._schedule_completion_locked(trace_id)
@@ -696,11 +696,26 @@ class TransactionSpanProcessor(SpanProcessor):
         return True
 
     def _dispatch_raw_export(self, batches: Sequence[Sequence[ReadableSpan]]) -> None:
-        """Queue raw passthrough exports; a saturated queue falls back to export now."""
+        """Queue raw passthrough exports without blocking the ending thread."""
         for batch in batches:
             payload = list(batch)
             if not self._enqueue_finalize_item(("raw", payload)):
-                self._run_raw_export(payload)
+                _LOG.error(
+                    "TransactionSpanProcessor finalize queue full "
+                    "(max=%d); dropping raw batch of %d span(s)",
+                    DEFAULT_MAX_FINALIZE_QUEUE,
+                    len(payload),
+                )
+                self._abandon_raw_batch(payload)
+
+    def _abandon_raw_batch(self, batch: Sequence[ReadableSpan]) -> None:
+        with self._lock:
+            self._pending_finalize -= 1
+            self._finish_inflight_batch_locked(batch)
+            for span in batch:
+                if span.context is not None:
+                    self._forget_span_locked(span.context.span_id)
+            self._idle.notify_all()
 
     def _finalize_loop(self) -> None:
         while True:
@@ -850,25 +865,8 @@ class TransactionSpanProcessor(SpanProcessor):
             self._holdback.cancel((_HOLD_PASSTHROUGH, trace_id))
 
     def _schedule_passthrough_cleanup_locked(self, trace_id: int) -> None:
+        # Keep the tombstone so late children of an oversized trace stay raw.
         self._cancel_passthrough_cleanup_locked(trace_id)
-
-        token = 0
-
-        def _fire() -> None:
-            with self._lock:
-                if self._pending_passthrough_cleanup.get(trace_id) != token:
-                    return
-                self._pending_passthrough_cleanup.pop(trace_id, None)
-                if self._live_parents.get(trace_id):
-                    return
-                self._passthrough_traces.discard(trace_id)
-
-        token = self._holdback.schedule(
-            (_HOLD_PASSTHROUGH, trace_id),
-            self._completion_holdback_millis / 1000.0,
-            _fire,
-        )
-        self._pending_passthrough_cleanup[trace_id] = token
 
     def _is_local_parent_locked(self, trace_id: int, parent_id: int) -> bool:
         live = self._live_parents.get(trace_id)
