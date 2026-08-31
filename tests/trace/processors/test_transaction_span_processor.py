@@ -284,6 +284,31 @@ def test_nested_server_with_sampler_does_not_inherit_outer_override() -> None:
     assert (
         outer_spans[0].attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER] == "outer"
     )
+
+
+def test_nested_server_ignores_sampler_name_before_parent_override() -> None:
+    from coralogix_opentelemetry.trace.samplers import CoralogixTransactionSampler
+
+    exporter = ListSpanExporter()
+    provider = TracerProvider(sampler=CoralogixTransactionSampler())
+    provider.add_span_processor(
+        TransactionSpanProcessor(exporter, completion_holdback_millis=0)
+    )
+    tracer = provider.get_tracer("test")
+
+    outer = tracer.start_span("outer", kind=SpanKind.SERVER)
+    start_new_transaction(outer, "outer-override")
+    with trace.use_span(outer, end_on_exit=False):
+        with tracer.start_as_current_span("promote-parent"):
+            pass
+        with tracer.start_as_current_span("nested", kind=SpanKind.SERVER):
+            pass
+    outer.end()
+    provider.force_flush()
+
+    nested = next(span for span in exporter.spans if span.name == "nested")
+    assert nested.attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER] == "nested"
+    provider.shutdown()  # type: ignore[no-untyped-call]
     provider.shutdown()  # type: ignore[no-untyped-call]
 
 
