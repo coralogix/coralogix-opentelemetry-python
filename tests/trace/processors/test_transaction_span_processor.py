@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import gc
 import os
 import threading
 import time
+import weakref
 from typing import Sequence
 
 from coralogix_opentelemetry.trace.common import CoralogixAttributes
@@ -1377,6 +1379,18 @@ def test_processor_restarts_workers_after_fork() -> None:
     os.close(read_fd)
     assert os.waitpid(pid, 0)[1] == 0
     provider.shutdown()  # type: ignore[no-untyped-call]
+
+
+def test_at_fork_callback_does_not_retain_shutdown_processor() -> None:
+    if not hasattr(os, "register_at_fork"):
+        return
+    exporter = ListSpanExporter()
+    processor = TransactionSpanProcessor(exporter, completion_holdback_millis=0)
+    processor_ref = weakref.ref(processor)
+    processor.shutdown()
+    del processor
+    gc.collect()
+    assert processor_ref() is None
 
 
 def test_processor_server_under_local_parent_starts_new_transaction() -> None:

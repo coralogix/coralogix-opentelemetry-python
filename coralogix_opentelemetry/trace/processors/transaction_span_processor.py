@@ -32,6 +32,7 @@ import os
 import queue
 import threading
 import time
+import weakref
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from coralogix_opentelemetry.trace.common import CoralogixAttributes
@@ -84,6 +85,14 @@ DEFAULT_MAX_DEFERRED_FINALIZE = DEFAULT_MAX_FINALIZE_QUEUE
 # covered-duration scalar. One residual interval is enough for overlap merges
 # with the next child; disjoint pieces fold into ``_child_covered_ns``.
 DEFAULT_MAX_CHILD_INTERVAL_RESIDUAL = 1
+
+
+def _restart_processor_after_fork(
+    processor_ref: "weakref.ReferenceType[TransactionSpanProcessor]",
+) -> None:
+    processor = processor_ref()
+    if processor is not None:
+        processor._restart_after_fork()
 
 
 class TransactionSpanProcessor(SpanProcessor):
@@ -147,7 +156,10 @@ class TransactionSpanProcessor(SpanProcessor):
             meter_provider
         )
         if hasattr(os, "register_at_fork"):
-            os.register_at_fork(after_in_child=self._restart_after_fork)
+            processor_ref = weakref.ref(self)
+            os.register_at_fork(
+                after_in_child=lambda: _restart_processor_after_fork(processor_ref)
+            )
 
     def _start_finalize_worker(self) -> None:
         self._finalize_worker = threading.Thread(
