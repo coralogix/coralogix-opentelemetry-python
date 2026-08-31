@@ -19,7 +19,7 @@ holdback (default 100ms) waits so fire-and-forget children can still join.
 
 For each completed local transaction the export pipeline is:
 
-1. Until the 257th ended span on a TraceID, stamp ``cgx.transaction`` from
+1. Until the configured span cap plus one ended span on a TraceID, stamp ``cgx.transaction`` from
    ``override_name ?? root.final_name``, compute exclusive self-duration, and
    record the matching histogram (unit ``s``).
 2. On that 257th span, flush the buffered spans raw and proxy later spans
@@ -36,8 +36,9 @@ from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from coralogix_opentelemetry.trace.common import CoralogixAttributes
 from coralogix_opentelemetry.trace.processors.defaults import (
-    MAX_ENRICHED_SPANS,
     resolve_completion_holdback_millis,
+    resolve_max_traces,
+    resolve_max_transaction_spans,
 )
 from coralogix_opentelemetry.trace.processors.holdback_scheduler import (
     HoldbackScheduler,
@@ -52,7 +53,6 @@ from coralogix_opentelemetry.trace.processors.transaction_extract import (
 from coralogix_opentelemetry.trace.processors.transaction_finalize import (
     annotate_completed_batch,
     create_self_duration_histogram,
-    strip_transaction_enrichment,
 )
 from coralogix_opentelemetry.trace.processors.transaction_naming import (
     TransactionMembership,
@@ -95,11 +95,17 @@ class TransactionSpanProcessor(SpanProcessor):
         *,
         completion_holdback_millis: Optional[int] = None,
         meter_provider: Optional[MeterProvider] = None,
+        max_transaction_spans: Optional[int] = None,
+        max_traces: Optional[int] = None,
     ) -> None:
         self._exporter = span_exporter
         self._completion_holdback_millis = resolve_completion_holdback_millis(
             completion_holdback_millis
         )
+        self._max_transaction_spans = resolve_max_transaction_spans(
+            max_transaction_spans
+        )
+        self._max_traces = resolve_max_traces(max_traces)
         self._lock = threading.Lock()
         self._export_lock = threading.Lock()
         self._buffers: Dict[int, List[ReadableSpan]] = {}
@@ -225,6 +231,15 @@ class TransactionSpanProcessor(SpanProcessor):
             trace_already_tracked = (
                 trace_id in self._live_parents or trace_id in self._buffers
             )
+            if (
+                self._max_traces > 0
+                and not trace_already_tracked
+                and len(set(self._live_parents) | set(self._buffers))
+                >= self._max_traces
+            ):
+                self._passthrough_traces.add(trace_id)
+                self._live_parents.setdefault(trace_id, {})[span_id] = parent_id
+                return
             parent_has_local = (
                 parent_member is not None
                 or parent_has_transaction_attrs(parent_span)
@@ -402,7 +417,7 @@ class TransactionSpanProcessor(SpanProcessor):
                     if not live:
                         self._live_parents.pop(trace_id, None)
 
-                if len(self._buffers[trace_id]) > MAX_ENRICHED_SPANS:
+                if len(self._buffers[trace_id]) > self._max_transaction_spans:
                     self._cancel_pending_completion_locked(trace_id)
                     self._cancel_pending_nested_completion_locked(trace_id)
                     self._passthrough_traces.add(trace_id)
@@ -445,7 +460,7 @@ class TransactionSpanProcessor(SpanProcessor):
     def _run_raw_export(self, batch: Sequence[ReadableSpan]) -> None:
         """Export a trace that crossed the enrichment limit without blocking Span.end."""
         try:
-            self._export_spans([strip_transaction_enrichment(span) for span in batch])
+            self._export_spans(batch)
         finally:
             with self._lock:
                 self._pending_finalize -= 1
@@ -577,7 +592,7 @@ class TransactionSpanProcessor(SpanProcessor):
                 membership=membership_snapshot,
                 self_duration_hist=self._self_duration_hist,
                 child_covered_ns=covered_snapshot,
-                max_enriched_spans=MAX_ENRICHED_SPANS,
+                max_enriched_spans=self._max_transaction_spans,
             )
         except Exception:
             _LOG.exception(
@@ -1003,7 +1018,7 @@ class TransactionSpanProcessor(SpanProcessor):
             membership=membership_snapshot,
             self_duration_hist=self._self_duration_hist,
             child_covered_ns=covered_snapshot,
-            max_enriched_spans=MAX_ENRICHED_SPANS,
+            max_enriched_spans=self._max_transaction_spans,
         )
 
         try:

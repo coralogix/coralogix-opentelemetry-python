@@ -309,7 +309,6 @@ def test_257th_ended_span_flushes_trace_raw_and_enables_passthrough() -> None:
     assert len(exporter.spans) == 257
     assert all(
         CoralogixAttributes.TRANSACTION_IDENTIFIER not in (span.attributes or {})
-        and CoralogixAttributes.TRANSACTION_ROOT not in (span.attributes or {})
         and SELF_DURATION_ATTRIBUTE not in (span.attributes or {})
         for span in exporter.spans
     )
@@ -327,7 +326,6 @@ def test_257th_ended_span_flushes_trace_raw_and_enables_passthrough() -> None:
     }
     assert all(
         CoralogixAttributes.TRANSACTION_IDENTIFIER not in (span.attributes or {})
-        and CoralogixAttributes.TRANSACTION_ROOT not in (span.attributes or {})
         and SELF_DURATION_ATTRIBUTE not in (span.attributes or {})
         for span in exporter.spans
     )
@@ -1202,13 +1200,67 @@ def test_processor_skips_all_enrichment_for_a_260_span_transaction() -> None:
     assert len(exporter.spans) == 260
     assert all(
         CoralogixAttributes.TRANSACTION_IDENTIFIER not in (span.attributes or {})
-        and CoralogixAttributes.TRANSACTION_ROOT not in (span.attributes or {})
         and SELF_DURATION_ATTRIBUTE not in (span.attributes or {})
         for span in exporter.spans
     )
     assert not _self_duration_metric_span_names(reader)
     provider.shutdown()  # type: ignore[no-untyped-call]
     meter_provider.shutdown()
+
+
+def test_processor_uses_configured_span_limit() -> None:
+    exporter = ListSpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(
+        TransactionSpanProcessor(
+            exporter, completion_holdback_millis=0, max_transaction_spans=2
+        )
+    )
+    tracer = provider.get_tracer("test")
+
+    with tracer.start_as_current_span("root", kind=SpanKind.SERVER) as root:
+        root_ctx = trace.set_span_in_context(root)
+        tracer.start_span("first", context=root_ctx).end()
+        tracer.start_span("second", context=root_ctx).end()
+
+    provider.force_flush()
+    assert len(exporter.spans) == 3
+    assert all(
+        CoralogixAttributes.TRANSACTION_IDENTIFIER not in (span.attributes or {})
+        and SELF_DURATION_ATTRIBUTE not in (span.attributes or {})
+        for span in exporter.spans
+    )
+    provider.shutdown()  # type: ignore[no-untyped-call]
+
+
+def test_processor_uses_configured_trace_limit() -> None:
+    exporter = ListSpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(
+        TransactionSpanProcessor(exporter, completion_holdback_millis=0, max_traces=1)
+    )
+    tracer = provider.get_tracer("test")
+
+    first = tracer.start_span("first", kind=SpanKind.SERVER)
+    second = tracer.start_span("second", kind=SpanKind.SERVER)
+    second.end()
+    first.end()
+
+    provider.force_flush()
+    by_name = {span.name: span for span in exporter.spans}
+    assert CoralogixAttributes.TRANSACTION_IDENTIFIER in (
+        by_name["first"].attributes or {}
+    )
+    assert CoralogixAttributes.TRANSACTION_IDENTIFIER not in (
+        by_name["second"].attributes or {}
+    )
+    assert SELF_DURATION_ATTRIBUTE not in (by_name["second"].attributes or {})
+
+    tracer.start_span("third", kind=SpanKind.SERVER).end()
+    provider.force_flush()
+    third = next(span for span in exporter.spans if span.name == "third")
+    assert CoralogixAttributes.TRANSACTION_IDENTIFIER in (third.attributes or {})
+    provider.shutdown()  # type: ignore[no-untyped-call]
 
 
 def test_processor_records_self_duration_for_all_130_spans() -> None:

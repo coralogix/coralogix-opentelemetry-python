@@ -5,10 +5,13 @@ from __future__ import annotations
 import os
 from typing import Optional
 
-MAX_ENRICHED_SPANS = 256
+DEFAULT_MAX_TRANSACTION_SPANS = 256
+DEFAULT_MAX_TRACES = 0
 DEFAULT_COMPLETION_HOLDBACK_MILLIS = 100
 
 ENV_COMPLETION_HOLDBACK_MILLIS = "OTEL_CX_TRANSACTION_COMPLETION_HOLDBACK_MILLIS"
+ENV_MAX_TRANSACTION_SPANS = "CORALOGIX_MAX_SPANS_PER_TRACE"
+ENV_MAX_TRACES = "CORALOGIX_MAX_TRANSACTION_TRACES"
 
 
 def env_int(name: str, default: int) -> int:
@@ -48,3 +51,17 @@ def resolve_completion_holdback_millis(value: Optional[int] = None) -> int:
     if value is not None:
         return _non_negative_or_default(value, DEFAULT_COMPLETION_HOLDBACK_MILLIS)
     return env_int(ENV_COMPLETION_HOLDBACK_MILLIS, DEFAULT_COMPLETION_HOLDBACK_MILLIS)
+
+
+def resolve_max_transaction_spans(value: Optional[int] = None) -> int:
+    """Maximum completed spans buffered for transaction enrichment."""
+    if value is not None:
+        return _non_negative_or_default(value, DEFAULT_MAX_TRANSACTION_SPANS)
+    return env_int(ENV_MAX_TRANSACTION_SPANS, DEFAULT_MAX_TRANSACTION_SPANS)
+
+
+def resolve_max_traces(value: Optional[int] = None) -> int:
+    """Maximum concurrent retained traces; zero means unlimited."""
+    if value is not None:
+        return _non_negative_or_default(value, DEFAULT_MAX_TRACES)
+    return env_int(ENV_MAX_TRACES, DEFAULT_MAX_TRACES)
