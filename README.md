@@ -12,8 +12,9 @@ available for backward compatibility only.
 
 The processor **exports every completed local trace in full**. Transactions of
 at most **256** spans receive transaction tags, self-duration attributes, and
-metrics. On the 257th ended span, larger transactions flush the buffered spans
+metrics. On the next ended span, larger transactions flush the buffered spans
 raw and proxy later spans without processor-added tags or self-duration metrics.
+At most 1,000 traces are buffered concurrently; further traces pass through raw.
 Constructor keyword arguments override environment variables. When a keyword is
 omitted, the matching env var is read; invalid values fall back to the default.
 
@@ -33,6 +34,8 @@ trace.set_tracer_provider(provider)
 | Option | Type | Default | Env var | Meaning |
 |---|---|---|---|---|
 | `completion_holdback_millis` | int | `100` | `OTEL_CX_TRANSACTION_COMPLETION_HOLDBACK_MILLIS` | After the last live span on a TraceID ends, wait so fire-and-forget children can join. `0` = finalize immediately. Negative → default |
+| `max_transaction_spans` | int | `256` | `CORALOGIX_MAX_SPANS_PER_TRACE` | Maximum spans to buffer and enrich per trace. On the next span, export the whole trace raw. `0` = raw passthrough |
+| `max_traces` | int | `0` | `CORALOGIX_MAX_TRANSACTION_TRACES` | Maximum transactions retained in memory while their spans are still live or awaiting completion. Once full, newly seen transactions pass through raw until buffered transactions finish. `0` = unlimited |
 | `meter_provider` | MeterProvider | global | — | MeterProvider for the self-duration histogram |
 
 Requires OpenTelemetry API/SDK **1.21+** (metrics API and `ReadableSpan.instrumentation_scope`).
