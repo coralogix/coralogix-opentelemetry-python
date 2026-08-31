@@ -268,16 +268,16 @@ def test_nested_server_with_sampler_does_not_inherit_outer_override() -> None:
         with tracer.start_as_current_span("inner", kind=SpanKind.SERVER):
             pass
         provider.force_flush()
-        inner_spans = [span for span in exporter.spans if span.name == "inner"]
-        assert len(inner_spans) == 1
-        assert (
-            inner_spans[0].attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER]
-            == "inner"
-        )
-        assert inner_spans[0].attributes[CoralogixAttributes.TRANSACTION_ROOT] is True
+        assert exporter.spans == []
 
     outer.end()
     provider.force_flush()
+    inner_spans = [span for span in exporter.spans if span.name == "inner"]
+    assert len(inner_spans) == 1
+    assert (
+        inner_spans[0].attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER] == "inner"
+    )
+    assert inner_spans[0].attributes[CoralogixAttributes.TRANSACTION_ROOT] is True
     outer_spans = [span for span in exporter.spans if span.name == "outer"]
     assert (
         outer_spans[0].attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER] == "outer"
@@ -1433,15 +1433,12 @@ def test_nested_server_finalizes_while_outer_still_open() -> None:
 
         provider.force_flush()
         names = {span.name for span in exporter.spans}
-        assert names == {
-            "inner",
-            "db",
-        }, "nested local transaction must finalize before the outer SERVER ends"
+        assert names == set(), "nested local transaction must wait for the outer trace"
 
     outer.end()
     provider.force_flush()
     names = {span.name for span in exporter.spans}
-    assert "outer" in names
+    assert {"outer", "inner", "db"} <= names
     provider.shutdown()  # type: ignore[no-untyped-call]
 
 

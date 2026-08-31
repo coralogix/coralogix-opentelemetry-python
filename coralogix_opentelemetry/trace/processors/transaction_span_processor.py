@@ -234,7 +234,10 @@ class TransactionSpanProcessor(SpanProcessor):
             if (
                 self._max_traces > 0
                 and not trace_already_tracked
-                and len(set(self._live_parents) | set(self._buffers))
+                and len(
+                    (set(self._live_parents) | set(self._buffers))
+                    - self._passthrough_traces
+                )
                 >= self._max_traces
             ):
                 self._passthrough_traces.add(trace_id)
@@ -865,8 +868,24 @@ class TransactionSpanProcessor(SpanProcessor):
             self._holdback.cancel((_HOLD_PASSTHROUGH, trace_id))
 
     def _schedule_passthrough_cleanup_locked(self, trace_id: int) -> None:
-        # Keep the tombstone so late children of an oversized trace stay raw.
         self._cancel_passthrough_cleanup_locked(trace_id)
+
+        token = 0
+
+        def _fire() -> None:
+            with self._lock:
+                if self._pending_passthrough_cleanup.get(trace_id) != token:
+                    return
+                self._pending_passthrough_cleanup.pop(trace_id, None)
+                if not self._live_parents.get(trace_id):
+                    self._passthrough_traces.discard(trace_id)
+
+        token = self._holdback.schedule(
+            (_HOLD_PASSTHROUGH, trace_id),
+            self._completion_holdback_millis / 1000.0,
+            _fire,
+        )
+        self._pending_passthrough_cleanup[trace_id] = token
 
     def _is_local_parent_locked(self, trace_id: int, parent_id: int) -> bool:
         live = self._live_parents.get(trace_id)
@@ -885,11 +904,6 @@ class TransactionSpanProcessor(SpanProcessor):
             self._cancel_pending_nested_completion_locked(trace_id)
         for trace_id in list(self._buffers.keys()):
             if self._live_parents.get(trace_id):
-                batches.extend(
-                    self._extract_completed_local_transactions_locked(
-                        trace_id, flush_leftover=False
-                    )
-                )
                 continue
             batches.extend(
                 self._extract_completed_local_transactions_locked(
