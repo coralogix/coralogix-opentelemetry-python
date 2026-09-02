@@ -684,7 +684,10 @@ def test_finalize_queue_finalizes_inline_when_full(monkeypatch: MonkeyPatch) -> 
 
     completed = threading.Event()
     thread = threading.Thread(
-        target=lambda: (tracer.start_span("overflow", kind=SpanKind.SERVER).end(), completed.set())
+        target=lambda: (
+            tracer.start_span("overflow", kind=SpanKind.SERVER).end(),
+            completed.set(),
+        )
     )
     thread.start()
     assert completed.wait(timeout=2.0), "overflow must be exported rather than dropped"
