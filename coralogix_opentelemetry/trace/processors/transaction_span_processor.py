@@ -695,7 +695,8 @@ class TransactionSpanProcessor(SpanProcessor):
     ) -> bool:
         """Queue finalize/export so callers never block on exporters.
 
-        Hot path (no deadline): if the queue is full, finalize inline.
+        Hot path (no deadline): if the queue is full, retain the batch for a
+        later force_flush rather than blocking callback threads.
         force_flush (deadline set): wait for capacity until the deadline; return
         False if any batch could not be queued in time. Unqueued force_flush
         batches are retained in ``_deferred_finalize`` for a later retry.
@@ -707,11 +708,11 @@ class TransactionSpanProcessor(SpanProcessor):
             if deadline is None:
                 _LOG.debug(
                     "TransactionSpanProcessor finalize queue full "
-                    "(max=%d); finalizing completed batch of %d span(s) inline",
+                    "(max=%d); retaining completed batch of %d span(s) for force_flush",
                     DEFAULT_MAX_FINALIZE_QUEUE,
                     len(payload),
                 )
-                self._run_accept_completed(payload)
+                self._retain_deferred_batches([payload])
                 continue
             unqueued = [payload] + [list(rest) for rest in batches[index + 1 :]]
             self._retain_deferred_batches(unqueued)

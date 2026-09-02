@@ -642,8 +642,10 @@ def test_slow_export_does_not_block_holdback_deadlines() -> None:
     assert {span.name for span in exporter.spans} == {"first", "second"}
 
 
-def test_finalize_queue_finalizes_inline_when_full(monkeypatch: MonkeyPatch) -> None:
-    """Bounded finalize queue applies backpressure without dropping overflow."""
+def test_finalize_queue_defers_overflow_without_blocking(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Bounded finalize queue defers overflow without blocking callback threads."""
     monkeypatch.setattr(
         "coralogix_opentelemetry.trace.processors.transaction_span_processor."
         "DEFAULT_MAX_FINALIZE_QUEUE",
@@ -690,7 +692,11 @@ def test_finalize_queue_finalizes_inline_when_full(monkeypatch: MonkeyPatch) -> 
 
     thread = threading.Thread(target=end_overflow)
     thread.start()
-    assert completed.wait(timeout=2.0), "overflow must be exported rather than dropped"
+    assert completed.wait(timeout=2.0), "overflow must not block Span.end"
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline and not processor._deferred_finalize:
+        time.sleep(0.01)
+    assert processor._deferred_finalize, "overflow must wait for force_flush"
 
     release_exports.set()
     thread.join(timeout=2.0)
@@ -707,7 +713,7 @@ def test_finalize_queue_finalizes_inline_when_full(monkeypatch: MonkeyPatch) -> 
                     span_names.add(dict(point.attributes).get("span.name"))
     assert (
         "overflow" in span_names
-    ), "inline overflow export must still record self-duration metrics"
+    ), "deferred overflow export must still record self-duration metrics"
 
     provider.shutdown()  # type: ignore[no-untyped-call]
     meter_provider.shutdown()
