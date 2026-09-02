@@ -642,8 +642,8 @@ def test_slow_export_does_not_block_holdback_deadlines() -> None:
     assert {span.name for span in exporter.spans} == {"first", "second"}
 
 
-def test_finalize_queue_drops_when_full(monkeypatch: MonkeyPatch) -> None:
-    """Bounded finalize queue must drop overflow instead of growing without bound."""
+def test_finalize_queue_finalizes_inline_when_full(monkeypatch: MonkeyPatch) -> None:
+    """Bounded finalize queue applies backpressure without dropping overflow."""
     monkeypatch.setattr(
         "coralogix_opentelemetry.trace.processors.transaction_span_processor."
         "DEFAULT_MAX_FINALIZE_QUEUE",
@@ -651,7 +651,6 @@ def test_finalize_queue_drops_when_full(monkeypatch: MonkeyPatch) -> None:
     )
     first_export_entered = threading.Event()
     release_exports = threading.Event()
-    abandoned: list = []
 
     class BlockingExporter(ListSpanExporter):
         def export(self, spans: Sequence[ReadableSpan]) -> SpanExportResult:
@@ -670,16 +669,6 @@ def test_finalize_queue_drops_when_full(monkeypatch: MonkeyPatch) -> None:
         meter_provider=meter_provider,
     )
     assert processor._finalize_queue.maxsize == 1
-    original_abandon = processor._abandon_completed_batch
-
-    def tracking_abandon(
-        batch: Sequence[ReadableSpan], *, adjust_pending: bool = True
-    ) -> None:
-        abandoned.append([span.name for span in batch])
-        original_abandon(batch, adjust_pending=adjust_pending)
-
-    processor._abandon_completed_batch = tracking_abandon  # type: ignore[method-assign]
-
     provider = TracerProvider(resource=resource)
     provider.add_span_processor(processor)
     tracer = provider.get_tracer("test")
@@ -693,13 +682,16 @@ def test_finalize_queue_drops_when_full(monkeypatch: MonkeyPatch) -> None:
         time.sleep(0.01)
     assert processor._finalize_queue.qsize() == 1
 
-    tracer.start_span("dropped", kind=SpanKind.SERVER).end()
-    deadline = time.monotonic() + 2.0
-    while time.monotonic() < deadline and not abandoned:
-        time.sleep(0.01)
-    assert abandoned and "dropped" in abandoned[0]
+    completed = threading.Event()
+    thread = threading.Thread(
+        target=lambda: (tracer.start_span("overflow", kind=SpanKind.SERVER).end(), completed.set())
+    )
+    thread.start()
+    assert completed.wait(timeout=2.0), "overflow must be exported rather than dropped"
 
     release_exports.set()
+    thread.join(timeout=2.0)
+    assert completed.is_set()
     provider.force_flush()
     meter_provider.force_flush()
     span_names = set()
@@ -711,15 +703,15 @@ def test_finalize_queue_drops_when_full(monkeypatch: MonkeyPatch) -> None:
                 for point in metric.data.data_points:
                     span_names.add(dict(point.attributes).get("span.name"))
     assert (
-        "dropped" in span_names
-    ), "overflow drop must still record self-duration metrics"
+        "overflow" in span_names
+    ), "inline overflow export must still record self-duration metrics"
 
     provider.shutdown()  # type: ignore[no-untyped-call]
     meter_provider.shutdown()
     names = {span.name for span in exporter.spans}
     assert "first" in names
     assert "queued" in names
-    assert "dropped" not in names
+    assert "overflow" in names
 
 
 def test_force_flush_returns_false_when_finalize_times_out() -> None:
