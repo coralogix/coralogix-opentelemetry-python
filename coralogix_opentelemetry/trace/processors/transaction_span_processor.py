@@ -464,10 +464,11 @@ class TransactionSpanProcessor(SpanProcessor):
                 self._note_inflight_batches_locked(completed_batches + raw_batches)
             if self._total_live_locked() == 0 and self._pending_finalize == 0:
                 self._idle.notify_all()
-        # Always queue finalize/export (including zero-holdback) so Span.end
-        # never blocks on a slow exporter and the bounded backlog applies.
+        # Enriched batches use the worker. Raw passthrough exports immediately
+        # so a large trace cannot become a processor-owned queue or be dropped.
         self._dispatch_accept_completed(completed_batches)
-        self._dispatch_raw_export(raw_batches)
+        for batch in raw_batches:
+            self._run_raw_export(batch)
 
     def _run_accept_completed(self, batch: Sequence[ReadableSpan]) -> None:
         """Run finalize/export off the caller's contract: never raise to Span.end."""
@@ -694,7 +695,7 @@ class TransactionSpanProcessor(SpanProcessor):
     ) -> bool:
         """Queue finalize/export so callers never block on exporters.
 
-        Hot path (no deadline): if the queue is full, record metrics then drop.
+        Hot path (no deadline): if the queue is full, finalize inline.
         force_flush (deadline set): wait for capacity until the deadline; return
         False if any batch could not be queued in time. Unqueued force_flush
         batches are retained in ``_deferred_finalize`` for a later retry.
@@ -704,13 +705,13 @@ class TransactionSpanProcessor(SpanProcessor):
             if self._enqueue_finalize_item(payload, deadline=deadline):
                 continue
             if deadline is None:
-                _LOG.error(
+                _LOG.debug(
                     "TransactionSpanProcessor finalize queue full "
-                    "(max=%d); dropping completed batch of %d span(s)",
+                    "(max=%d); finalizing completed batch of %d span(s) inline",
                     DEFAULT_MAX_FINALIZE_QUEUE,
                     len(payload),
                 )
-                self._abandon_completed_batch(payload)
+                self._run_accept_completed(payload)
                 continue
             unqueued = [payload] + [list(rest) for rest in batches[index + 1 :]]
             self._retain_deferred_batches(unqueued)
@@ -722,28 +723,6 @@ class TransactionSpanProcessor(SpanProcessor):
             )
             return False
         return True
-
-    def _dispatch_raw_export(self, batches: Sequence[Sequence[ReadableSpan]]) -> None:
-        """Queue raw passthrough exports without blocking the ending thread."""
-        for batch in batches:
-            payload = list(batch)
-            if not self._enqueue_finalize_item(("raw", payload)):
-                _LOG.error(
-                    "TransactionSpanProcessor finalize queue full "
-                    "(max=%d); dropping raw batch of %d span(s)",
-                    DEFAULT_MAX_FINALIZE_QUEUE,
-                    len(payload),
-                )
-                self._abandon_raw_batch(payload)
-
-    def _abandon_raw_batch(self, batch: Sequence[ReadableSpan]) -> None:
-        with self._lock:
-            self._pending_finalize -= 1
-            self._finish_inflight_batch_locked(batch)
-            for span in batch:
-                if span.context is not None:
-                    self._forget_span_locked(span.context.span_id)
-            self._idle.notify_all()
 
     def _finalize_loop(self) -> None:
         while True:
