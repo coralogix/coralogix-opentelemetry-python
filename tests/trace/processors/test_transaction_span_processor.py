@@ -1627,6 +1627,35 @@ def test_processor_caps_concurrent_transaction_state_on_start() -> None:
     provider.shutdown()  # type: ignore[no-untyped-call]
 
 
+def test_processor_exports_concurrent_raw_spans_without_queue_loss() -> None:
+    exporter = ListSpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(
+        TransactionSpanProcessor(exporter, completion_holdback_millis=0)
+    )
+    tracer = provider.get_tracer("test")
+
+    root = tracer.start_span("root", kind=SpanKind.SERVER)
+    context = trace.set_span_in_context(root)
+    children = [
+        tracer.start_span("child-{}".format(index), context=context)
+        for index in range(511)
+    ]
+    for child in reversed(children):
+        child.end()
+    root.end()
+
+    assert provider.force_flush() is True
+    assert len(exporter.spans) == 512
+    assert all(
+        CoralogixAttributes.TRANSACTION_IDENTIFIER not in (span.attributes or {})
+        and CoralogixAttributes.TRANSACTION_ROOT not in (span.attributes or {})
+        and SELF_DURATION_ATTRIBUTE not in (span.attributes or {})
+        for span in exporter.spans
+    )
+    provider.shutdown()  # type: ignore[no-untyped-call]
+
+
 def test_processor_uses_configured_trace_limit() -> None:
     exporter = ListSpanExporter()
     provider = TracerProvider()

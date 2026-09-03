@@ -127,6 +127,9 @@ class TransactionSpanProcessor(SpanProcessor):
         self._live_parents: Dict[int, Dict[int, int]] = {}
         # Raw traces need only a count to know when their tombstone can expire.
         self._passthrough_live_counts: Dict[int, int] = {}
+        # Coalesce rapid raw ends per trace so they do not fill the worker queue.
+        self._raw_pending_by_trace: Dict[int, List[ReadableSpan]] = {}
+        self._raw_exporting_traces: Set[int] = set()
         self._membership: Dict[Tuple[int, int], TransactionMembership] = {}
         self._root_memberships_by_trace: Dict[int, Set[int]] = {}
         # Batches extracted but not yet accept/abandon-finished, per TraceID.
@@ -189,6 +192,8 @@ class TransactionSpanProcessor(SpanProcessor):
         self._pending_passthrough_cleanup.clear()
         self._live_parents.clear()
         self._passthrough_live_counts.clear()
+        self._raw_pending_by_trace.clear()
+        self._raw_exporting_traces.clear()
         self._membership.clear()
         self._root_memberships_by_trace.clear()
         self._pending_completions.clear()
@@ -488,11 +493,15 @@ class TransactionSpanProcessor(SpanProcessor):
                     self._passthrough_live_counts.pop(trace_id, None)
                 else:
                     self._passthrough_live_counts[trace_id] = remaining
-                raw_batches = [[span]]
+                pending = self._raw_pending_by_trace.setdefault(trace_id, [])
+                pending.append(span)
+                if trace_id not in self._raw_exporting_traces:
+                    self._raw_exporting_traces.add(trace_id)
+                    raw_batches = [self._raw_pending_by_trace.pop(trace_id)]
+                    self._pending_finalize += 1
+                    self._note_inflight_batches_locked(raw_batches)
                 if not self._passthrough_live_counts.get(trace_id):
                     self._schedule_passthrough_cleanup_locked(trace_id)
-                self._pending_finalize += 1
-                self._note_inflight_batches_locked(raw_batches)
             else:
                 if (
                     original_parent_id
@@ -562,6 +571,7 @@ class TransactionSpanProcessor(SpanProcessor):
 
     def _run_raw_export(self, batch: Sequence[ReadableSpan]) -> None:
         """Export a trace that crossed the enrichment limit without blocking Span.end."""
+        next_raw_batches: List[List[ReadableSpan]] = []
         try:
             with self._lock:
                 raw = self._strip_processor_root_flags_locked(batch)
@@ -576,6 +586,14 @@ class TransactionSpanProcessor(SpanProcessor):
                             span.context.trace_id, span.context.span_id
                         )
                 trace_id = self._batch_trace_id(batch)
+                if trace_id is not None and trace_id in self._raw_exporting_traces:
+                    pending = self._raw_pending_by_trace.pop(trace_id, [])
+                    if pending:
+                        next_raw_batches.append(pending)
+                        self._pending_finalize += 1
+                        self._note_inflight_batches_locked(next_raw_batches)
+                    else:
+                        self._raw_exporting_traces.discard(trace_id)
                 if (
                     trace_id is not None
                     and not self._live_parents.get(trace_id)
@@ -584,6 +602,7 @@ class TransactionSpanProcessor(SpanProcessor):
                 ):
                     self._schedule_passthrough_cleanup_locked(trace_id)
                 self._idle.notify_all()
+            self._dispatch_raw_exports(next_raw_batches)
 
     def _strip_processor_root_flags_locked(
         self, spans: Sequence[ReadableSpan]
@@ -1003,6 +1022,7 @@ class TransactionSpanProcessor(SpanProcessor):
                             trace_id, flush_leftover=True
                         )
                     )
+                raw_batches.extend(self._raw_pending_by_trace.values())
                 self._note_inflight_batches_locked(
                     holdback_batches + extracted + raw_batches
                 )
@@ -1013,6 +1033,8 @@ class TransactionSpanProcessor(SpanProcessor):
                 self._buffers.clear()
                 self._live_parents.clear()
                 self._passthrough_live_counts.clear()
+                self._raw_pending_by_trace.clear()
+                self._raw_exporting_traces.clear()
 
             for batch in batches:
                 self._run_accept_completed(batch)
