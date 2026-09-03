@@ -451,6 +451,7 @@ def test_257th_ended_span_flushes_trace_raw_and_enables_passthrough() -> None:
     assert all(
         CoralogixAttributes.TRANSACTION_IDENTIFIER not in (span.attributes or {})
         and SELF_DURATION_ATTRIBUTE not in (span.attributes or {})
+        and CoralogixAttributes.TRANSACTION_ROOT not in (span.attributes or {})
         for span in exporter.spans
     )
     assert not _self_duration_metric_span_names(reader)
@@ -468,11 +469,32 @@ def test_257th_ended_span_flushes_trace_raw_and_enables_passthrough() -> None:
     assert all(
         CoralogixAttributes.TRANSACTION_IDENTIFIER not in (span.attributes or {})
         and SELF_DURATION_ATTRIBUTE not in (span.attributes or {})
+        and CoralogixAttributes.TRANSACTION_ROOT not in (span.attributes or {})
         for span in exporter.spans
     )
     assert not _self_duration_metric_span_names(reader)
     provider.shutdown()  # type: ignore[no-untyped-call]
     meter_provider.shutdown()
+
+
+def test_raw_passthrough_preserves_sampler_root_flag() -> None:
+    from coralogix_opentelemetry.trace.samplers import CoralogixTransactionSampler
+
+    exporter = ListSpanExporter()
+    provider = TracerProvider(sampler=CoralogixTransactionSampler())
+    provider.add_span_processor(
+        TransactionSpanProcessor(
+            exporter, completion_holdback_millis=0, max_transaction_spans=0
+        )
+    )
+    provider.get_tracer("test").start_span("root", kind=SpanKind.SERVER).end()
+
+    assert provider.force_flush() is True
+    attrs = exporter.spans[0].attributes or {}
+    assert attrs[CoralogixAttributes.TRANSACTION_ROOT] is True
+    assert attrs[CoralogixAttributes.TRANSACTION_IDENTIFIER] == "root"
+    assert SELF_DURATION_ATTRIBUTE not in attrs
+    provider.shutdown()  # type: ignore[no-untyped-call]
 
 
 def test_raw_export_does_not_block_span_end() -> None:
@@ -957,6 +979,23 @@ def test_force_flush_timeout_covers_extracted_holdback_batches() -> None:
     assert processor.force_flush(timeout_millis=2000) is True
     provider.shutdown()  # type: ignore[no-untyped-call]
     assert {span.name for span in exporter.spans} == {"held"}
+
+
+def test_force_flush_reretains_raw_batches_after_enriched_timeout(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    processor = TransactionSpanProcessor(ListSpanExporter())
+    raw_batch = [_readable("raw", trace_id=1, span_id=1)]
+    processor._deferred_raw_finalize = [raw_batch]
+    retained: list[list[ReadableSpan]] = []
+    monkeypatch.setattr(
+        processor, "_dispatch_accept_completed", lambda batches, deadline: False
+    )
+    monkeypatch.setattr(processor, "_retain_deferred_raw_batches", retained.extend)
+
+    assert processor.force_flush(timeout_millis=50) is False
+    assert retained == [raw_batch]
+    processor.shutdown()
 
 
 def test_force_flush_waits_for_queue_capacity_instead_of_dropping(
