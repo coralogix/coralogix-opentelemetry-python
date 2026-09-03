@@ -150,6 +150,7 @@ class TransactionSpanProcessor(SpanProcessor):
         # existing bounded queue/deferred/drop path.
         self._raw_pending_by_trace: Dict[int, List[ReadableSpan]] = {}
         self._raw_exporting_traces: Dict[int, int] = {}
+        self._tracked_span_counts: Dict[int, int] = {}
         self._membership: Dict[Tuple[int, int], TransactionMembership] = {}
         self._root_memberships_by_trace: Dict[int, Set[int]] = {}
         # Batches extracted but not yet accept/abandon-finished, per TraceID.
@@ -214,6 +215,7 @@ class TransactionSpanProcessor(SpanProcessor):
         self._passthrough_live_counts.clear()
         self._raw_pending_by_trace.clear()
         self._raw_exporting_traces.clear()
+        self._tracked_span_counts.clear()
         self._membership.clear()
         self._root_memberships_by_trace.clear()
         self._pending_completions.clear()
@@ -427,17 +429,17 @@ class TransactionSpanProcessor(SpanProcessor):
             self._cancel_pending_completion_locked(trace_id)
             live = self._live_parents.setdefault(trace_id, {})
             live[span_id] = parent_id
+            tracked_span_count = self._tracked_span_counts.get(trace_id, 0) + 1
+            self._tracked_span_counts[trace_id] = tracked_span_count
             if parent_id and self._is_local_parent_locked(trace_id, parent_id):
                 self._live_child_starts.setdefault((trace_id, parent_id), {})[
                     span_id
                 ] = int(span.start_time or 0)
-            if (
-                len(self._buffers.get(trace_id, [])) + len(live)
-                > self._max_transaction_spans
-            ):
+            if tracked_span_count > self._max_transaction_spans:
                 self._cancel_pending_completion_locked(trace_id)
                 self._cancel_pending_nested_completion_locked(trace_id)
                 self._passthrough_traces.add(trace_id)
+                self._tracked_span_counts.pop(trace_id, None)
                 self._passthrough_live_counts[trace_id] = len(live)
                 self._live_parents.pop(trace_id, None)
                 raw = self._buffers.pop(trace_id, [])
@@ -769,6 +771,13 @@ class TransactionSpanProcessor(SpanProcessor):
                     self._root_memberships_by_trace.pop(trace_id, None)
         self._child_intervals.pop(span_key, None)
         self._live_child_starts.pop(span_key, None)
+        if (
+            not self._live_parents.get(trace_id)
+            and not self._buffers.get(trace_id)
+            and trace_id not in self._inflight_batches_by_trace
+            and trace_id not in self._passthrough_traces
+        ):
+            self._tracked_span_counts.pop(trace_id, None)
 
     def _batch_trace_id(self, batch: Sequence[ReadableSpan]) -> Optional[int]:
         for span in batch:
@@ -797,45 +806,17 @@ class TransactionSpanProcessor(SpanProcessor):
         else:
             self._inflight_batches_by_trace[trace_id] = left
 
-    def _abandon_completed_batch(
-        self, batch: Sequence[ReadableSpan], *, adjust_pending: bool = True
-    ) -> None:
-        """Drop export for an unqueued batch; still record self-duration metrics."""
-        try:
-            with self._lock:
-                interval_snapshot = self._child_coverage_snapshot_locked(batch)
-                membership_snapshot = {
-                    span.context.span_id: self._membership[
-                        (span.context.trace_id, span.context.span_id)
-                    ]
-                    for span in batch
-                    if span.context is not None
-                    and (span.context.trace_id, span.context.span_id)
-                    in self._membership
-                }
-            annotate_completed_batch(
-                batch,
-                child_intervals=interval_snapshot,
-                membership=membership_snapshot,
-                self_duration_hist=self._self_duration_hist,
-                max_enriched_spans=self._max_transaction_spans,
-            )
-        except Exception:
-            _LOG.exception(
-                "TransactionSpanProcessor failed while recording metrics for "
-                "a dropped finalize batch"
-            )
-        finally:
-            with self._lock:
-                if adjust_pending:
-                    self._pending_finalize -= 1
-                self._finish_inflight_batch_locked(batch)
-                for span in batch:
-                    if span.context is not None:
-                        self._forget_span_locked(
-                            span.context.trace_id, span.context.span_id
-                        )
-                self._idle.notify_all()
+    def _drop_completed_batch(self, batch: Sequence[ReadableSpan]) -> None:
+        """Release an over-cap batch without export or metric work."""
+        with self._lock:
+            self._pending_finalize -= 1
+            self._finish_inflight_batch_locked(batch)
+            for span in batch:
+                if span.context is not None:
+                    self._forget_span_locked(
+                        span.context.trace_id, span.context.span_id
+                    )
+            self._idle.notify_all()
 
     def _retain_deferred_batches(
         self, batches: Sequence[Sequence[ReadableSpan]]
@@ -861,7 +842,7 @@ class TransactionSpanProcessor(SpanProcessor):
                 DEFAULT_MAX_DEFERRED_FINALIZE,
                 len(batch),
             )
-            self._abandon_completed_batch(batch)
+            self._drop_completed_batch(batch)
 
     def _abandon_raw_batch(self, batch: Sequence[ReadableSpan]) -> None:
         """Drop an over-cap raw batch once all bounded retention is exhausted."""
@@ -1124,6 +1105,7 @@ class TransactionSpanProcessor(SpanProcessor):
                 self._passthrough_live_counts.clear()
                 self._raw_pending_by_trace.clear()
                 self._raw_exporting_traces.clear()
+                self._tracked_span_counts.clear()
 
             for batch in batches:
                 self._run_accept_completed(batch)
