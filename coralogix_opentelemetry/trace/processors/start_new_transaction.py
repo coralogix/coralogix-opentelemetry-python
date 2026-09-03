@@ -72,6 +72,9 @@ def start_new_transaction(span: Span, name: str) -> Span:
     key = _span_key(span)
     if key is not None:
         with _explicit_names_lock:
+            prior = _explicit_names.get(key)
+            if prior is not None:
+                previous = prior[1]
             _explicit_names[key] = (name, previous)
         try:
             weakref.finalize(span, _clear_explicit_name, key)

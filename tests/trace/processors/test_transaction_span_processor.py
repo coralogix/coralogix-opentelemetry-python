@@ -132,6 +132,7 @@ def test_processor_preserves_transaction_metadata_at_attribute_limit() -> None:
 
         exported = exporter.spans[0]
         attrs = exported.attributes or {}
+        assert len(attrs) <= max_attributes
         assert attrs[CoralogixAttributes.TRANSACTION_IDENTIFIER] == "root"
         assert SELF_DURATION_ATTRIBUTE not in attrs
         assert "root" in _self_duration_metric_span_names(reader)
@@ -564,6 +565,37 @@ def test_raw_passthrough_strips_start_new_transaction_metadata() -> None:
         CoralogixAttributes.TRANSACTION_EXPLICIT,
     ):
         assert key not in attrs
+    provider.shutdown()  # type: ignore[no-untyped-call]
+
+
+def test_raw_passthrough_restores_original_attributes_after_repeated_helper_calls() -> (
+    None
+):
+    exporter = ListSpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(
+        TransactionSpanProcessor(
+            exporter, completion_holdback_millis=0, max_transaction_spans=0
+        )
+    )
+    tracer = provider.get_tracer("test")
+
+    outer = tracer.start_span("outer", kind=SpanKind.SERVER)
+    inner = tracer.start_span(
+        "inner",
+        context=trace.set_span_in_context(outer),
+        attributes={"application.attribute": "value"},
+    )
+    start_new_transaction(inner, "first")
+    start_new_transaction(inner, "second")
+    inner.end()
+    outer.end()
+
+    assert provider.force_flush() is True
+    attrs = next(
+        span.attributes or {} for span in exporter.spans if span.name == "inner"
+    )
+    assert attrs == {"application.attribute": "value"}
     provider.shutdown()  # type: ignore[no-untyped-call]
 
 
