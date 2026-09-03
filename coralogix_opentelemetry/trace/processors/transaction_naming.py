@@ -37,6 +37,12 @@ class TransactionMembership:
     # Span name observed at on_start (before framework update_name).
     start_name: Optional[str] = None
     root_flag_added: bool = False
+    # Attributes before the processor added its root marker. Raw passthrough
+    # restores this snapshot so a bounded attribute map does not lose user data.
+    raw_attributes: Optional[Dict[str, AttributeValue]] = None
+    # start_new_transaction() stores its name outside span attributes; retain
+    # that provenance through delayed raw export.
+    helper_added: bool = False
 
 
 def starts_new_transaction(

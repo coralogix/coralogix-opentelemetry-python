@@ -292,6 +292,7 @@ class TransactionSpanProcessor(SpanProcessor):
                 parent_context=parent_context,
                 parent_has_local_transaction=parent_has_local,
             )
+            original_attributes = dict(span.attributes or {})
             root_flag_added = apply_on_start_root_flag(span, starts)
             start_name = span.name
             preset = preset_transaction_name(span)
@@ -334,6 +335,7 @@ class TransactionSpanProcessor(SpanProcessor):
                     or parent_transaction_from_attrs(parent_span),
                     start_name=start_name,
                     root_flag_added=root_flag_added,
+                    raw_attributes=original_attributes if root_flag_added else None,
                 )
                 self._root_memberships_by_trace.setdefault(trace_id, set()).add(span_id)
             else:
@@ -385,6 +387,7 @@ class TransactionSpanProcessor(SpanProcessor):
                     override_name=None,
                     inherited_name=inherited_name,
                     start_name=start_name,
+                    raw_attributes=original_attributes if root_flag_added else None,
                 )
 
             self._cancel_pending_completion_locked(trace_id)
@@ -437,6 +440,8 @@ class TransactionSpanProcessor(SpanProcessor):
                 self._root_memberships_by_trace.setdefault(trace_id, set()).add(
                     span.context.span_id
                 )
+            if member is not None and explicit_name is not None:
+                member.helper_added = True
             if (
                 member is not None
                 and member.is_root
@@ -638,11 +643,20 @@ class TransactionSpanProcessor(SpanProcessor):
                 raw.append(span)
                 continue
             member = self._membership.get((span.context.trace_id, span.context.span_id))
-            helper_added = explicit_transaction_name(span) is not None
+            helper_added = bool(
+                (member is not None and member.helper_added)
+                or explicit_transaction_name(span) is not None
+            )
             if (member is None or not member.root_flag_added) and not helper_added:
                 raw.append(span)
                 continue
-            attrs = dict(span.attributes or {})
+            attrs = (
+                dict(member.raw_attributes)
+                if member is not None
+                and member.root_flag_added
+                and member.raw_attributes is not None
+                else dict(span.attributes or {})
+            )
             if member is not None and member.root_flag_added:
                 attrs.pop(CoralogixAttributes.TRANSACTION_ROOT, None)
             if helper_added:

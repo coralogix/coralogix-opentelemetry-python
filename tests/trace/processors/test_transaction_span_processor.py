@@ -497,6 +497,25 @@ def test_raw_passthrough_preserves_sampler_root_flag() -> None:
     provider.shutdown()  # type: ignore[no-untyped-call]
 
 
+def test_raw_passthrough_restores_attribute_evicted_by_processor_root_flag() -> None:
+    exporter = ListSpanExporter()
+    provider = TracerProvider(span_limits=SpanLimits(max_attributes=1))
+    provider.add_span_processor(
+        TransactionSpanProcessor(
+            exporter, completion_holdback_millis=0, max_transaction_spans=0
+        )
+    )
+    provider.get_tracer("test").start_span(
+        "root", kind=SpanKind.SERVER, attributes={"application.attribute": "value"}
+    ).end()
+
+    assert provider.force_flush() is True
+    attrs = exporter.spans[0].attributes or {}
+    assert attrs["application.attribute"] == "value"
+    assert CoralogixAttributes.TRANSACTION_ROOT not in attrs
+    provider.shutdown()  # type: ignore[no-untyped-call]
+
+
 def test_raw_passthrough_strips_start_new_transaction_metadata() -> None:
     exporter = ListSpanExporter()
     provider = TracerProvider()
@@ -514,6 +533,51 @@ def test_raw_passthrough_strips_start_new_transaction_metadata() -> None:
     outer.end()
 
     assert provider.force_flush() is True
+    attrs = next(
+        span.attributes or {} for span in exporter.spans if span.name == "inner"
+    )
+    for key in (
+        CoralogixAttributes.TRANSACTION_IDENTIFIER,
+        CoralogixAttributes.TRANSACTION_ROOT,
+        CoralogixAttributes.TRANSACTION_EXPLICIT,
+    ):
+        assert key not in attrs
+    provider.shutdown()  # type: ignore[no-untyped-call]
+
+
+def test_raw_passthrough_keeps_helper_provenance_until_export() -> None:
+    from coralogix_opentelemetry.trace.processors.start_new_transaction import (
+        _clear_explicit_name,
+    )
+
+    export_started = threading.Event()
+    release_export = threading.Event()
+
+    class BlockingExporter(ListSpanExporter):
+        def export(self, spans: Sequence[ReadableSpan]) -> SpanExportResult:
+            export_started.set()
+            assert release_export.wait(timeout=5.0)
+            return super().export(spans)
+
+    exporter = BlockingExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(
+        TransactionSpanProcessor(
+            exporter, completion_holdback_millis=0, max_transaction_spans=1
+        )
+    )
+    tracer = provider.get_tracer("test")
+    outer = tracer.start_span("outer", kind=SpanKind.SERVER)
+    inner = tracer.start_span("inner", context=trace.set_span_in_context(outer))
+    start_new_transaction(inner, "nested")
+    inner.end()
+    assert export_started.wait(timeout=2.0)
+
+    inner_context = inner.get_span_context()
+    _clear_explicit_name((inner_context.trace_id, inner_context.span_id))
+    outer.end()
+    release_export.set()
+    assert provider.force_flush(timeout_millis=2000) is True
     attrs = next(
         span.attributes or {} for span in exporter.spans if span.name == "inner"
     )
