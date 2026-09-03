@@ -128,8 +128,10 @@ class TransactionSpanProcessor(SpanProcessor):
         # Raw traces need only a count to know when their tombstone can expire.
         self._passthrough_live_counts: Dict[int, int] = {}
         # Coalesce rapid raw ends per trace so they do not fill the worker queue.
+        # A batch is capped at the queue capacity; further batches go through the
+        # existing bounded queue/deferred/drop path.
         self._raw_pending_by_trace: Dict[int, List[ReadableSpan]] = {}
-        self._raw_exporting_traces: Set[int] = set()
+        self._raw_exporting_traces: Dict[int, int] = {}
         self._membership: Dict[Tuple[int, int], TransactionMembership] = {}
         self._root_memberships_by_trace: Dict[int, Set[int]] = {}
         # Batches extracted but not yet accept/abandon-finished, per TraceID.
@@ -403,8 +405,7 @@ class TransactionSpanProcessor(SpanProcessor):
                 self._live_parents.pop(trace_id, None)
                 raw = self._buffers.pop(trace_id, [])
                 if raw:
-                    self._pending_finalize += 1
-                    self._note_inflight_batches_locked([raw])
+                    self._schedule_raw_batch_locked(raw)
                     raw_batches.append(raw)
         self._dispatch_raw_exports(raw_batches)
 
@@ -495,11 +496,12 @@ class TransactionSpanProcessor(SpanProcessor):
                     self._passthrough_live_counts[trace_id] = remaining
                 pending = self._raw_pending_by_trace.setdefault(trace_id, [])
                 pending.append(span)
-                if trace_id not in self._raw_exporting_traces:
-                    self._raw_exporting_traces.add(trace_id)
+                if (
+                    not self._raw_exporting_traces.get(trace_id)
+                    or len(pending) >= DEFAULT_MAX_FINALIZE_QUEUE
+                ):
                     raw_batches = [self._raw_pending_by_trace.pop(trace_id)]
-                    self._pending_finalize += 1
-                    self._note_inflight_batches_locked(raw_batches)
+                    self._schedule_raw_batch_locked(raw_batches[0])
                 if not self._passthrough_live_counts.get(trace_id):
                     self._schedule_passthrough_cleanup_locked(trace_id)
             else:
@@ -531,6 +533,7 @@ class TransactionSpanProcessor(SpanProcessor):
                     self._cancel_pending_nested_completion_locked(trace_id)
                     self._passthrough_traces.add(trace_id)
                     raw_batches = [self._buffers.pop(trace_id)]
+                    self._schedule_raw_batch_locked(raw_batches[0])
                     self._passthrough_live_counts[trace_id] = len(
                         self._live_parents.pop(trace_id, {})
                     )
@@ -544,8 +547,8 @@ class TransactionSpanProcessor(SpanProcessor):
                     self._cancel_pending_nested_completion_locked(trace_id)
                     completed_batches = self._schedule_completion_locked(trace_id)
 
-                self._pending_finalize += len(completed_batches) + len(raw_batches)
-                self._note_inflight_batches_locked(completed_batches + raw_batches)
+                self._pending_finalize += len(completed_batches)
+                self._note_inflight_batches_locked(completed_batches)
             if self._total_live_locked() == 0 and self._pending_finalize == 0:
                 self._idle.notify_all()
         # Both enriched and raw batches use the worker so Span.end never waits
@@ -586,14 +589,7 @@ class TransactionSpanProcessor(SpanProcessor):
                             span.context.trace_id, span.context.span_id
                         )
                 trace_id = self._batch_trace_id(batch)
-                if trace_id is not None and trace_id in self._raw_exporting_traces:
-                    pending = self._raw_pending_by_trace.pop(trace_id, [])
-                    if pending:
-                        next_raw_batches.append(pending)
-                        self._pending_finalize += 1
-                        self._note_inflight_batches_locked(next_raw_batches)
-                    else:
-                        self._raw_exporting_traces.discard(trace_id)
+                next_raw_batches = self._advance_raw_export_chain_locked(batch)
                 if (
                     trace_id is not None
                     and not self._live_parents.get(trace_id)
@@ -603,6 +599,34 @@ class TransactionSpanProcessor(SpanProcessor):
                     self._schedule_passthrough_cleanup_locked(trace_id)
                 self._idle.notify_all()
             self._dispatch_raw_exports(next_raw_batches)
+
+    def _schedule_raw_batch_locked(self, batch: Sequence[ReadableSpan]) -> None:
+        """Account for a raw batch before handing it to the bounded worker path."""
+        trace_id = self._batch_trace_id(batch)
+        if trace_id is not None:
+            self._raw_exporting_traces[trace_id] = (
+                self._raw_exporting_traces.get(trace_id, 0) + 1
+            )
+        self._pending_finalize += 1
+        self._note_inflight_batches_locked([batch])
+
+    def _advance_raw_export_chain_locked(
+        self, batch: Sequence[ReadableSpan]
+    ) -> List[List[ReadableSpan]]:
+        """Finish one raw batch and schedule its bounded coalesced successor."""
+        trace_id = self._batch_trace_id(batch)
+        if trace_id is None:
+            return []
+        active = self._raw_exporting_traces.get(trace_id, 0)
+        if active <= 1:
+            self._raw_exporting_traces.pop(trace_id, None)
+        else:
+            self._raw_exporting_traces[trace_id] = active - 1
+        pending = self._raw_pending_by_trace.pop(trace_id, [])
+        if not pending:
+            return []
+        self._schedule_raw_batch_locked(pending)
+        return [pending]
 
     def _strip_processor_root_flags_locked(
         self, spans: Sequence[ReadableSpan]
@@ -779,6 +803,7 @@ class TransactionSpanProcessor(SpanProcessor):
 
     def _abandon_raw_batch(self, batch: Sequence[ReadableSpan]) -> None:
         """Drop an over-cap raw batch once all bounded retention is exhausted."""
+        next_raw_batches: List[List[ReadableSpan]] = []
         with self._lock:
             self._pending_finalize -= 1
             self._finish_inflight_batch_locked(batch)
@@ -787,6 +812,7 @@ class TransactionSpanProcessor(SpanProcessor):
                     self._forget_span_locked(
                         span.context.trace_id, span.context.span_id
                     )
+            next_raw_batches = self._advance_raw_export_chain_locked(batch)
             trace_id = self._batch_trace_id(batch)
             if (
                 trace_id is not None
@@ -796,6 +822,7 @@ class TransactionSpanProcessor(SpanProcessor):
             ):
                 self._schedule_passthrough_cleanup_locked(trace_id)
             self._idle.notify_all()
+        self._dispatch_raw_exports(next_raw_batches)
 
     def _retain_deferred_raw_batches(
         self, batches: Sequence[Sequence[ReadableSpan]]
