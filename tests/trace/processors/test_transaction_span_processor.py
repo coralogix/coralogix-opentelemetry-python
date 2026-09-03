@@ -1592,6 +1592,41 @@ def test_processor_uses_configured_span_limit() -> None:
     provider.shutdown()  # type: ignore[no-untyped-call]
 
 
+def test_processor_caps_concurrent_transaction_state_on_start() -> None:
+    exporter = ListSpanExporter()
+    processor = TransactionSpanProcessor(
+        exporter, completion_holdback_millis=0, max_transaction_spans=2
+    )
+    provider = TracerProvider()
+    provider.add_span_processor(processor)
+    tracer = provider.get_tracer("test")
+
+    root = tracer.start_span("root", kind=SpanKind.SERVER)
+    context = trace.set_span_in_context(root)
+    first = tracer.start_span("first", context=context)
+    second = tracer.start_span("second", context=context)
+
+    trace_id = root.get_span_context().trace_id
+    with processor._lock:
+        assert trace_id in processor._passthrough_traces
+        assert trace_id not in processor._live_parents
+        assert processor._passthrough_live_counts[trace_id] == 3
+        assert sum(key[0] == trace_id for key in processor._membership) == 3
+
+    second.end()
+    first.end()
+    root.end()
+    assert provider.force_flush() is True
+    assert len(exporter.spans) == 3
+    assert all(
+        CoralogixAttributes.TRANSACTION_IDENTIFIER not in (span.attributes or {})
+        and CoralogixAttributes.TRANSACTION_ROOT not in (span.attributes or {})
+        and SELF_DURATION_ATTRIBUTE not in (span.attributes or {})
+        for span in exporter.spans
+    )
+    provider.shutdown()  # type: ignore[no-untyped-call]
+
+
 def test_processor_uses_configured_trace_limit() -> None:
     exporter = ListSpanExporter()
     provider = TracerProvider()
