@@ -36,6 +36,7 @@ class TransactionMembership:
     inherited_name: Optional[str] = None
     # Span name observed at on_start (before framework update_name).
     start_name: Optional[str] = None
+    root_flag_added: bool = False
 
 
 def starts_new_transaction(
@@ -88,10 +89,16 @@ def explicit_transaction_override(span: object) -> bool:
     return _attr_get(attrs, CoralogixAttributes.TRANSACTION_EXPLICIT.value) is True
 
 
-def apply_on_start_root_flag(span: Span, starts: bool) -> None:
-    """Set root flag only; never freeze the transaction name from span.name."""
-    if starts:
+def apply_on_start_root_flag(span: Span, starts: bool) -> bool:
+    """Set a missing root flag and report whether the processor added it."""
+    if starts and not bool(
+        (getattr(span, "attributes", None) or {}).get(
+            CoralogixAttributes.TRANSACTION_ROOT
+        )
+    ):
         span.set_attribute(CoralogixAttributes.TRANSACTION_ROOT, True)
+        return True
+    return False
 
 
 def parent_transaction_from_tracestate(parent_span: Optional[object]) -> Optional[str]:

@@ -44,6 +44,7 @@ from coralogix_opentelemetry.trace.processors.defaults import (
 from coralogix_opentelemetry.trace.processors.holdback_scheduler import (
     HoldbackScheduler,
 )
+from coralogix_opentelemetry.trace.processors.span_copy import copy_with_attributes
 from coralogix_opentelemetry.trace.processors.start_new_transaction import (
     clear_explicit_transaction_name,
     explicit_transaction_name,
@@ -278,7 +279,7 @@ class TransactionSpanProcessor(SpanProcessor):
                 parent_context=parent_context,
                 parent_has_local_transaction=parent_has_local,
             )
-            apply_on_start_root_flag(span, starts)
+            root_flag_added = apply_on_start_root_flag(span, starts)
             start_name = span.name
             preset = preset_transaction_name(span)
 
@@ -319,6 +320,7 @@ class TransactionSpanProcessor(SpanProcessor):
                     inherited_name=inherited_from_ts
                     or parent_transaction_from_attrs(parent_span),
                     start_name=start_name,
+                    root_flag_added=root_flag_added,
                 )
                 self._root_memberships_by_trace.setdefault(trace_id, set()).add(span_id)
             else:
@@ -535,7 +537,9 @@ class TransactionSpanProcessor(SpanProcessor):
     def _run_raw_export(self, batch: Sequence[ReadableSpan]) -> None:
         """Export a trace that crossed the enrichment limit without blocking Span.end."""
         try:
-            self._export_spans(batch)
+            with self._lock:
+                raw = self._strip_processor_root_flags_locked(batch)
+            self._export_spans(raw)
         finally:
             with self._lock:
                 self._pending_finalize -= 1
@@ -553,6 +557,24 @@ class TransactionSpanProcessor(SpanProcessor):
                 ):
                     self._schedule_passthrough_cleanup_locked(trace_id)
                 self._idle.notify_all()
+
+    def _strip_processor_root_flags_locked(
+        self, spans: Sequence[ReadableSpan]
+    ) -> List[ReadableSpan]:
+        """Remove only root flags the processor added before raw passthrough."""
+        raw: List[ReadableSpan] = []
+        for span in spans:
+            if span.context is None:
+                raw.append(span)
+                continue
+            member = self._membership.get((span.context.trace_id, span.context.span_id))
+            if member is None or not member.root_flag_added:
+                raw.append(span)
+                continue
+            attrs = dict(span.attributes or {})
+            attrs.pop(CoralogixAttributes.TRANSACTION_ROOT, None)
+            raw.append(copy_with_attributes(span, attrs))
+        return raw
 
     def _add_child_interval_locked(
         self, trace_id: int, parent_id: int, start: int, end: int
@@ -871,6 +893,7 @@ class TransactionSpanProcessor(SpanProcessor):
             self._pending_finalize += len(new_batches)
         # Wait for queue capacity within the deadline — retain on timeout.
         if not self._dispatch_accept_completed(batches, deadline=deadline):
+            self._retain_deferred_raw_batches(deferred_raw)
             return False
         if not self._dispatch_raw_exports(deferred_raw, deadline=deadline):
             return False
