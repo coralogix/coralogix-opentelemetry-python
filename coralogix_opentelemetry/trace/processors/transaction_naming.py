@@ -36,10 +36,6 @@ class TransactionMembership:
     inherited_name: Optional[str] = None
     # Span name observed at on_start (before framework update_name).
     start_name: Optional[str] = None
-    root_flag_added: bool = False
-    # Attributes before the processor added its root marker. Raw passthrough
-    # restores this snapshot so a bounded attribute map does not lose user data.
-    raw_attributes: Optional[Dict[str, AttributeValue]] = None
     # start_new_transaction() stores its name outside span attributes; retain
     # that provenance through delayed raw export.
     helper_added: bool = False
@@ -93,18 +89,6 @@ def explicit_transaction_override(span: object) -> bool:
     """True when ``start_new_transaction`` marked this span's name as explicit."""
     attrs = getattr(span, "attributes", None)
     return _attr_get(attrs, CoralogixAttributes.TRANSACTION_EXPLICIT.value) is True
-
-
-def apply_on_start_root_flag(span: Span, starts: bool) -> bool:
-    """Set a missing root flag and report whether the processor added it."""
-    if starts and not bool(
-        (getattr(span, "attributes", None) or {}).get(
-            CoralogixAttributes.TRANSACTION_ROOT
-        )
-    ):
-        span.set_attribute(CoralogixAttributes.TRANSACTION_ROOT, True)
-        return True
-    return False
 
 
 def parent_transaction_from_tracestate(parent_span: Optional[object]) -> Optional[str]:
