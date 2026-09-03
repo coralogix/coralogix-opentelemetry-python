@@ -260,33 +260,36 @@ def test_start_new_transaction_override_wins_over_span_name() -> None:
 
 
 def test_start_new_transaction_preserves_name_with_bounded_attributes() -> None:
-    exporter = ListSpanExporter()
-    provider = TracerProvider(span_limits=SpanLimits(max_attributes=2))
-    provider.add_span_processor(
-        TransactionSpanProcessor(exporter, completion_holdback_millis=0)
-    )
-    tracer = provider.get_tracer("test")
+    for max_attributes in (1, 2):
+        exporter = ListSpanExporter()
+        provider = TracerProvider(span_limits=SpanLimits(max_attributes=max_attributes))
+        provider.add_span_processor(
+            TransactionSpanProcessor(exporter, completion_holdback_millis=0)
+        )
+        tracer = provider.get_tracer("test")
 
-    outer = tracer.start_span("outer", kind=SpanKind.SERVER)
-    inner = tracer.start_span("inner", context=trace.set_span_in_context(outer))
-    start_new_transaction(inner, "custom-name")
-    child = tracer.start_span("child", context=trace.set_span_in_context(inner))
-    child.end()
-    inner.update_name("renamed-inner")
-    inner.end()
-    outer.end()
-    provider.force_flush()
+        outer = tracer.start_span("outer", kind=SpanKind.SERVER)
+        inner = tracer.start_span("inner", context=trace.set_span_in_context(outer))
+        start_new_transaction(inner, "custom-name")
+        child = tracer.start_span("child", context=trace.set_span_in_context(inner))
+        child.end()
+        inner.update_name("renamed-inner")
+        inner.end()
+        outer.end()
+        provider.force_flush()
 
-    by_name = {span.name: span for span in exporter.spans}
-    assert (
-        by_name["renamed-inner"].attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER]
-        == "custom-name"
-    )
-    assert (
-        by_name["child"].attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER]
-        == "custom-name"
-    )
-    provider.shutdown()  # type: ignore[no-untyped-call]
+        by_name = {span.name: span for span in exporter.spans}
+        assert (
+            by_name["renamed-inner"].attributes[
+                CoralogixAttributes.TRANSACTION_IDENTIFIER
+            ]
+            == "custom-name"
+        )
+        assert (
+            by_name["child"].attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER]
+            == "custom-name"
+        )
+        provider.shutdown()  # type: ignore[no-untyped-call]
 
 
 def test_sampler_echo_does_not_block_update_name() -> None:
