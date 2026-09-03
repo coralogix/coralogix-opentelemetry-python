@@ -1150,6 +1150,29 @@ def test_deferred_finalize_is_bounded(monkeypatch: MonkeyPatch) -> None:
     provider.shutdown()  # type: ignore[no-untyped-call]
 
 
+def test_abandoning_raw_batch_reschedules_passthrough_cleanup() -> None:
+    processor = TransactionSpanProcessor(
+        ListSpanExporter(), completion_holdback_millis=1
+    )
+    batch = [_readable("raw", trace_id=1, span_id=1)]
+    with processor._lock:
+        processor._passthrough_traces.add(1)
+        processor._note_inflight_batches_locked([batch])
+        processor._pending_finalize = 1
+        processor._schedule_passthrough_cleanup_locked(1)
+
+    deadline = time.monotonic() + 2
+    while processor._pending_passthrough_cleanup and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert 1 in processor._passthrough_traces
+    processor._abandon_raw_batch(batch)
+
+    while 1 in processor._passthrough_traces and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert 1 not in processor._passthrough_traces
+    processor.shutdown()
+
+
 def test_force_flush_export_lock_respects_deadline() -> None:
     """force_flush must not block forever waiting on a held export lock."""
     lock_held = threading.Event()

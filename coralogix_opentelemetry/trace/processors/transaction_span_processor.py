@@ -740,6 +740,13 @@ class TransactionSpanProcessor(SpanProcessor):
                     self._forget_span_locked(
                         span.context.trace_id, span.context.span_id
                     )
+            trace_id = self._batch_trace_id(batch)
+            if (
+                trace_id is not None
+                and not self._live_parents.get(trace_id)
+                and trace_id not in self._inflight_batches_by_trace
+            ):
+                self._schedule_passthrough_cleanup_locked(trace_id)
             self._idle.notify_all()
 
     def _retain_deferred_raw_batches(
