@@ -60,6 +60,8 @@ from coralogix_opentelemetry.trace.processors.transaction_finalize import (
 from coralogix_opentelemetry.trace.processors.transaction_naming import (
     TransactionMembership,
     explicit_transaction_override,
+    has_processor_root_marker,
+    mark_processor_root,
     parent_has_transaction_attrs,
     parent_transaction_from_attrs,
     parent_transaction_from_tracestate,
@@ -305,7 +307,8 @@ class TransactionSpanProcessor(SpanProcessor):
                     raw_attribute_limit = bounded.maxlen
                     bounded.maxlen += 1
                 span.set_attribute(CoralogixAttributes.TRANSACTION_ROOT, True)
-                root_flag_added = True
+                mark_processor_root(span)
+            root_flag_added = has_processor_root_marker(span)
             start_name = span.name
             preset = preset_transaction_name(span)
 
