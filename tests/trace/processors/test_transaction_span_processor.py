@@ -1151,12 +1151,13 @@ def test_deferred_finalize_is_bounded(monkeypatch: MonkeyPatch) -> None:
 
 
 def test_abandoning_raw_batch_reschedules_passthrough_cleanup() -> None:
-    processor = TransactionSpanProcessor(
-        ListSpanExporter(), completion_holdback_millis=1
-    )
+    exporter = ListSpanExporter()
+    processor = TransactionSpanProcessor(exporter, completion_holdback_millis=1)
     batch = [_readable("raw", trace_id=1, span_id=1)]
     with processor._lock:
         processor._passthrough_traces.add(1)
+        processor._raw_exporting_traces[1] = 1
+        processor._raw_pending_by_trace[1] = [_readable("next", trace_id=1, span_id=2)]
         processor._note_inflight_batches_locked([batch])
         processor._pending_finalize = 1
         processor._schedule_passthrough_cleanup_locked(1)
@@ -1166,6 +1167,9 @@ def test_abandoning_raw_batch_reschedules_passthrough_cleanup() -> None:
         time.sleep(0.01)
     assert 1 in processor._passthrough_traces
     processor._abandon_raw_batch(batch)
+
+    assert processor.force_flush(timeout_millis=2000) is True
+    assert {span.name for span in exporter.spans} == {"next"}
 
     while 1 in processor._passthrough_traces and time.monotonic() < deadline:
         time.sleep(0.01)
@@ -1653,6 +1657,55 @@ def test_processor_exports_concurrent_raw_spans_without_queue_loss() -> None:
         and SELF_DURATION_ATTRIBUTE not in (span.attributes or {})
         for span in exporter.spans
     )
+    provider.shutdown()  # type: ignore[no-untyped-call]
+
+
+def test_raw_coalescing_is_bounded_during_exporter_stall(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "coralogix_opentelemetry.trace.processors.transaction_span_processor."
+        "DEFAULT_MAX_FINALIZE_QUEUE",
+        2,
+    )
+    monkeypatch.setattr(
+        "coralogix_opentelemetry.trace.processors.transaction_span_processor."
+        "DEFAULT_MAX_DEFERRED_FINALIZE",
+        2,
+    )
+    export_started = threading.Event()
+    release_export = threading.Event()
+
+    class BlockingExporter(ListSpanExporter):
+        def export(self, spans: Sequence[ReadableSpan]) -> SpanExportResult:
+            export_started.set()
+            assert release_export.wait(timeout=5.0)
+            return super().export(spans)
+
+    exporter = BlockingExporter()
+    processor = TransactionSpanProcessor(
+        exporter, completion_holdback_millis=0, max_transaction_spans=0
+    )
+    provider = TracerProvider()
+    provider.add_span_processor(processor)
+    tracer = provider.get_tracer("test")
+
+    root = tracer.start_span("root", kind=SpanKind.SERVER)
+    context = trace.set_span_in_context(root)
+    children = [
+        tracer.start_span("child-{}".format(index), context=context)
+        for index in range(16)
+    ]
+    root.end()
+    assert export_started.wait(timeout=2.0)
+    for child in children:
+        child.end()
+
+    with processor._lock:
+        assert all(len(batch) < 2 for batch in processor._raw_pending_by_trace.values())
+        assert processor._finalize_queue.qsize() <= 2
+        assert len(processor._deferred_raw_finalize) <= 2
+    release_export.set()
     provider.shutdown()  # type: ignore[no-untyped-call]
 
 
