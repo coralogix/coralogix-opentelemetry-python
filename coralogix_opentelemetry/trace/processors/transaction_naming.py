@@ -129,7 +129,7 @@ def resolve_batch_transaction_name(
     Sampler-injected ``cgx.transaction`` that merely echoed the on_start span
     name is ignored so ``update_name`` can still supply the final name.
     """
-    root = _batch_root(spans)
+    root = _batch_root(spans, membership)
     if root is not None and root.context is not None:
         if explicit_transaction_override(root):
             preset = (root.attributes or {}).get(
@@ -180,9 +180,16 @@ def stamp_transaction_attributes(
     return stamped
 
 
-def _batch_root(spans: Sequence[ReadableSpan]) -> Optional[ReadableSpan]:
+def _batch_root(
+    spans: Sequence[ReadableSpan], membership: Mapping[int, TransactionMembership]
+) -> Optional[ReadableSpan]:
     for span in spans:
         if (span.attributes or {}).get(CoralogixAttributes.TRANSACTION_ROOT):
+            return span
+        member = (
+            membership.get(span.context.span_id) if span.context is not None else None
+        )
+        if member is not None and member.is_root:
             return span
     return spans[0] if spans else None
 
