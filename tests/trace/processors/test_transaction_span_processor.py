@@ -114,22 +114,31 @@ def test_processor_tags_and_self_duration_without_sampler() -> None:
 def test_processor_preserves_transaction_metadata_at_attribute_limit() -> None:
     for max_attributes in (1, 2):
         exporter = ListSpanExporter()
+        reader = InMemoryMetricReader()
+        meter_provider = MeterProvider(metric_readers=[reader])
         provider = TracerProvider(span_limits=SpanLimits(max_attributes=max_attributes))
         provider.add_span_processor(
-            TransactionSpanProcessor(exporter, completion_holdback_millis=0)
+            TransactionSpanProcessor(
+                exporter,
+                meter_provider=meter_provider,
+                completion_holdback_millis=0,
+            )
         )
         span = provider.get_tracer("test").start_span("root", kind=SpanKind.SERVER)
         span.set_attribute("application.attribute", "value")
         span.end()
         provider.force_flush()
+        meter_provider.force_flush()
 
         exported = exporter.spans[0]
         attrs = exported.attributes or {}
         assert attrs[CoralogixAttributes.TRANSACTION_IDENTIFIER] == "root"
         assert SELF_DURATION_ATTRIBUTE not in attrs
+        assert "root" in _self_duration_metric_span_names(reader)
         if max_attributes == 2:
             assert attrs[CoralogixAttributes.TRANSACTION_ROOT] is True
         provider.shutdown()  # type: ignore[no-untyped-call]
+        meter_provider.shutdown()
 
 
 def test_inherits_transaction_from_parent_tracestate_when_parent_has_no_attributes() -> (
@@ -1111,6 +1120,32 @@ def test_shutdown_waits_for_in_flight_spans() -> None:
     thread.join()
 
     assert {span.name for span in exporter.spans} == {"parent", "child"}
+    provider.shutdown()  # type: ignore[no-untyped-call]
+
+
+def test_shutdown_exports_buffered_spans_when_a_trace_remains_live(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    exporter = ListSpanExporter()
+    processor = TransactionSpanProcessor(exporter, completion_holdback_millis=0)
+    provider = TracerProvider()
+    provider.add_span_processor(processor)
+    tracer = provider.get_tracer("test")
+
+    parent = tracer.start_span("parent", kind=SpanKind.SERVER)
+    child = tracer.start_span("child", context=trace.set_span_in_context(parent))
+    child.set_attribute("preexisting", "kept")
+    child.end()
+    monkeypatch.setattr(processor, "_wait_for_idle_locked", lambda timeout_sec: None)
+
+    processor.shutdown()
+
+    assert len(exporter.spans) == 1
+    exported = exporter.spans[0]
+    assert exported.name == "child"
+    assert (exported.attributes or {})["preexisting"] == "kept"
+    assert SELF_DURATION_ATTRIBUTE not in (exported.attributes or {})
+    parent.end()
     provider.shutdown()  # type: ignore[no-untyped-call]
 
 

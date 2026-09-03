@@ -822,29 +822,31 @@ class TransactionSpanProcessor(SpanProcessor):
                 deferred = list(self._deferred_finalize)
                 self._deferred_finalize = []
                 extracted: List[List[ReadableSpan]] = []
+                raw_batches: List[List[ReadableSpan]] = []
                 for trace_id in list(self._buffers.keys()):
                     if self._live_parents.get(trace_id):
-                        dropped = self._buffers.pop(trace_id, None) or []
+                        raw_batches.append(self._buffers.pop(trace_id, []))
                         self._live_parents.pop(trace_id, None)
-                        for span in dropped:
-                            if span.context is not None:
-                                self._forget_span_locked(
-                                    span.context.trace_id, span.context.span_id
-                                )
                         continue
                     extracted.extend(
                         self._extract_completed_local_transactions_locked(
                             trace_id, flush_leftover=True
                         )
                     )
-                self._note_inflight_batches_locked(holdback_batches + extracted)
+                self._note_inflight_batches_locked(
+                    holdback_batches + extracted + raw_batches
+                )
                 batches = deferred + holdback_batches + extracted
-                self._pending_finalize += len(holdback_batches) + len(extracted)
+                self._pending_finalize += (
+                    len(holdback_batches) + len(extracted) + len(raw_batches)
+                )
                 self._buffers.clear()
                 self._live_parents.clear()
 
             for batch in batches:
                 self._run_accept_completed(batch)
+            for batch in raw_batches:
+                self._run_raw_export(batch)
 
             with self._lock:
                 while self._pending_finalize > 0:
