@@ -141,6 +141,25 @@ def test_processor_preserves_transaction_metadata_at_attribute_limit() -> None:
         meter_provider.shutdown()
 
 
+def test_metric_failure_does_not_drop_completed_trace(monkeypatch: MonkeyPatch) -> None:
+    class FailingHistogram:
+        def record(self, *args: object, **kwargs: object) -> None:
+            raise RuntimeError("metric backend unavailable")
+
+    exporter = ListSpanExporter()
+    processor = TransactionSpanProcessor(exporter, completion_holdback_millis=0)
+    monkeypatch.setattr(processor, "_self_duration_hist", FailingHistogram())
+    provider = TracerProvider()
+    provider.add_span_processor(processor)
+
+    provider.get_tracer("test").start_span("root", kind=SpanKind.SERVER).end()
+
+    assert provider.force_flush() is True
+    assert [span.name for span in exporter.spans] == ["root"]
+    assert not processor._membership
+    provider.shutdown()  # type: ignore[no-untyped-call]
+
+
 def test_inherits_transaction_from_parent_tracestate_when_parent_has_no_attributes() -> (
     None
 ):

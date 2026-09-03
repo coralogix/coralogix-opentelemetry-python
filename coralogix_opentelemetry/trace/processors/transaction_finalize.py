@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Dict, List, Optional, Sequence, Set, Tuple, cast
 
 from coralogix_opentelemetry.trace.common import CoralogixAttributes
@@ -22,6 +23,7 @@ from opentelemetry.util.types import AttributeValue
 METRIC_SELF_DURATION = "cgx.transaction.self_duration"
 SELF_DURATION_ATTRIBUTE = "cgx.transaction.self_duration"
 METRIC_ATTR_SPAN_NAME = "span.name"
+_LOG = logging.getLogger(__name__)
 
 
 def annotate_completed_batch(
@@ -104,7 +106,10 @@ def _annotate_with_self_duration_and_metrics(
             metric_attrs[CoralogixAttributes.TRANSACTION_IDENTIFIER] = str(txn)
         if attrs.get(CoralogixAttributes.TRANSACTION_ROOT):
             metric_attrs[CoralogixAttributes.TRANSACTION_ROOT] = True
-        self_duration_hist.record(self_duration_ns / 1_000_000_000.0, metric_attrs)
+        try:
+            self_duration_hist.record(self_duration_ns / 1_000_000_000.0, metric_attrs)
+        except Exception:
+            _LOG.exception("Failed to record transaction self-duration metric")
     return annotated
 
 
