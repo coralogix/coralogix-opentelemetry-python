@@ -2016,6 +2016,27 @@ def test_nested_server_finalizes_while_outer_still_open() -> None:
     provider.shutdown()  # type: ignore[no-untyped-call]
 
 
+def test_force_flush_finalizes_nested_transaction_while_outer_is_live() -> None:
+    exporter = ListSpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(
+        TransactionSpanProcessor(exporter, completion_holdback_millis=60_000)
+    )
+    tracer = provider.get_tracer("test")
+
+    outer = tracer.start_span("outer", kind=SpanKind.SERVER)
+    with trace.use_span(outer, end_on_exit=False):
+        with tracer.start_as_current_span("inner", kind=SpanKind.SERVER):
+            with tracer.start_as_current_span("db"):
+                pass
+
+    assert provider.force_flush() is True
+    assert {span.name for span in exporter.spans} == {"inner", "db"}
+    outer.end()
+    assert provider.force_flush() is True
+    provider.shutdown()  # type: ignore[no-untyped-call]
+
+
 def test_completion_holdback_keeps_fire_and_forget_child() -> None:
     exporter = ListSpanExporter()
     processor = TransactionSpanProcessor(exporter, completion_holdback_millis=80)

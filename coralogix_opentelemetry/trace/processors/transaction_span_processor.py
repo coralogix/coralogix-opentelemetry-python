@@ -1183,6 +1183,11 @@ class TransactionSpanProcessor(SpanProcessor):
             self._cancel_pending_nested_completion_locked(trace_id)
         for trace_id in list(self._buffers.keys()):
             if self._live_parents.get(trace_id):
+                batches.extend(
+                    self._extract_completed_local_transactions_locked(
+                        trace_id, flush_leftover=False
+                    )
+                )
                 continue
             batches.extend(
                 self._extract_completed_local_transactions_locked(
