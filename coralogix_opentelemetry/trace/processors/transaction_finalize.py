@@ -6,7 +6,6 @@ from typing import Dict, List, Optional, Sequence, Set, Tuple, cast
 
 from coralogix_opentelemetry.trace.common import CoralogixAttributes
 from coralogix_opentelemetry.trace.processors.self_duration import (
-    covered_duration_ns,
     self_duration_by_span_id,
 )
 from coralogix_opentelemetry.trace.processors.span_copy import copy_with_attributes
@@ -32,7 +31,6 @@ def annotate_completed_batch(
     membership: Dict[int, TransactionMembership],
     self_duration_hist: Histogram,
     transaction_name: Optional[str] = None,
-    child_covered_ns: Optional[Dict[int, int]] = None,
     max_enriched_spans: Optional[int] = None,
 ) -> List[ReadableSpan]:
     """Enrich a bounded batch, or export a larger batch without enrichment.
@@ -42,9 +40,6 @@ def annotate_completed_batch(
 
     ``transaction_name`` overrides name resolution (used when recording metrics
     for live-buffer evictions that do not include the transaction root span).
-
-    ``child_covered_ns`` is folded prior-child coverage that no longer has
-    residual interval geometry (bounded live-parent aggregate).
     """
     if max_enriched_spans is not None and len(spans) > max_enriched_spans:
         return [strip_transaction_enrichment(span) for span in spans]
@@ -55,7 +50,6 @@ def annotate_completed_batch(
         named,
         child_intervals,
         self_duration_hist,
-        child_covered_ns or {},
     )
 
 
@@ -63,7 +57,6 @@ def _annotate_with_self_duration_and_metrics(
     spans: Sequence[ReadableSpan],
     child_intervals: Dict[int, List[Tuple[int, int]]],
     self_duration_hist: Histogram,
-    child_covered_ns: Dict[int, int],
 ) -> List[ReadableSpan]:
     direct_child_intervals: Dict[int, Set[Tuple[int, int]]] = {}
     for span in spans:
@@ -88,9 +81,6 @@ def _annotate_with_self_duration_and_metrics(
         sid = format_span_id(span.context.span_id)
         rows.append((sid, parent_id, span.name, span.start_time, span.end_time))
         batch_child_keys = direct_child_intervals.get(span.context.span_id)
-        # Residual geometry still participates in the tree merge. Folded coverage
-        # is applied below so batch children already absorbed into the scalar are
-        # not double-counted through synthetic priors alone.
         for index, (start_ns, end_ns) in enumerate(
             child_intervals.get(span.context.span_id, [])
         ):
@@ -100,21 +90,6 @@ def _annotate_with_self_duration_and_metrics(
             rows.append((child_sid, sid, "_prior_child", start_ns, end_ns))
 
     self_durations = self_duration_by_span_id(rows)
-    for span in spans:
-        if span.context is None or span.start_time is None or span.end_time is None:
-            continue
-        span_id = span.context.span_id
-        folded = int(child_covered_ns.get(span_id, 0))
-        if folded <= 0:
-            continue
-        # Folded coverage already includes ended children (possibly still present
-        # in this batch). Recompute from the aggregate so those children are not
-        # subtracted twice — once via the batch tree and again via the scalar.
-        residual = child_intervals.get(span_id, [])
-        covered = folded + covered_duration_ns(span.start_time, span.end_time, residual)
-        wall = max(0, span.end_time - span.start_time)
-        sid = format_span_id(span_id)
-        self_durations[sid] = max(0, wall - min(wall, covered))
     annotated = [_copy_with_self_duration(span, self_durations) for span in spans]
     for span in annotated:
         attrs = dict(span.attributes or {})
