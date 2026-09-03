@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, List, Set
+from typing import Dict, List, Optional, Set
 
 from coralogix_opentelemetry.trace.common import CoralogixAttributes
 from opentelemetry.sdk.trace import ReadableSpan
@@ -13,6 +13,7 @@ def extract_completed_local_transactions(
     buffer: List[ReadableSpan],
     live: Dict[int, int],
     flush_leftover: bool,
+    root_span_ids: Optional[Set[int]] = None,
 ) -> tuple[List[List[ReadableSpan]], List[ReadableSpan]]:
     """Return ``(batches, remaining_buffer)``.
 
@@ -48,11 +49,15 @@ def extract_completed_local_transactions(
             return True
         return any(under_root(live_id, root_id) for live_id in live)
 
+    root_span_ids = root_span_ids or set()
     roots = [
         span
         for span in buffer
         if span.context is not None
-        and (span.attributes or {}).get(CoralogixAttributes.TRANSACTION_ROOT)
+        and (
+            span.context.span_id in root_span_ids
+            or (span.attributes or {}).get(CoralogixAttributes.TRANSACTION_ROOT)
+        )
     ]
 
     def root_depth(root_id: int) -> int:

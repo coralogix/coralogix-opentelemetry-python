@@ -874,7 +874,7 @@ class TransactionSpanProcessor(SpanProcessor):
                     )
                 self._note_inflight_batches_locked(holdback_batches + extracted)
                 batches = deferred + holdback_batches + extracted
-                self._pending_finalize += len(batches)
+                self._pending_finalize += len(holdback_batches) + len(extracted)
                 self._buffers.clear()
                 self._live_parents.clear()
 
@@ -1063,8 +1063,16 @@ class TransactionSpanProcessor(SpanProcessor):
         if not buffer:
             return []
         live = self._live_parents.get(trace_id, {})
+        root_span_ids = {
+            span_id
+            for (member_trace_id, span_id), member in self._membership.items()
+            if member_trace_id == trace_id and member.is_root
+        }
         batches, remaining = extract_completed_local_transactions(
-            buffer=buffer, live=live, flush_leftover=flush_leftover
+            buffer=buffer,
+            live=live,
+            flush_leftover=flush_leftover,
+            root_span_ids=root_span_ids,
         )
         if remaining:
             self._buffers[trace_id] = remaining
