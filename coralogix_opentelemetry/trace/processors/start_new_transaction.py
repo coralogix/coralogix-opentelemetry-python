@@ -13,7 +13,7 @@ from opentelemetry.trace import Span
 
 
 def start_new_transaction(span: Span, name: str) -> Span:
-    span.set_attribute(CoralogixAttributes.TRANSACTION_IDENTIFIER, name)
     span.set_attribute(CoralogixAttributes.TRANSACTION_ROOT, True)
     span.set_attribute(CoralogixAttributes.TRANSACTION_EXPLICIT, True)
+    span.set_attribute(CoralogixAttributes.TRANSACTION_IDENTIFIER, name)
     return span
