@@ -312,6 +312,35 @@ def test_nested_server_ignores_sampler_name_before_parent_override() -> None:
     provider.shutdown()  # type: ignore[no-untyped-call]
 
 
+def test_nested_server_ignores_sampler_name_from_untracked_parent() -> None:
+    from coralogix_opentelemetry.trace.samplers import CoralogixTransactionSampler
+
+    sampler = CoralogixTransactionSampler()
+    parent_provider = TracerProvider(sampler=sampler)
+    outer = parent_provider.get_tracer("parent").start_span(
+        "outer", kind=SpanKind.SERVER
+    )
+
+    exporter = ListSpanExporter()
+    provider = TracerProvider(sampler=sampler)
+    provider.add_span_processor(
+        TransactionSpanProcessor(exporter, completion_holdback_millis=0)
+    )
+    tracer = provider.get_tracer("child")
+    with trace.use_span(outer, end_on_exit=False):
+        nested = tracer.start_span("nested", kind=SpanKind.SERVER)
+    nested.update_name("nested-final")
+    nested.end()
+    provider.force_flush()
+
+    assert exporter.spans[0].attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER] == (
+        "nested-final"
+    )
+    provider.shutdown()  # type: ignore[no-untyped-call]
+    outer.end()
+    parent_provider.shutdown()  # type: ignore[no-untyped-call]
+
+
 def test_257th_ended_span_flushes_trace_raw_and_enables_passthrough() -> None:
     resource = Resource.create({"service.name": "test"})
     exporter = ListSpanExporter()

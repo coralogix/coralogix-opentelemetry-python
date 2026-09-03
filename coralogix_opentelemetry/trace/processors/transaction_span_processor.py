@@ -294,8 +294,14 @@ class TransactionSpanProcessor(SpanProcessor):
                     parent_txn = parent_transaction_from_attrs(parent_span)
                 if not (
                     starts
-                    and parent_member is not None
-                    and (preset == parent_txn or preset == parent_member.start_name)
+                    and parent_txn is not None
+                    and (
+                        preset == parent_txn
+                        or (
+                            parent_member is not None
+                            and preset == parent_member.start_name
+                        )
+                    )
                 ):
                     override = preset
 
@@ -304,6 +310,8 @@ class TransactionSpanProcessor(SpanProcessor):
                     root_span_id=span_id,
                     is_root=True,
                     override_name=override,
+                    inherited_name=inherited_from_ts
+                    or parent_transaction_from_attrs(parent_span),
                     start_name=start_name,
                 )
             else:
@@ -383,7 +391,8 @@ class TransactionSpanProcessor(SpanProcessor):
                     and member.start_name is not None
                     and str(preset) != member.start_name
                 ):
-                    parent_txn = None
+                    parent_txn = member.inherited_name
+                    parent_member = None
                     if span.parent is not None and span.parent.is_valid:
                         parent_member = self._membership.get(span.parent.span_id)
                         if parent_member is not None:
@@ -393,9 +402,12 @@ class TransactionSpanProcessor(SpanProcessor):
                                 or parent_member.start_name
                             )
                     # Ignore sampler copy of the outer txn onto a nested root.
-                    if parent_member is None or (
+                    if parent_txn is None or (
                         str(preset) != parent_txn
-                        and str(preset) != parent_member.start_name
+                        and (
+                            parent_member is None
+                            or str(preset) != parent_member.start_name
+                        )
                     ):
                         member.override_name = str(preset)
         original_parent_id = 0
