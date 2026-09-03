@@ -50,7 +50,7 @@ def annotate_completed_batch(
         return [strip_transaction_enrichment(span) for span in spans]
 
     txn_name = transaction_name or resolve_batch_transaction_name(spans, membership)
-    named = stamp_transaction_attributes(spans, txn_name)
+    named = stamp_transaction_attributes(spans, txn_name, membership)
     return _annotate_with_self_duration_and_metrics(
         named,
         child_intervals,
@@ -141,6 +141,13 @@ def _copy_with_self_duration(
     if span.context is not None:
         sid = format_span_id(span.context.span_id)
         if sid in self_durations:
+            max_attributes = getattr(getattr(span, "_attributes", None), "maxlen", None)
+            if (
+                isinstance(max_attributes, int)
+                and len(attrs) >= max_attributes
+                and CoralogixAttributes.TRANSACTION_IDENTIFIER in attrs
+            ):
+                return span
             attrs[SELF_DURATION_ATTRIBUTE] = self_durations[sid] / 1_000_000_000.0
     return copy_with_attributes(span, attrs)
 

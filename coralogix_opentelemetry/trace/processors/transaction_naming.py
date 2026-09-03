@@ -166,17 +166,31 @@ def resolve_batch_transaction_name(
 def stamp_transaction_attributes(
     spans: Sequence[ReadableSpan],
     transaction_name: str,
+    membership: Mapping[int, TransactionMembership],
 ) -> list[ReadableSpan]:
     """Stamp ``cgx.transaction`` (and keep root) on every span in the batch."""
     stamped: list[ReadableSpan] = []
     for span in spans:
         attrs: Dict[str, AttributeValue] = dict(span.attributes or {})
-        attrs.pop(CoralogixAttributes.TRANSACTION_EXPLICIT, None)
-        attrs.pop(CoralogixAttributes.TRANSACTION_EXPLICIT.value, None)
-        attrs[CoralogixAttributes.TRANSACTION_IDENTIFIER] = transaction_name
-        if attrs.get(CoralogixAttributes.TRANSACTION_ROOT):
-            attrs[CoralogixAttributes.TRANSACTION_ROOT] = True
-        stamped.append(copy_with_attributes(span, attrs))
+        is_root = bool(attrs.get(CoralogixAttributes.TRANSACTION_ROOT)) or (
+            span.context is not None
+            and membership.get(span.context.span_id) is not None
+            and membership[span.context.span_id].is_root
+        )
+        for key in (
+            CoralogixAttributes.TRANSACTION_IDENTIFIER,
+            CoralogixAttributes.TRANSACTION_ROOT,
+            CoralogixAttributes.TRANSACTION_EXPLICIT,
+            CoralogixAttributes.TRANSACTION_EXPLICIT.value,
+        ):
+            attrs.pop(key, None)
+        prioritized: Dict[str, AttributeValue] = {
+            CoralogixAttributes.TRANSACTION_IDENTIFIER: transaction_name
+        }
+        if is_root:
+            prioritized[CoralogixAttributes.TRANSACTION_ROOT] = True
+        prioritized.update(attrs)
+        stamped.append(copy_with_attributes(span, prioritized))
     return stamped
 
 
