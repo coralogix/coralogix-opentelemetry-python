@@ -332,6 +332,10 @@ class TransactionSpanProcessor(SpanProcessor):
                             CoralogixAttributes.TRANSACTION_ROOT
                         )
                         is True
+                        or (
+                            explicit_transaction_override(parent_span)
+                            and parent_transaction_from_attrs(parent_span) is not None
+                        )
                     )
                 ):
                     parent_member.is_root = True
@@ -378,7 +382,10 @@ class TransactionSpanProcessor(SpanProcessor):
         trace_id = span.context.trace_id
         with self._lock:
             member = self._membership.get((trace_id, span.context.span_id))
-            if member is not None and attrs.get(CoralogixAttributes.TRANSACTION_ROOT):
+            if member is not None and (
+                attrs.get(CoralogixAttributes.TRANSACTION_ROOT)
+                or (explicit_transaction_override(span) and preset is not None)
+            ):
                 # Dynamic root (e.g. start_new_transaction on an INTERNAL child).
                 member.is_root = True
                 member.root_span_id = span.context.span_id
