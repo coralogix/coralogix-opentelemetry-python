@@ -19,10 +19,10 @@ holdback (default 100ms) waits so fire-and-forget children can still join.
 
 For each completed local transaction the export pipeline is:
 
-1. Until the configured span cap plus one ended span on a TraceID, stamp ``cgx.transaction`` from
+1. Until the configured span cap on a TraceID, stamp ``cgx.transaction`` from
    ``override_name ?? root.final_name``, compute exclusive self-duration, and
    record the matching histogram (unit ``s``).
-2. On that 257th span, flush the buffered spans raw and proxy later spans
+2. On that 257th span, flush ended buffered spans raw and proxy later spans
    unchanged, without transaction tags or self-duration metrics.
 """
 from __future__ import annotations
@@ -121,10 +121,12 @@ class TransactionSpanProcessor(SpanProcessor):
         self._lock = threading.Lock()
         self._export_lock = threading.Lock()
         self._buffers: Dict[int, List[ReadableSpan]] = {}
-        # The 257th ended span switches this TraceID to raw passthrough.
+        # The 257th started span switches this TraceID to raw passthrough.
         self._passthrough_traces: Set[int] = set()
         self._pending_passthrough_cleanup: Dict[int, int] = {}
         self._live_parents: Dict[int, Dict[int, int]] = {}
+        # Raw traces need only a count to know when their tombstone can expire.
+        self._passthrough_live_counts: Dict[int, int] = {}
         self._membership: Dict[Tuple[int, int], TransactionMembership] = {}
         self._root_memberships_by_trace: Dict[int, Set[int]] = {}
         # Batches extracted but not yet accept/abandon-finished, per TraceID.
@@ -186,6 +188,7 @@ class TransactionSpanProcessor(SpanProcessor):
         self._passthrough_traces.clear()
         self._pending_passthrough_cleanup.clear()
         self._live_parents.clear()
+        self._passthrough_live_counts.clear()
         self._membership.clear()
         self._root_memberships_by_trace.clear()
         self._pending_completions.clear()
@@ -220,6 +223,7 @@ class TransactionSpanProcessor(SpanProcessor):
 
         trace_id = span.context.trace_id
         span_id = span.context.span_id
+        raw_batches: List[List[ReadableSpan]] = []
 
         with self._lock:
             # After exporter shutdown, do not grow membership — on_end will also
@@ -232,11 +236,14 @@ class TransactionSpanProcessor(SpanProcessor):
                 self._stopped
                 and trace_id not in self._live_parents
                 and trace_id not in self._buffers
+                and trace_id not in self._passthrough_live_counts
             ):
                 return
             if trace_id in self._passthrough_traces:
                 self._cancel_passthrough_cleanup_locked(trace_id)
-                self._live_parents.setdefault(trace_id, {})[span_id] = parent_id
+                self._passthrough_live_counts[trace_id] = (
+                    self._passthrough_live_counts.get(trace_id, 0) + 1
+                )
                 return
 
             # Keep deciding inheritance and registering this live child in one
@@ -265,7 +272,7 @@ class TransactionSpanProcessor(SpanProcessor):
                 >= self._max_traces
             ):
                 self._passthrough_traces.add(trace_id)
-                self._live_parents.setdefault(trace_id, {})[span_id] = parent_id
+                self._passthrough_live_counts[trace_id] = 1
                 return
             parent_has_local = (
                 parent_member is not None
@@ -380,8 +387,21 @@ class TransactionSpanProcessor(SpanProcessor):
                 self._live_child_starts.setdefault((trace_id, parent_id), {})[
                     span_id
                 ] = int(span.start_time or 0)
-            if self._stopped:
-                return
+            if (
+                len(self._buffers.get(trace_id, [])) + len(live)
+                > self._max_transaction_spans
+            ):
+                self._cancel_pending_completion_locked(trace_id)
+                self._cancel_pending_nested_completion_locked(trace_id)
+                self._passthrough_traces.add(trace_id)
+                self._passthrough_live_counts[trace_id] = len(live)
+                self._live_parents.pop(trace_id, None)
+                raw = self._buffers.pop(trace_id, [])
+                if raw:
+                    self._pending_finalize += 1
+                    self._note_inflight_batches_locked([raw])
+                    raw_batches.append(raw)
+        self._dispatch_raw_exports(raw_batches)
 
     def on_end(self, span: ReadableSpan) -> None:
         try:
@@ -455,17 +475,21 @@ class TransactionSpanProcessor(SpanProcessor):
         with self._lock:
             if self._exporter_shutdown:
                 return
-            tracked = trace_id in self._live_parents or trace_id in self._buffers
+            tracked = (
+                trace_id in self._live_parents
+                or trace_id in self._buffers
+                or trace_id in self._passthrough_live_counts
+            )
             if self._stopped and not tracked:
                 return
             if trace_id in self._passthrough_traces:
-                live = self._live_parents.get(trace_id)
-                if live is not None:
-                    live.pop(span.context.span_id, None)
-                    if not live:
-                        self._live_parents.pop(trace_id, None)
+                remaining = self._passthrough_live_counts.get(trace_id, 0) - 1
+                if remaining <= 0:
+                    self._passthrough_live_counts.pop(trace_id, None)
+                else:
+                    self._passthrough_live_counts[trace_id] = remaining
                 raw_batches = [[span]]
-                if not self._live_parents.get(trace_id):
+                if not self._passthrough_live_counts.get(trace_id):
                     self._schedule_passthrough_cleanup_locked(trace_id)
                 self._pending_finalize += 1
                 self._note_inflight_batches_locked(raw_batches)
@@ -498,7 +522,10 @@ class TransactionSpanProcessor(SpanProcessor):
                     self._cancel_pending_nested_completion_locked(trace_id)
                     self._passthrough_traces.add(trace_id)
                     raw_batches = [self._buffers.pop(trace_id)]
-                    if not self._live_parents.get(trace_id):
+                    self._passthrough_live_counts[trace_id] = len(
+                        self._live_parents.pop(trace_id, {})
+                    )
+                    if not self._passthrough_live_counts.get(trace_id):
                         self._schedule_passthrough_cleanup_locked(trace_id)
                 elif self._live_parents.get(trace_id):
                     # Wait for the complete trace so a later overflow cannot
@@ -552,6 +579,7 @@ class TransactionSpanProcessor(SpanProcessor):
                 if (
                     trace_id is not None
                     and not self._live_parents.get(trace_id)
+                    and not self._passthrough_live_counts.get(trace_id)
                     and trace_id not in self._inflight_batches_by_trace
                 ):
                     self._schedule_passthrough_cleanup_locked(trace_id)
@@ -744,6 +772,7 @@ class TransactionSpanProcessor(SpanProcessor):
             if (
                 trace_id is not None
                 and not self._live_parents.get(trace_id)
+                and not self._passthrough_live_counts.get(trace_id)
                 and trace_id not in self._inflight_batches_by_trace
             ):
                 self._schedule_passthrough_cleanup_locked(trace_id)
@@ -983,6 +1012,7 @@ class TransactionSpanProcessor(SpanProcessor):
                 )
                 self._buffers.clear()
                 self._live_parents.clear()
+                self._passthrough_live_counts.clear()
 
             for batch in batches:
                 self._run_accept_completed(batch)
@@ -1011,7 +1041,9 @@ class TransactionSpanProcessor(SpanProcessor):
             self._shutdown_done.set()
 
     def _total_live_locked(self) -> int:
-        return sum(len(live) for live in self._live_parents.values())
+        return sum(len(live) for live in self._live_parents.values()) + sum(
+            self._passthrough_live_counts.values()
+        )
 
     def _wait_for_idle_locked(self, timeout_sec: float) -> None:
         deadline = time.monotonic() + timeout_sec
@@ -1045,6 +1077,7 @@ class TransactionSpanProcessor(SpanProcessor):
                 self._pending_passthrough_cleanup.pop(trace_id, None)
                 if (
                     not self._live_parents.get(trace_id)
+                    and not self._passthrough_live_counts.get(trace_id)
                     and trace_id not in self._inflight_batches_by_trace
                 ):
                     self._passthrough_traces.discard(trace_id)
