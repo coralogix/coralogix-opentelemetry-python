@@ -121,6 +121,7 @@ def has_extractable_nested_transaction(
     *,
     buffer: List[ReadableSpan],
     live: Dict[int, int],
+    root_span_ids: Optional[Set[int]] = None,
 ) -> bool:
     """True when a nested root subtree is done while an outer ancestor is live."""
     if not buffer or not live:
@@ -151,10 +152,13 @@ def has_extractable_nested_transaction(
             return True
         return any(under_root(live_id, root_id) for live_id in live)
 
+    root_span_ids = root_span_ids or set()
     for span in buffer:
         if span.context is None:
             continue
-        if not (span.attributes or {}).get(CoralogixAttributes.TRANSACTION_ROOT):
+        if span.context.span_id not in root_span_ids and not (
+            span.attributes or {}
+        ).get(CoralogixAttributes.TRANSACTION_ROOT):
             continue
         if not has_live_in_subtree(span.context.span_id):
             return True

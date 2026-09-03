@@ -58,7 +58,6 @@ from coralogix_opentelemetry.trace.processors.transaction_finalize import (
 )
 from coralogix_opentelemetry.trace.processors.transaction_naming import (
     TransactionMembership,
-    apply_on_start_root_flag,
     explicit_transaction_override,
     parent_has_transaction_attrs,
     parent_transaction_from_attrs,
@@ -292,8 +291,6 @@ class TransactionSpanProcessor(SpanProcessor):
                 parent_context=parent_context,
                 parent_has_local_transaction=parent_has_local,
             )
-            original_attributes = dict(span.attributes or {})
-            root_flag_added = apply_on_start_root_flag(span, starts)
             start_name = span.name
             preset = preset_transaction_name(span)
 
@@ -334,8 +331,6 @@ class TransactionSpanProcessor(SpanProcessor):
                     inherited_name=inherited_from_ts
                     or parent_transaction_from_attrs(parent_span),
                     start_name=start_name,
-                    root_flag_added=root_flag_added,
-                    raw_attributes=original_attributes if root_flag_added else None,
                 )
                 self._root_memberships_by_trace.setdefault(trace_id, set()).add(span_id)
             else:
@@ -387,7 +382,6 @@ class TransactionSpanProcessor(SpanProcessor):
                     override_name=None,
                     inherited_name=inherited_name,
                     start_name=start_name,
-                    raw_attributes=original_attributes if root_flag_added else None,
                 )
 
             self._cancel_pending_completion_locked(trace_id)
@@ -647,15 +641,10 @@ class TransactionSpanProcessor(SpanProcessor):
                 (member is not None and member.helper_added)
                 or explicit_transaction_name(span) is not None
             )
-            if (member is None or not member.root_flag_added) and not helper_added:
+            if member is None and not helper_added:
                 raw.append(span)
                 continue
             attrs = dict(span.attributes or {})
-            if member is not None and member.root_flag_added:
-                attrs.pop(CoralogixAttributes.TRANSACTION_ROOT, None)
-                if member.raw_attributes is not None:
-                    for key, value in member.raw_attributes.items():
-                        attrs.setdefault(key, value)
             if helper_added:
                 for key in (
                     CoralogixAttributes.TRANSACTION_IDENTIFIER,
@@ -1214,7 +1203,11 @@ class TransactionSpanProcessor(SpanProcessor):
     ) -> List[List[ReadableSpan]]:
         buffer = self._buffers.get(trace_id, [])
         live = self._live_parents.get(trace_id, {})
-        if not has_extractable_nested_transaction(buffer=buffer, live=live):
+        if not has_extractable_nested_transaction(
+            buffer=buffer,
+            live=live,
+            root_span_ids=self._root_memberships_by_trace.get(trace_id),
+        ):
             self._cancel_pending_nested_completion_locked(trace_id)
             return []
         if trace_id in self._pending_nested_completions:
@@ -1245,6 +1238,7 @@ class TransactionSpanProcessor(SpanProcessor):
                 ) and has_extractable_nested_transaction(
                     buffer=self._buffers.get(trace_id, []),
                     live=self._live_parents.get(trace_id, {}),
+                    root_span_ids=self._root_memberships_by_trace.get(trace_id),
                 ):
                     self._schedule_nested_completion_locked(trace_id)
             self._dispatch_accept_completed(batches)
