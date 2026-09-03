@@ -475,6 +475,57 @@ def test_257th_ended_span_flushes_trace_raw_and_enables_passthrough() -> None:
     meter_provider.shutdown()
 
 
+def test_raw_export_does_not_block_span_end() -> None:
+    export_started = threading.Event()
+    release_export = threading.Event()
+
+    class BlockingExporter(ListSpanExporter):
+        def export(self, spans: Sequence[ReadableSpan]) -> SpanExportResult:
+            export_started.set()
+            release_export.wait(timeout=5.0)
+            return super().export(spans)
+
+    exporter = BlockingExporter()
+    processor = TransactionSpanProcessor(
+        exporter, completion_holdback_millis=0, max_transaction_spans=0
+    )
+    provider = TracerProvider()
+    provider.add_span_processor(processor)
+
+    started = time.monotonic()
+    provider.get_tracer("test").start_span("raw", kind=SpanKind.SERVER).end()
+    elapsed = time.monotonic() - started
+    try:
+        assert elapsed < 0.5
+        assert export_started.wait(timeout=1.0)
+    finally:
+        release_export.set()
+    assert provider.force_flush(timeout_millis=2000) is True
+    provider.shutdown()  # type: ignore[no-untyped-call]
+
+
+def test_export_suppresses_instrumentation() -> None:
+    from opentelemetry.context import _SUPPRESS_INSTRUMENTATION_KEY, get_value
+
+    seen: list[object] = []
+
+    class CheckingExporter(ListSpanExporter):
+        def export(self, spans: Sequence[ReadableSpan]) -> SpanExportResult:
+            seen.append(get_value(_SUPPRESS_INSTRUMENTATION_KEY))
+            return super().export(spans)
+
+    exporter = CheckingExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(
+        TransactionSpanProcessor(exporter, completion_holdback_millis=0)
+    )
+    provider.get_tracer("test").start_span("root", kind=SpanKind.SERVER).end()
+
+    assert provider.force_flush() is True
+    assert seen == [True]
+    provider.shutdown()  # type: ignore[no-untyped-call]
+
+
 def test_256_ended_spans_remain_buffered_and_are_enriched() -> None:
     resource = Resource.create({"service.name": "test"})
     exporter = ListSpanExporter()

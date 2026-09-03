@@ -66,7 +66,13 @@ from coralogix_opentelemetry.trace.processors.transaction_naming import (
     preset_transaction_name,
     starts_new_transaction,
 )
-from opentelemetry.context import Context
+from opentelemetry.context import (
+    Context,
+    _SUPPRESS_INSTRUMENTATION_KEY,
+    attach,
+    detach,
+    set_value,
+)
 from opentelemetry.metrics import Histogram, MeterProvider
 from opentelemetry.sdk.trace import ReadableSpan, Span, SpanProcessor
 from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
@@ -148,6 +154,7 @@ class TransactionSpanProcessor(SpanProcessor):
         # Batches extracted by force_flush that could not be queued before the
         # deadline — retained for a later flush instead of being abandoned.
         self._deferred_finalize: List[List[ReadableSpan]] = []
+        self._deferred_raw_finalize: List[List[ReadableSpan]] = []
         self._self_duration_hist: Histogram = create_self_duration_histogram(
             meter_provider
         )
@@ -174,6 +181,7 @@ class TransactionSpanProcessor(SpanProcessor):
         self._finalize_stop = threading.Event()
         self._pending_finalize = 0
         self._deferred_finalize = []
+        self._deferred_raw_finalize = []
         self._buffers.clear()
         self._passthrough_traces.clear()
         self._pending_passthrough_cleanup.clear()
@@ -503,11 +511,10 @@ class TransactionSpanProcessor(SpanProcessor):
                 self._note_inflight_batches_locked(completed_batches + raw_batches)
             if self._total_live_locked() == 0 and self._pending_finalize == 0:
                 self._idle.notify_all()
-        # Enriched batches use the worker. Raw passthrough exports immediately
-        # so a large trace cannot become a processor-owned queue or be dropped.
+        # Both enriched and raw batches use the worker so Span.end never waits
+        # for a stalled exporter.
         self._dispatch_accept_completed(completed_batches)
-        for batch in raw_batches:
-            self._run_raw_export(batch)
+        self._dispatch_raw_exports(raw_batches)
 
     def _run_accept_completed(self, batch: Sequence[ReadableSpan]) -> None:
         """Run finalize/export off the caller's contract: never raise to Span.end."""
@@ -676,7 +683,10 @@ class TransactionSpanProcessor(SpanProcessor):
         with self._lock:
             for batch in batches:
                 payload = list(batch)
-                if len(self._deferred_finalize) >= DEFAULT_MAX_DEFERRED_FINALIZE:
+                if (
+                    len(self._deferred_finalize) + len(self._deferred_raw_finalize)
+                    >= DEFAULT_MAX_DEFERRED_FINALIZE
+                ):
                     overflow.append(payload)
                     continue
                 self._deferred_finalize.append(payload)
@@ -691,17 +701,62 @@ class TransactionSpanProcessor(SpanProcessor):
             )
             self._abandon_completed_batch(batch)
 
+    def _abandon_raw_batch(self, batch: Sequence[ReadableSpan]) -> None:
+        """Drop an over-cap raw batch once all bounded retention is exhausted."""
+        with self._lock:
+            self._pending_finalize -= 1
+            self._finish_inflight_batch_locked(batch)
+            for span in batch:
+                if span.context is not None:
+                    self._forget_span_locked(
+                        span.context.trace_id, span.context.span_id
+                    )
+            self._idle.notify_all()
+
+    def _retain_deferred_raw_batches(
+        self, batches: Sequence[Sequence[ReadableSpan]]
+    ) -> None:
+        """Keep unqueued raw batches for retry within the same bounded cap."""
+        overflow: List[List[ReadableSpan]] = []
+        with self._lock:
+            for batch in batches:
+                payload = list(batch)
+                if (
+                    len(self._deferred_finalize) + len(self._deferred_raw_finalize)
+                    >= DEFAULT_MAX_DEFERRED_FINALIZE
+                ):
+                    overflow.append(payload)
+                    continue
+                self._deferred_raw_finalize.append(payload)
+            self._idle.notify_all()
+        self._retry_deferred_batches()
+        for batch in overflow:
+            _LOG.error(
+                "TransactionSpanProcessor deferred finalize full "
+                "(max=%d); dropping raw batch of %d span(s)",
+                DEFAULT_MAX_DEFERRED_FINALIZE,
+                len(batch),
+            )
+            self._abandon_raw_batch(batch)
+
     def _retry_deferred_batches(self) -> None:
         """Move deferred batches back to the worker whenever capacity returns."""
         while True:
             with self._lock:
-                if not self._deferred_finalize:
+                if self._deferred_finalize:
+                    item: object = self._deferred_finalize[0]
+                elif self._deferred_raw_finalize:
+                    item = ("raw", self._deferred_raw_finalize[0])
+                else:
                     return
                 try:
-                    self._finalize_queue.put_nowait(self._deferred_finalize[0])
+                    self._finalize_queue.put_nowait(item)
                 except queue.Full:
                     return
-                self._deferred_finalize.pop(0)
+                if self._deferred_finalize:
+                    self._deferred_finalize.pop(0)
+                else:
+                    self._deferred_raw_finalize.pop(0)
 
     def _enqueue_finalize_item(
         self, item: object, *, deadline: Optional[float] = None
@@ -765,6 +820,25 @@ class TransactionSpanProcessor(SpanProcessor):
             return False
         return True
 
+    def _dispatch_raw_exports(
+        self,
+        batches: Sequence[Sequence[ReadableSpan]],
+        *,
+        deadline: Optional[float] = None,
+    ) -> bool:
+        """Queue raw exports without blocking the ending application thread."""
+        for index, batch in enumerate(batches):
+            payload = list(batch)
+            if self._enqueue_finalize_item(("raw", payload), deadline=deadline):
+                continue
+            if deadline is None:
+                self._retain_deferred_raw_batches([payload])
+                continue
+            unqueued = [payload] + [list(rest) for rest in batches[index + 1 :]]
+            self._retain_deferred_raw_batches(unqueued)
+            return False
+        return True
+
     def _finalize_loop(self) -> None:
         while True:
             try:
@@ -789,12 +863,16 @@ class TransactionSpanProcessor(SpanProcessor):
                 return True
             deferred = list(self._deferred_finalize)
             self._deferred_finalize = []
+            deferred_raw = list(self._deferred_raw_finalize)
+            self._deferred_raw_finalize = []
             new_batches = self._flush_pending_completions_locked()
             self._note_inflight_batches_locked(new_batches)
             batches = deferred + new_batches
             self._pending_finalize += len(new_batches)
         # Wait for queue capacity within the deadline — retain on timeout.
         if not self._dispatch_accept_completed(batches, deadline=deadline):
+            return False
+        if not self._dispatch_raw_exports(deferred_raw, deadline=deadline):
             return False
         with self._lock:
             while self._pending_finalize > 0:
@@ -845,6 +923,8 @@ class TransactionSpanProcessor(SpanProcessor):
                 holdback_batches = self._flush_pending_completions_locked()
                 deferred = list(self._deferred_finalize)
                 self._deferred_finalize = []
+                deferred_raw = list(self._deferred_raw_finalize)
+                self._deferred_raw_finalize = []
                 extracted: List[List[ReadableSpan]] = []
                 raw_batches: List[List[ReadableSpan]] = []
                 for trace_id in list(self._buffers.keys()):
@@ -869,7 +949,7 @@ class TransactionSpanProcessor(SpanProcessor):
 
             for batch in batches:
                 self._run_accept_completed(batch)
-            for batch in raw_batches:
+            for batch in deferred_raw + raw_batches:
                 self._run_raw_export(batch)
 
             with self._lock:
@@ -1100,10 +1180,14 @@ class TransactionSpanProcessor(SpanProcessor):
         with self._export_lock:
             if self._exporter_shutdown:
                 return
+            token = attach(set_value(_SUPPRESS_INSTRUMENTATION_KEY, True))
             try:
-                result = self._exporter.export(list(spans))
-            except Exception:
-                _LOG.exception("TransactionSpanProcessor failed to export spans")
-                return
+                try:
+                    result = self._exporter.export(list(spans))
+                except Exception:
+                    _LOG.exception("TransactionSpanProcessor failed to export spans")
+                    return
+            finally:
+                detach(token)
             if result is SpanExportResult.FAILURE:
                 _LOG.warning("TransactionSpanProcessor exporter returned FAILURE")
