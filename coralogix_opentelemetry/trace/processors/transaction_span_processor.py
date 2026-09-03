@@ -675,6 +675,19 @@ class TransactionSpanProcessor(SpanProcessor):
             # pending already adjusted above for these batches.
             self._abandon_completed_batch(batch, adjust_pending=False)
 
+    def _retry_deferred_batches(self) -> None:
+        """Move deferred batches back to the worker whenever capacity returns."""
+        while True:
+            with self._lock:
+                if not self._deferred_finalize:
+                    return
+                try:
+                    self._finalize_queue.put_nowait(self._deferred_finalize[0])
+                except queue.Full:
+                    return
+                self._deferred_finalize.pop(0)
+                self._pending_finalize += 1
+
     def _enqueue_finalize_item(
         self, item: object, *, deadline: Optional[float] = None
     ) -> bool:
@@ -752,6 +765,7 @@ class TransactionSpanProcessor(SpanProcessor):
                     self._run_accept_completed(item)
             finally:
                 self._finalize_queue.task_done()
+                self._retry_deferred_batches()
 
     def force_flush(self, timeout_millis: int = 30000) -> bool:
         deadline = time.monotonic() + max(0.001, timeout_millis / 1000.0)

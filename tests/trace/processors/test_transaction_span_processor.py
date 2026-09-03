@@ -730,6 +730,10 @@ def test_finalize_queue_defers_overflow_without_blocking(
     release_exports.set()
     thread.join(timeout=2.0)
     assert completed.is_set()
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline and processor._deferred_finalize:
+        time.sleep(0.01)
+    assert not processor._deferred_finalize, "worker must retry deferred overflow"
     provider.force_flush()
     meter_provider.force_flush()
     span_names = set()
