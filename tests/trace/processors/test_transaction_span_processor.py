@@ -1291,6 +1291,22 @@ def test_trace_cap_counts_completed_nested_transactions() -> None:
     provider.shutdown()  # type: ignore[no-untyped-call]
 
 
+def test_completed_trace_releases_cumulative_span_count() -> None:
+    processor = TransactionSpanProcessor(
+        ListSpanExporter(), completion_holdback_millis=0
+    )
+    provider = TracerProvider()
+    provider.add_span_processor(processor)
+    span = provider.get_tracer("test").start_span("root", kind=SpanKind.SERVER)
+    trace_id = span.get_span_context().trace_id
+    span.end()
+
+    assert provider.force_flush() is True
+    with processor._lock:
+        assert trace_id not in processor._tracked_span_counts
+    provider.shutdown()  # type: ignore[no-untyped-call]
+
+
 def test_deferred_overflow_drops_without_metric_work(monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setattr(
         "coralogix_opentelemetry.trace.processors.transaction_span_processor."
