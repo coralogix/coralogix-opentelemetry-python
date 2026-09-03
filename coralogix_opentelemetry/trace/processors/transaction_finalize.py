@@ -92,19 +92,19 @@ def _annotate_with_self_duration_and_metrics(
     self_durations = self_duration_by_span_id(rows)
     annotated = [_copy_with_self_duration(span, self_durations) for span in spans]
     for span in annotated:
-        attrs = dict(span.attributes or {})
-        self_duration_sec = attrs.get(SELF_DURATION_ATTRIBUTE)
-        if not isinstance(self_duration_sec, (int, float)) or isinstance(
-            self_duration_sec, bool
-        ):
+        if span.context is None:
             continue
+        self_duration_ns = self_durations.get(format_span_id(span.context.span_id))
+        if self_duration_ns is None:
+            continue
+        attrs = dict(span.attributes or {})
         metric_attrs: Dict[str, AttributeValue] = {METRIC_ATTR_SPAN_NAME: span.name}
         txn = attrs.get(CoralogixAttributes.TRANSACTION_IDENTIFIER)
         if txn is not None:
             metric_attrs[CoralogixAttributes.TRANSACTION_IDENTIFIER] = str(txn)
         if attrs.get(CoralogixAttributes.TRANSACTION_ROOT):
             metric_attrs[CoralogixAttributes.TRANSACTION_ROOT] = True
-        self_duration_hist.record(float(self_duration_sec), metric_attrs)
+        self_duration_hist.record(self_duration_ns / 1_000_000_000.0, metric_attrs)
     return annotated
 
 
