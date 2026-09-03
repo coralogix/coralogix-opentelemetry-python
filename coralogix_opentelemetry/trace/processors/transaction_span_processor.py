@@ -516,6 +516,13 @@ class TransactionSpanProcessor(SpanProcessor):
                         self._forget_span_locked(
                             span.context.trace_id, span.context.span_id
                         )
+                trace_id = self._batch_trace_id(batch)
+                if (
+                    trace_id is not None
+                    and not self._live_parents.get(trace_id)
+                    and trace_id not in self._inflight_batches_by_trace
+                ):
+                    self._schedule_passthrough_cleanup_locked(trace_id)
                 self._idle.notify_all()
 
     def _add_child_interval_locked(
@@ -685,7 +692,6 @@ class TransactionSpanProcessor(SpanProcessor):
                     overflow.append(payload)
                     continue
                 self._deferred_finalize.append(payload)
-            self._pending_finalize -= len(batches)
             self._idle.notify_all()
         for batch in overflow:
             _LOG.error(
@@ -694,8 +700,7 @@ class TransactionSpanProcessor(SpanProcessor):
                 DEFAULT_MAX_DEFERRED_FINALIZE,
                 len(batch),
             )
-            # pending already adjusted above for these batches.
-            self._abandon_completed_batch(batch, adjust_pending=False)
+            self._abandon_completed_batch(batch)
 
     def _retry_deferred_batches(self) -> None:
         """Move deferred batches back to the worker whenever capacity returns."""
@@ -708,7 +713,6 @@ class TransactionSpanProcessor(SpanProcessor):
                 except queue.Full:
                     return
                 self._deferred_finalize.pop(0)
-                self._pending_finalize += 1
 
     def _enqueue_finalize_item(
         self, item: object, *, deadline: Optional[float] = None
@@ -799,7 +803,7 @@ class TransactionSpanProcessor(SpanProcessor):
             new_batches = self._flush_pending_completions_locked()
             self._note_inflight_batches_locked(new_batches)
             batches = deferred + new_batches
-            self._pending_finalize += len(batches)
+            self._pending_finalize += len(new_batches)
         # Wait for queue capacity within the deadline — retain on timeout.
         if not self._dispatch_accept_completed(batches, deadline=deadline):
             return False
@@ -931,7 +935,10 @@ class TransactionSpanProcessor(SpanProcessor):
                 if self._pending_passthrough_cleanup.get(trace_id) != token:
                     return
                 self._pending_passthrough_cleanup.pop(trace_id, None)
-                if not self._live_parents.get(trace_id):
+                if (
+                    not self._live_parents.get(trace_id)
+                    and trace_id not in self._inflight_batches_by_trace
+                ):
                     self._passthrough_traces.discard(trace_id)
 
         token = self._holdback.schedule(
