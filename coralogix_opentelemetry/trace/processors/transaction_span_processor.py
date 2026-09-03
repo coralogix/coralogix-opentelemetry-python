@@ -46,7 +46,6 @@ from coralogix_opentelemetry.trace.processors.holdback_scheduler import (
 )
 from coralogix_opentelemetry.trace.processors.span_copy import copy_with_attributes
 from coralogix_opentelemetry.trace.processors.start_new_transaction import (
-    clear_explicit_transaction_name,
     explicit_transaction_name,
 )
 from coralogix_opentelemetry.trace.processors.transaction_extract import (
@@ -561,18 +560,27 @@ class TransactionSpanProcessor(SpanProcessor):
     def _strip_processor_root_flags_locked(
         self, spans: Sequence[ReadableSpan]
     ) -> List[ReadableSpan]:
-        """Remove only root flags the processor added before raw passthrough."""
+        """Remove transaction metadata added by the processor before passthrough."""
         raw: List[ReadableSpan] = []
         for span in spans:
             if span.context is None:
                 raw.append(span)
                 continue
             member = self._membership.get((span.context.trace_id, span.context.span_id))
-            if member is None or not member.root_flag_added:
+            helper_added = explicit_transaction_name(span) is not None
+            if (member is None or not member.root_flag_added) and not helper_added:
                 raw.append(span)
                 continue
             attrs = dict(span.attributes or {})
-            attrs.pop(CoralogixAttributes.TRANSACTION_ROOT, None)
+            if member is not None and member.root_flag_added:
+                attrs.pop(CoralogixAttributes.TRANSACTION_ROOT, None)
+            if helper_added:
+                for key in (
+                    CoralogixAttributes.TRANSACTION_IDENTIFIER,
+                    CoralogixAttributes.TRANSACTION_ROOT,
+                    CoralogixAttributes.TRANSACTION_EXPLICIT,
+                ):
+                    attrs.pop(key, None)
             raw.append(copy_with_attributes(span, attrs))
         return raw
 
@@ -619,7 +627,6 @@ class TransactionSpanProcessor(SpanProcessor):
     def _forget_span_locked(self, trace_id: int, span_id: int) -> None:
         """Drop side-table rows for a span that will not be exported."""
         span_key = (trace_id, span_id)
-        clear_explicit_transaction_name(trace_id, span_id)
         member = self._membership.pop(span_key, None)
         if member is not None and member.is_root:
             roots = self._root_memberships_by_trace.get(trace_id)
