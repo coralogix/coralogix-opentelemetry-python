@@ -19,6 +19,9 @@ from coralogix_opentelemetry.trace.processors import (
 from coralogix_opentelemetry.trace.processors.self_duration import (
     self_duration_by_span_id,
 )
+from coralogix_opentelemetry.trace.processors.transaction_naming import (
+    TransactionMembership,
+)
 from opentelemetry import trace
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import InMemoryMetricReader
@@ -443,7 +446,11 @@ def test_side_tables_survive_until_last_inflight_batch() -> None:
     # Outer still open; nested exported. Side tables for this TraceID must remain
     # so outer finalize can still resolve names/intervals.
     with processor._lock:
-        assert processor._membership.get(outer.get_span_context().span_id) is not None
+        outer_context = outer.get_span_context()
+        assert (
+            processor._membership.get((outer_context.trace_id, outer_context.span_id))
+            is not None
+        )
     outer.end()
     provider.force_flush()
     fulfill = [
@@ -471,14 +478,15 @@ def test_disjoint_child_intervals_use_bounded_covered_aggregate() -> None:
 
     root = tracer.start_span("root", kind=SpanKind.SERVER)
     root_ctx = trace.set_span_in_context(root)
-    root_id = root.get_span_context().span_id
+    root_context = root.get_span_context()
+    root_key = (root_context.trace_id, root_context.span_id)
     for index in range(40):
         child = tracer.start_span("child-{}".format(index), context=root_ctx)
         time.sleep(0.002)
         child.end()
     with processor._lock:
-        residual = processor._child_intervals.get(root_id, [])
-        covered = processor._child_covered_ns.get(root_id, 0)
+        residual = processor._child_intervals.get(root_key, [])
+        covered = processor._child_covered_ns.get(root_key, 0)
         assert len(residual) <= 1
         assert covered > 0
         aggregate = covered + sum(end - start for start, end in residual)
@@ -1585,16 +1593,16 @@ def test_folded_child_coverage_keeps_live_overlap_geometry() -> None:
     processor = TransactionSpanProcessor(ListSpanExporter())
     with processor._lock:
         # A child that began at 5 remains live while two siblings finish.
-        processor._live_child_starts[1] = {4: 5}
+        processor._live_child_starts[(1, 1)] = {4: 5}
         processor._add_child_interval_locked(1, 1, 0, 10)
         processor._add_child_interval_locked(1, 1, 20, 30)
-        assert processor._child_covered_ns[1] == 5
-        assert processor._child_intervals[1] == [(5, 10), (20, 30)]
+        assert processor._child_covered_ns[(1, 1)] == 5
+        assert processor._child_intervals[(1, 1)] == [(5, 10), (20, 30)]
 
-        processor._live_child_starts.pop(1)
+        processor._live_child_starts.pop((1, 1))
         processor._add_child_interval_locked(1, 1, 5, 40)
-        assert processor._child_covered_ns[1] == 40
-        assert 1 not in processor._child_intervals
+        assert processor._child_covered_ns[(1, 1)] == 40
+        assert (1, 1) not in processor._child_intervals
     processor.shutdown()
 
 
@@ -1604,8 +1612,34 @@ def test_folded_child_coverage_clamps_to_ended_parent() -> None:
         processor._buffers[1] = [_readable("root", span_id=1, root=True, end=100)]
         processor._add_child_interval_locked(1, 1, 0, 60)
         processor._add_child_interval_locked(1, 1, 80, 200)
-        assert processor._child_covered_ns[1] == 80
-        assert 1 not in processor._child_intervals
+        assert processor._child_covered_ns[(1, 1)] == 80
+        assert (1, 1) not in processor._child_intervals
+    processor.shutdown()
+
+
+def test_side_tables_do_not_collide_for_same_span_id_in_different_traces() -> None:
+    exporter = ListSpanExporter()
+    processor = TransactionSpanProcessor(exporter)
+    first = _readable("first", trace_id=1, span_id=1, root=True)
+    second = _readable("second", trace_id=2, span_id=1, root=True)
+    with processor._lock:
+        processor._membership[(1, 1)] = TransactionMembership(
+            root_span_id=1, is_root=True, override_name="first-transaction"
+        )
+        processor._membership[(2, 1)] = TransactionMembership(
+            root_span_id=1, is_root=True, override_name="second-transaction"
+        )
+
+    processor._accept_completed_trace([first])
+    processor._accept_completed_trace([second])
+
+    assert [
+        span.attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER]
+        for span in exporter.spans
+    ] == [
+        "first-transaction",
+        "second-transaction",
+    ]
     processor.shutdown()
 
 
