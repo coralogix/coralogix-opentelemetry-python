@@ -26,7 +26,7 @@ from opentelemetry import trace
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 from opentelemetry.sdk.resources import Resource
-from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
+from opentelemetry.sdk.trace import ReadableSpan, SpanLimits, TracerProvider
 from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
 from opentelemetry.trace import SpanKind
 from pytest import MonkeyPatch
@@ -109,6 +109,27 @@ def test_processor_tags_and_self_duration_without_sampler() -> None:
 
     provider.shutdown()  # type: ignore[no-untyped-call]
     meter_provider.shutdown()
+
+
+def test_processor_preserves_transaction_metadata_at_attribute_limit() -> None:
+    for max_attributes in (1, 2):
+        exporter = ListSpanExporter()
+        provider = TracerProvider(span_limits=SpanLimits(max_attributes=max_attributes))
+        provider.add_span_processor(
+            TransactionSpanProcessor(exporter, completion_holdback_millis=0)
+        )
+        span = provider.get_tracer("test").start_span("root", kind=SpanKind.SERVER)
+        span.set_attribute("application.attribute", "value")
+        span.end()
+        provider.force_flush()
+
+        exported = exporter.spans[0]
+        attrs = exported.attributes or {}
+        assert attrs[CoralogixAttributes.TRANSACTION_IDENTIFIER] == "root"
+        assert SELF_DURATION_ATTRIBUTE not in attrs
+        if max_attributes == 2:
+            assert attrs[CoralogixAttributes.TRANSACTION_ROOT] is True
+        provider.shutdown()  # type: ignore[no-untyped-call]
 
 
 def test_inherits_transaction_from_parent_tracestate_when_parent_has_no_attributes() -> (
@@ -468,8 +489,8 @@ def test_side_tables_survive_until_last_inflight_batch() -> None:
     provider.shutdown()  # type: ignore[no-untyped-call]
 
 
-def test_disjoint_child_intervals_use_bounded_covered_aggregate() -> None:
-    """Sequential children under a live root must not grow an interval list."""
+def test_disjoint_child_intervals_preserve_geometry() -> None:
+    """Sequential children retain exact coverage for later backdated siblings."""
     exporter = ListSpanExporter()
     processor = TransactionSpanProcessor(exporter, completion_holdback_millis=0)
     provider = TracerProvider()
@@ -485,11 +506,9 @@ def test_disjoint_child_intervals_use_bounded_covered_aggregate() -> None:
         time.sleep(0.002)
         child.end()
     with processor._lock:
-        residual = processor._child_intervals.get(root_key, [])
-        covered = processor._child_covered_ns.get(root_key, 0)
-        assert len(residual) <= 1
-        assert covered > 0
-        aggregate = covered + sum(end - start for start, end in residual)
+        intervals = processor._child_intervals.get(root_key, [])
+        assert len(intervals) == 40
+        aggregate = sum(end - start for start, end in intervals)
         assert aggregate > 0
     root.end()
     provider.force_flush()
@@ -497,7 +516,7 @@ def test_disjoint_child_intervals_use_bounded_covered_aggregate() -> None:
     assert len(roots) == 1
     self_sec = roots[0].attributes[SELF_DURATION_ATTRIBUTE]
     wall_sec = (roots[0].end_time - roots[0].start_time) / 1_000_000_000.0
-    # Exclusive self-duration must subtract folded child coverage (not ≈ wall).
+    # Exclusive self-duration must subtract retained child coverage (not ≈ wall).
     assert self_sec < wall_sec
     assert self_sec >= 0
     provider.shutdown()  # type: ignore[no-untyped-call]
@@ -1589,31 +1608,25 @@ def _readable(
     )
 
 
-def test_folded_child_coverage_keeps_live_overlap_geometry() -> None:
+def test_child_coverage_keeps_backdated_overlap_geometry() -> None:
     processor = TransactionSpanProcessor(ListSpanExporter())
     with processor._lock:
-        # A child that began at 5 remains live while two siblings finish.
-        processor._live_child_starts[(1, 1)] = {4: 5}
         processor._add_child_interval_locked(1, 1, 0, 10)
         processor._add_child_interval_locked(1, 1, 20, 30)
-        assert processor._child_covered_ns[(1, 1)] == 5
-        assert processor._child_intervals[(1, 1)] == [(5, 10), (20, 30)]
+        assert processor._child_intervals[(1, 1)] == [(0, 10), (20, 30)]
 
-        processor._live_child_starts.pop((1, 1))
         processor._add_child_interval_locked(1, 1, 5, 40)
-        assert processor._child_covered_ns[(1, 1)] == 40
-        assert (1, 1) not in processor._child_intervals
+        assert processor._child_intervals[(1, 1)] == [(0, 40)]
     processor.shutdown()
 
 
-def test_folded_child_coverage_clamps_to_ended_parent() -> None:
+def test_child_coverage_clamps_to_ended_parent() -> None:
     processor = TransactionSpanProcessor(ListSpanExporter())
     with processor._lock:
         processor._buffers[1] = [_readable("root", span_id=1, root=True, end=100)]
         processor._add_child_interval_locked(1, 1, 0, 60)
         processor._add_child_interval_locked(1, 1, 80, 200)
-        assert processor._child_covered_ns[(1, 1)] == 80
-        assert (1, 1) not in processor._child_intervals
+        assert processor._child_intervals[(1, 1)] == [(0, 60), (80, 100)]
     processor.shutdown()
 
 

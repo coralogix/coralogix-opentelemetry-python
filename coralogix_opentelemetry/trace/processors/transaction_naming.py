@@ -184,12 +184,10 @@ def stamp_transaction_attributes(
             CoralogixAttributes.TRANSACTION_EXPLICIT.value,
         ):
             attrs.pop(key, None)
-        prioritized: Dict[str, AttributeValue] = {
-            CoralogixAttributes.TRANSACTION_IDENTIFIER: transaction_name
-        }
+        prioritized: Dict[str, AttributeValue] = dict(attrs)
         if is_root:
             prioritized[CoralogixAttributes.TRANSACTION_ROOT] = True
-        prioritized.update(attrs)
+        prioritized[CoralogixAttributes.TRANSACTION_IDENTIFIER] = transaction_name
         stamped.append(copy_with_attributes(span, prioritized))
     return stamped
 
