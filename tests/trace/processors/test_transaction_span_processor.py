@@ -1268,6 +1268,58 @@ def test_force_flush_waits_for_queue_capacity_instead_of_dropping(
     assert {"a", "b", "c"} <= names
 
 
+def test_trace_cap_counts_completed_nested_transactions() -> None:
+    exporter = ListSpanExporter()
+    processor = TransactionSpanProcessor(
+        exporter, completion_holdback_millis=0, max_transaction_spans=3
+    )
+    provider = TracerProvider()
+    provider.add_span_processor(processor)
+    tracer = provider.get_tracer("test")
+
+    outer = tracer.start_span("outer", kind=SpanKind.SERVER)
+    outer_context = trace.set_span_in_context(outer)
+    for name in ("first", "second"):
+        tracer.start_span(name, kind=SpanKind.SERVER, context=outer_context).end()
+        assert provider.force_flush() is True
+    third = tracer.start_span("third", kind=SpanKind.SERVER, context=outer_context)
+
+    with processor._lock:
+        assert outer.get_span_context().trace_id in processor._passthrough_traces
+    third.end()
+    outer.end()
+    provider.shutdown()  # type: ignore[no-untyped-call]
+
+
+def test_deferred_overflow_drops_without_metric_work(monkeypatch: MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "coralogix_opentelemetry.trace.processors.transaction_span_processor."
+        "DEFAULT_MAX_DEFERRED_FINALIZE",
+        0,
+    )
+    processor = TransactionSpanProcessor(ListSpanExporter())
+    batch = [_readable("dropped", trace_id=1, span_id=1)]
+
+    class SlowHistogram:
+        calls = 0
+
+        def record(self, *args: object, **kwargs: object) -> None:
+            self.calls += 1
+            time.sleep(1.0)
+
+    histogram = SlowHistogram()
+    processor._self_duration_hist = histogram  # type: ignore[assignment]
+    with processor._lock:
+        processor._pending_finalize = 1
+        processor._note_inflight_batches_locked([batch])
+    started = time.monotonic()
+    processor._retain_deferred_batches([batch])
+
+    assert time.monotonic() - started < 0.1
+    assert histogram.calls == 0
+    processor.shutdown()
+
+
 def test_deferred_finalize_is_bounded(monkeypatch: MonkeyPatch) -> None:
     """Timed-out force_flush retention must not grow without a cap."""
     monkeypatch.setattr(
