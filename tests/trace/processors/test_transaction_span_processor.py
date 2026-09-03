@@ -497,6 +497,77 @@ def test_raw_passthrough_preserves_sampler_root_flag() -> None:
     provider.shutdown()  # type: ignore[no-untyped-call]
 
 
+def test_raw_passthrough_strips_start_new_transaction_metadata() -> None:
+    exporter = ListSpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(
+        TransactionSpanProcessor(
+            exporter, completion_holdback_millis=0, max_transaction_spans=0
+        )
+    )
+    tracer = provider.get_tracer("test")
+
+    outer = tracer.start_span("outer", kind=SpanKind.SERVER)
+    inner = tracer.start_span("inner", context=trace.set_span_in_context(outer))
+    start_new_transaction(inner, "nested")
+    inner.end()
+    outer.end()
+
+    assert provider.force_flush() is True
+    attrs = next(
+        span.attributes or {} for span in exporter.spans if span.name == "inner"
+    )
+    for key in (
+        CoralogixAttributes.TRANSACTION_IDENTIFIER,
+        CoralogixAttributes.TRANSACTION_ROOT,
+        CoralogixAttributes.TRANSACTION_EXPLICIT,
+    ):
+        assert key not in attrs
+    provider.shutdown()  # type: ignore[no-untyped-call]
+
+
+def test_start_new_transaction_name_survives_multiple_processors() -> None:
+    finalized = threading.Event()
+
+    class SignalingProcessor(TransactionSpanProcessor):
+        def _forget_span_locked(self, trace_id: int, span_id: int) -> None:
+            super()._forget_span_locked(trace_id, span_id)
+            finalized.set()
+
+    class WaitingProcessor(TransactionSpanProcessor):
+        def _on_end_impl(self, span: ReadableSpan) -> None:
+            if span.name == "inner":
+                assert finalized.wait(timeout=5)
+            super()._on_end_impl(span)
+
+    first_exporter = ListSpanExporter()
+    second_exporter = ListSpanExporter()
+    provider = TracerProvider(span_limits=SpanLimits(max_attributes=1))
+    provider.add_span_processor(
+        SignalingProcessor(
+            first_exporter, completion_holdback_millis=0, max_transaction_spans=0
+        )
+    )
+    provider.add_span_processor(
+        WaitingProcessor(second_exporter, completion_holdback_millis=0)
+    )
+    tracer = provider.get_tracer("test")
+
+    outer = tracer.start_span("outer", kind=SpanKind.SERVER)
+    inner = tracer.start_span("inner", context=trace.set_span_in_context(outer))
+    start_new_transaction(inner, "custom-name")
+    inner.end()
+    outer.end()
+
+    assert provider.force_flush() is True
+    by_name = {span.name: span for span in second_exporter.spans}
+    assert (
+        by_name["inner"].attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER]
+        == "custom-name"
+    )
+    provider.shutdown()  # type: ignore[no-untyped-call]
+
+
 def test_raw_export_does_not_block_span_end() -> None:
     export_started = threading.Event()
     release_export = threading.Event()

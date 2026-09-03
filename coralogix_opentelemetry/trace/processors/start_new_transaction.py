@@ -43,12 +43,6 @@ def explicit_transaction_name(span: object) -> Optional[str]:
         return _explicit_names.get(key)
 
 
-def clear_explicit_transaction_name(trace_id: int, span_id: int) -> None:
-    """Release explicit transaction intent after processor-side span cleanup."""
-    with _explicit_names_lock:
-        _explicit_names.pop((trace_id, span_id), None)
-
-
 def start_new_transaction(span: Span, name: str) -> Span:
     key = _span_key(span)
     if key is not None:
