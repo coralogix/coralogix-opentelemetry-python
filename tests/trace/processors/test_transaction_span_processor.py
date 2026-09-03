@@ -572,7 +572,7 @@ def test_raw_passthrough_restores_original_attributes_after_repeated_helper_call
     None
 ):
     exporter = ListSpanExporter()
-    provider = TracerProvider()
+    provider = TracerProvider(span_limits=SpanLimits(max_attributes=1))
     provider.add_span_processor(
         TransactionSpanProcessor(
             exporter, completion_holdback_millis=0, max_transaction_spans=0
@@ -596,6 +596,42 @@ def test_raw_passthrough_restores_original_attributes_after_repeated_helper_call
         span.attributes or {} for span in exporter.spans if span.name == "inner"
     )
     assert attrs == {"application.attribute": "value"}
+    provider.shutdown()  # type: ignore[no-untyped-call]
+
+
+def test_raw_passthrough_does_not_restore_processor_root_from_helper() -> None:
+    exporter = ListSpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(
+        TransactionSpanProcessor(
+            exporter, completion_holdback_millis=0, max_transaction_spans=0
+        )
+    )
+    root = provider.get_tracer("test").start_span("root", kind=SpanKind.SERVER)
+    start_new_transaction(root, "custom")
+    root.end()
+
+    assert provider.force_flush() is True
+    attrs = exporter.spans[0].attributes or {}
+    assert CoralogixAttributes.TRANSACTION_ROOT not in attrs
+    provider.shutdown()  # type: ignore[no-untyped-call]
+
+
+def test_multiple_processors_restore_the_original_attribute_limit() -> None:
+    first_exporter = ListSpanExporter()
+    second_exporter = ListSpanExporter()
+    provider = TracerProvider(span_limits=SpanLimits(max_attributes=1))
+    provider.add_span_processor(
+        TransactionSpanProcessor(first_exporter, completion_holdback_millis=0)
+    )
+    provider.add_span_processor(
+        TransactionSpanProcessor(second_exporter, completion_holdback_millis=0)
+    )
+    provider.get_tracer("test").start_span("root", kind=SpanKind.SERVER).end()
+
+    assert provider.force_flush() is True
+    assert len(first_exporter.spans[0].attributes or {}) <= 1
+    assert len(second_exporter.spans[0].attributes or {}) <= 1
     provider.shutdown()  # type: ignore[no-untyped-call]
 
 
