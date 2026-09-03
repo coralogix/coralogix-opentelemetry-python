@@ -545,9 +545,9 @@ class TransactionSpanProcessor(SpanProcessor):
                     if not self._passthrough_live_counts.get(trace_id):
                         self._schedule_passthrough_cleanup_locked(trace_id)
                 elif self._live_parents.get(trace_id):
-                    # Wait for the complete trace so a later overflow cannot
-                    # leave an already-exported nested batch enriched.
-                    pass
+                    completed_batches = self._schedule_nested_completion_locked(
+                        trace_id
+                    )
                 elif self._buffers.get(trace_id):
                     self._cancel_pending_nested_completion_locked(trace_id)
                     completed_batches = self._schedule_completion_locked(trace_id)
@@ -650,15 +650,12 @@ class TransactionSpanProcessor(SpanProcessor):
             if (member is None or not member.root_flag_added) and not helper_added:
                 raw.append(span)
                 continue
-            attrs = (
-                dict(member.raw_attributes)
-                if member is not None
-                and member.root_flag_added
-                and member.raw_attributes is not None
-                else dict(span.attributes or {})
-            )
+            attrs = dict(span.attributes or {})
             if member is not None and member.root_flag_added:
                 attrs.pop(CoralogixAttributes.TRANSACTION_ROOT, None)
+                if member.raw_attributes is not None:
+                    for key, value in member.raw_attributes.items():
+                        attrs.setdefault(key, value)
             if helper_added:
                 for key in (
                     CoralogixAttributes.TRANSACTION_IDENTIFIER,
