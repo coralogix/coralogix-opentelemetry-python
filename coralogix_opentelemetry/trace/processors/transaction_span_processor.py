@@ -803,6 +803,12 @@ class TransactionSpanProcessor(SpanProcessor):
         left = self._inflight_batches_by_trace.get(trace_id, 0) - 1
         if left <= 0:
             self._inflight_batches_by_trace.pop(trace_id, None)
+            if (
+                not self._live_parents.get(trace_id)
+                and not self._buffers.get(trace_id)
+                and trace_id not in self._passthrough_traces
+            ):
+                self._tracked_span_counts.pop(trace_id, None)
         else:
             self._inflight_batches_by_trace[trace_id] = left
 
