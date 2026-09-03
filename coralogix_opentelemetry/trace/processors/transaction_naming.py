@@ -13,6 +13,8 @@ early span name (frameworks may ``update_name`` later, e.g. ``GET`` →
 from __future__ import annotations
 
 from dataclasses import dataclass
+import threading
+import weakref
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 from coralogix_opentelemetry.trace.common import (
@@ -24,6 +26,38 @@ from opentelemetry.context import Context
 from opentelemetry.sdk.trace import ReadableSpan, Span
 from opentelemetry.trace import SpanKind, get_current_span
 from opentelemetry.util.types import AttributeValue
+
+_processor_root_markers: set[Tuple[int, int]] = set()
+_processor_root_markers_lock = threading.Lock()
+
+
+def _span_key(span: object) -> Optional[Tuple[int, int]]:
+    context = getattr(span, "context", None)
+    if context is None:
+        context = getattr(span, "get_span_context", lambda: None)()
+    if context is None or not getattr(context, "is_valid", False):
+        return None
+    return (int(context.trace_id), int(context.span_id))
+
+
+def mark_processor_root(span: Span) -> None:
+    key = _span_key(span)
+    if key is None:
+        return
+    with _processor_root_markers_lock:
+        _processor_root_markers.add(key)
+    try:
+        weakref.finalize(span, _processor_root_markers.discard, key)
+    except TypeError:
+        pass
+
+
+def has_processor_root_marker(span: Span) -> bool:
+    key = _span_key(span)
+    if key is None:
+        return False
+    with _processor_root_markers_lock:
+        return key in _processor_root_markers
 
 
 @dataclass
