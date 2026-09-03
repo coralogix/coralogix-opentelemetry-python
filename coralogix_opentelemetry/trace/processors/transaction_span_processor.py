@@ -73,7 +73,7 @@ from opentelemetry.context import (
     set_value,
 )
 from opentelemetry.metrics import Histogram, MeterProvider
-from opentelemetry.sdk.trace import ReadableSpan, Span, SpanProcessor
+from opentelemetry.sdk.trace import BoundedAttributes, ReadableSpan, Span, SpanProcessor
 from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
 from opentelemetry.trace import get_current_span
 
@@ -291,6 +291,20 @@ class TransactionSpanProcessor(SpanProcessor):
                 parent_context=parent_context,
                 parent_has_local_transaction=parent_has_local,
             )
+            root_flag_added = False
+            raw_attribute_limit = None
+            if starts and not (span.attributes or {}).get(
+                CoralogixAttributes.TRANSACTION_ROOT
+            ):
+                bounded = getattr(span, "_attributes", None)
+                if (
+                    isinstance(bounded, BoundedAttributes)
+                    and bounded.maxlen is not None
+                ):
+                    raw_attribute_limit = bounded.maxlen
+                    bounded.maxlen += 1
+                span.set_attribute(CoralogixAttributes.TRANSACTION_ROOT, True)
+                root_flag_added = True
             start_name = span.name
             preset = preset_transaction_name(span)
 
@@ -331,6 +345,8 @@ class TransactionSpanProcessor(SpanProcessor):
                     inherited_name=inherited_from_ts
                     or parent_transaction_from_attrs(parent_span),
                     start_name=start_name,
+                    root_flag_added=root_flag_added,
+                    raw_attribute_limit=raw_attribute_limit,
                 )
                 self._root_memberships_by_trace.setdefault(trace_id, set()).add(span_id)
             else:
@@ -382,6 +398,8 @@ class TransactionSpanProcessor(SpanProcessor):
                     override_name=None,
                     inherited_name=inherited_name,
                     start_name=start_name,
+                    root_flag_added=root_flag_added,
+                    raw_attribute_limit=raw_attribute_limit,
                 )
 
             self._cancel_pending_completion_locked(trace_id)
@@ -641,10 +659,12 @@ class TransactionSpanProcessor(SpanProcessor):
                 (member is not None and member.helper_added)
                 or explicit_transaction_name(span) is not None
             )
-            if member is None and not helper_added:
+            if (member is None or not member.root_flag_added) and not helper_added:
                 raw.append(span)
                 continue
             attrs = dict(span.attributes or {})
+            if member is not None and member.root_flag_added:
+                attrs.pop(CoralogixAttributes.TRANSACTION_ROOT, None)
             if helper_added:
                 for key in (
                     CoralogixAttributes.TRANSACTION_IDENTIFIER,
@@ -652,7 +672,15 @@ class TransactionSpanProcessor(SpanProcessor):
                     CoralogixAttributes.TRANSACTION_EXPLICIT,
                 ):
                     attrs.pop(key, None)
-            raw.append(copy_with_attributes(span, attrs))
+            raw.append(
+                copy_with_attributes(
+                    span,
+                    attrs,
+                    max_attributes=member.raw_attribute_limit
+                    if member is not None
+                    else None,
+                )
+            )
         return raw
 
     def _add_child_interval_locked(

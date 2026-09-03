@@ -36,6 +36,8 @@ class TransactionMembership:
     inherited_name: Optional[str] = None
     # Span name observed at on_start (before framework update_name).
     start_name: Optional[str] = None
+    root_flag_added: bool = False
+    raw_attribute_limit: Optional[int] = None
     # start_new_transaction() stores its name outside span attributes; retain
     # that provenance through delayed raw export.
     helper_added: bool = False

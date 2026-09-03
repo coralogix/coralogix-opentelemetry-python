@@ -34,14 +34,16 @@ def _passthrough_links(span: ReadableSpan) -> Any:
 
 
 def _attributes_preserving_dropped(
-    span: ReadableSpan, attributes: Mapping[str, AttributeValue]
+    span: ReadableSpan,
+    attributes: Mapping[str, AttributeValue],
+    maxlen: Optional[int] = None,
 ) -> Any:
     """Rebuild attributes while keeping the original dropped-attribute count."""
     original = getattr(span, "_attributes", None)
     if not isinstance(original, BoundedAttributes):
         return dict(attributes)
     rebuilt = BoundedAttributes(
-        maxlen=original.maxlen,
+        maxlen=original.maxlen if maxlen is None else maxlen,
         attributes=None,
         immutable=False,
         max_value_len=original.max_value_len,
@@ -71,14 +73,17 @@ def copy_with_parent(span: ReadableSpan, parent: Optional[SpanContext]) -> Reada
 
 
 def copy_with_attributes(
-    span: ReadableSpan, attributes: Mapping[str, AttributeValue]
+    span: ReadableSpan,
+    attributes: Mapping[str, AttributeValue],
+    *,
+    max_attributes: Optional[int] = None,
 ) -> ReadableSpan:
     return ReadableSpan(
         name=span.name,
         context=span.context,
         parent=span.parent,
         resource=span.resource if span.resource is not None else Resource.create({}),
-        attributes=_attributes_preserving_dropped(span, attributes),
+        attributes=_attributes_preserving_dropped(span, attributes, max_attributes),
         events=_passthrough_events(span),
         links=_passthrough_links(span),
         kind=span.kind,
