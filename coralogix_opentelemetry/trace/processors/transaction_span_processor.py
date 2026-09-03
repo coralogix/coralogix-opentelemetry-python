@@ -44,6 +44,10 @@ from coralogix_opentelemetry.trace.processors.defaults import (
 from coralogix_opentelemetry.trace.processors.holdback_scheduler import (
     HoldbackScheduler,
 )
+from coralogix_opentelemetry.trace.processors.start_new_transaction import (
+    clear_explicit_transaction_name,
+    explicit_transaction_name,
+)
 from coralogix_opentelemetry.trace.processors.transaction_extract import (
     extract_completed_local_transactions,
     has_extractable_nested_transaction,
@@ -324,6 +328,7 @@ class TransactionSpanProcessor(SpanProcessor):
                 # start_new_transaction() may mark the parent as a root after
                 # the parent's on_start recorded is_root=False. Promote it so
                 # children join the nested transaction.
+                parent_explicit_name = explicit_transaction_name(parent_span)
                 if (
                     parent_member is not None
                     and parent_id
@@ -336,6 +341,7 @@ class TransactionSpanProcessor(SpanProcessor):
                             explicit_transaction_override(parent_span)
                             and parent_transaction_from_attrs(parent_span) is not None
                         )
+                        or parent_explicit_name is not None
                     )
                 ):
                     parent_member.is_root = True
@@ -343,10 +349,12 @@ class TransactionSpanProcessor(SpanProcessor):
                     self._root_memberships_by_trace.setdefault(trace_id, set()).add(
                         parent_id
                     )
-                    if explicit_transaction_override(parent_span):
-                        parent_preset = parent_transaction_from_attrs(parent_span)
-                        if parent_preset is not None:
-                            parent_member.override_name = parent_preset
+                    parent_preset = (
+                        parent_explicit_name
+                        or parent_transaction_from_attrs(parent_span)
+                    )
+                    if parent_preset is not None:
+                        parent_member.override_name = parent_preset
                     root_span_id = parent_id
                 self._membership[(trace_id, span_id)] = TransactionMembership(
                     root_span_id=root_span_id,
@@ -379,12 +387,14 @@ class TransactionSpanProcessor(SpanProcessor):
         # start_new_transaction may set an explicit override after on_start.
         attrs = span.attributes or {}
         preset = attrs.get(CoralogixAttributes.TRANSACTION_IDENTIFIER)
+        explicit_name = explicit_transaction_name(span)
         trace_id = span.context.trace_id
         with self._lock:
             member = self._membership.get((trace_id, span.context.span_id))
             if member is not None and (
                 attrs.get(CoralogixAttributes.TRANSACTION_ROOT)
                 or (explicit_transaction_override(span) and preset is not None)
+                or explicit_name is not None
             ):
                 # Dynamic root (e.g. start_new_transaction on an INTERNAL child).
                 member.is_root = True
@@ -392,8 +402,14 @@ class TransactionSpanProcessor(SpanProcessor):
                 self._root_memberships_by_trace.setdefault(trace_id, set()).add(
                     span.context.span_id
                 )
-            if member is not None and member.is_root and preset is not None:
-                if explicit_transaction_override(span):
+            if (
+                member is not None
+                and member.is_root
+                and (preset is not None or explicit_name is not None)
+            ):
+                if explicit_name is not None:
+                    member.override_name = explicit_name
+                elif explicit_transaction_override(span):
                     member.override_name = str(preset)
                 elif (
                     not member.override_name
@@ -574,6 +590,7 @@ class TransactionSpanProcessor(SpanProcessor):
     def _forget_span_locked(self, trace_id: int, span_id: int) -> None:
         """Drop side-table rows for a span that will not be exported."""
         span_key = (trace_id, span_id)
+        clear_explicit_transaction_name(trace_id, span_id)
         member = self._membership.pop(span_key, None)
         if member is not None and member.is_root:
             roots = self._root_memberships_by_trace.get(trace_id)
