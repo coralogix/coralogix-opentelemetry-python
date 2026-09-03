@@ -355,7 +355,7 @@ def test_nested_server_with_sampler_does_not_inherit_outer_override() -> None:
         with tracer.start_as_current_span("inner", kind=SpanKind.SERVER):
             pass
         provider.force_flush()
-        assert exporter.spans == []
+        assert {span.name for span in exporter.spans} == {"inner"}
 
     outer.end()
     provider.force_flush()
@@ -512,6 +512,28 @@ def test_raw_passthrough_restores_attribute_evicted_by_processor_root_flag() -> 
     assert provider.force_flush() is True
     attrs = exporter.spans[0].attributes or {}
     assert attrs["application.attribute"] == "value"
+    assert CoralogixAttributes.TRANSACTION_ROOT not in attrs
+    provider.shutdown()  # type: ignore[no-untyped-call]
+
+
+def test_raw_passthrough_keeps_attributes_added_after_start() -> None:
+    exporter = ListSpanExporter()
+    provider = TracerProvider(span_limits=SpanLimits(max_attributes=3))
+    provider.add_span_processor(
+        TransactionSpanProcessor(
+            exporter, completion_holdback_millis=0, max_transaction_spans=0
+        )
+    )
+    span = provider.get_tracer("test").start_span(
+        "root", kind=SpanKind.SERVER, attributes={"application.attribute": "value"}
+    )
+    span.set_attribute("http.route", "/orders")
+    span.end()
+
+    assert provider.force_flush() is True
+    attrs = exporter.spans[0].attributes or {}
+    assert attrs["application.attribute"] == "value"
+    assert attrs["http.route"] == "/orders"
     assert CoralogixAttributes.TRANSACTION_ROOT not in attrs
     provider.shutdown()  # type: ignore[no-untyped-call]
 
@@ -1985,7 +2007,7 @@ def test_nested_server_finalizes_while_outer_still_open() -> None:
 
         provider.force_flush()
         names = {span.name for span in exporter.spans}
-        assert names == set(), "nested local transaction must wait for the outer trace"
+        assert names == {"inner", "db"}
 
     outer.end()
     provider.force_flush()
