@@ -27,7 +27,7 @@ from opentelemetry.sdk.trace import ReadableSpan, Span
 from opentelemetry.trace import SpanKind, get_current_span
 from opentelemetry.util.types import AttributeValue
 
-_processor_root_markers: set[Tuple[int, int]] = set()
+_processor_root_markers: Dict[Tuple[int, int], Optional[int]] = {}
 _processor_root_markers_lock = threading.Lock()
 
 
@@ -40,24 +40,37 @@ def _span_key(span: object) -> Optional[Tuple[int, int]]:
     return (int(context.trace_id), int(context.span_id))
 
 
-def mark_processor_root(span: Span) -> None:
+def mark_processor_root(span: Span, raw_attribute_limit: Optional[int]) -> None:
     key = _span_key(span)
     if key is None:
         return
     with _processor_root_markers_lock:
-        _processor_root_markers.add(key)
+        _processor_root_markers[key] = raw_attribute_limit
     try:
-        weakref.finalize(span, _processor_root_markers.discard, key)
+        weakref.finalize(span, _clear_processor_root_marker, key)
     except TypeError:
         pass
 
 
-def has_processor_root_marker(span: Span) -> bool:
+def _clear_processor_root_marker(key: Tuple[int, int]) -> None:
+    with _processor_root_markers_lock:
+        _processor_root_markers.pop(key, None)
+
+
+def has_processor_root_marker(span: object) -> bool:
     key = _span_key(span)
     if key is None:
         return False
     with _processor_root_markers_lock:
         return key in _processor_root_markers
+
+
+def processor_root_attribute_limit(span: object) -> Optional[int]:
+    key = _span_key(span)
+    if key is None:
+        return None
+    with _processor_root_markers_lock:
+        return _processor_root_markers.get(key)
 
 
 @dataclass

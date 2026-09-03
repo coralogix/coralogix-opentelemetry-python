@@ -46,6 +46,7 @@ from coralogix_opentelemetry.trace.processors.holdback_scheduler import (
 )
 from coralogix_opentelemetry.trace.processors.span_copy import copy_with_attributes
 from coralogix_opentelemetry.trace.processors.start_new_transaction import (
+    explicit_transaction_attribute_limit,
     explicit_transaction_name,
     explicit_transaction_previous_attributes,
 )
@@ -63,6 +64,7 @@ from coralogix_opentelemetry.trace.processors.transaction_naming import (
     has_processor_root_marker,
     mark_processor_root,
     parent_has_transaction_attrs,
+    processor_root_attribute_limit,
     parent_transaction_from_attrs,
     parent_transaction_from_tracestate,
     preset_transaction_name,
@@ -98,6 +100,20 @@ def _restart_processor_after_fork(
     processor = processor_ref()
     if processor is not None:
         processor._restart_after_fork()
+
+
+def _copy_with_original_attribute_limit(
+    span: ReadableSpan, max_attributes: Optional[int]
+) -> ReadableSpan:
+    """Restore the SDK limit while retaining transaction metadata first."""
+    attrs = dict(span.attributes or {})
+    root = attrs.pop(CoralogixAttributes.TRANSACTION_ROOT, None)
+    transaction = attrs.pop(CoralogixAttributes.TRANSACTION_IDENTIFIER, None)
+    if root is not None:
+        attrs[CoralogixAttributes.TRANSACTION_ROOT] = root
+    if transaction is not None:
+        attrs[CoralogixAttributes.TRANSACTION_IDENTIFIER] = transaction
+    return copy_with_attributes(span, attrs, max_attributes=max_attributes)
 
 
 class TransactionSpanProcessor(SpanProcessor):
@@ -307,8 +323,10 @@ class TransactionSpanProcessor(SpanProcessor):
                     raw_attribute_limit = bounded.maxlen
                     bounded.maxlen += 1
                 span.set_attribute(CoralogixAttributes.TRANSACTION_ROOT, True)
-                mark_processor_root(span)
+                mark_processor_root(span, raw_attribute_limit)
             root_flag_added = has_processor_root_marker(span)
+            if raw_attribute_limit is None:
+                raw_attribute_limit = processor_root_attribute_limit(span)
             start_name = span.name
             preset = preset_transaction_name(span)
 
@@ -443,6 +461,7 @@ class TransactionSpanProcessor(SpanProcessor):
         preset = attrs.get(CoralogixAttributes.TRANSACTION_IDENTIFIER)
         explicit_name = explicit_transaction_name(span)
         explicit_previous_attrs = explicit_transaction_previous_attributes(span)
+        explicit_attribute_limit = explicit_transaction_attribute_limit(span)
         trace_id = span.context.trace_id
         with self._lock:
             member = self._membership.get((trace_id, span.context.span_id))
@@ -460,6 +479,8 @@ class TransactionSpanProcessor(SpanProcessor):
             if member is not None and explicit_name is not None:
                 member.helper_added = True
                 member.helper_previous_attributes = explicit_previous_attrs
+                if member.raw_attribute_limit is None:
+                    member.raw_attribute_limit = explicit_attribute_limit
             if (
                 member is not None
                 and member.is_root
@@ -1336,12 +1357,9 @@ class TransactionSpanProcessor(SpanProcessor):
             max_enriched_spans=self._max_transaction_spans,
         )
         annotated = [
-            copy_with_attributes(
+            _copy_with_original_attribute_limit(
                 span,
-                dict(span.attributes or {}),
-                max_attributes=membership_snapshot[
-                    span.context.span_id
-                ].raw_attribute_limit,
+                membership_snapshot[span.context.span_id].raw_attribute_limit,
             )
             if span.context is not None
             and span.context.span_id in membership_snapshot

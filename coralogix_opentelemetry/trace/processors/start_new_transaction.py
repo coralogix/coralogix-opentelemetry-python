@@ -13,12 +13,18 @@ import weakref
 from typing import Dict, Optional, Tuple
 
 from coralogix_opentelemetry.trace.common import CoralogixAttributes
+from coralogix_opentelemetry.trace.processors.transaction_naming import (
+    has_processor_root_marker,
+    processor_root_attribute_limit,
+)
+from opentelemetry.sdk.trace import BoundedAttributes
 from opentelemetry.trace import Span
 from opentelemetry.util.types import AttributeValue
 
 
 _explicit_names: Dict[
-    Tuple[int, int], Tuple[str, Dict[CoralogixAttributes, AttributeValue]]
+    Tuple[int, int],
+    Tuple[str, Dict[CoralogixAttributes, AttributeValue], Optional[int]],
 ] = {}
 _explicit_names_lock = threading.Lock()
 
@@ -58,6 +64,15 @@ def explicit_transaction_previous_attributes(
         return dict(state[1]) if state is not None else {}
 
 
+def explicit_transaction_attribute_limit(span: object) -> Optional[int]:
+    key = _span_key(span)
+    if key is None:
+        return None
+    with _explicit_names_lock:
+        state = _explicit_names.get(key)
+        return state[2] if state is not None else None
+
+
 def start_new_transaction(span: Span, name: str) -> Span:
     attrs = getattr(span, "attributes", None) or {}
     previous = {
@@ -69,13 +84,26 @@ def start_new_transaction(span: Span, name: str) -> Span:
         )
         if key in attrs
     }
+    if has_processor_root_marker(span):
+        previous.pop(CoralogixAttributes.TRANSACTION_ROOT, None)
     key = _span_key(span)
+    prior = None
     if key is not None:
         with _explicit_names_lock:
             prior = _explicit_names.get(key)
-            if prior is not None:
-                previous = prior[1]
-            _explicit_names[key] = (name, previous)
+    if prior is not None:
+        previous = prior[1]
+        raw_attribute_limit = prior[2]
+    else:
+        raw_attribute_limit = processor_root_attribute_limit(span)
+        bounded = getattr(span, "_attributes", None)
+        if isinstance(bounded, BoundedAttributes) and bounded.maxlen is not None:
+            if raw_attribute_limit is None:
+                raw_attribute_limit = bounded.maxlen
+            bounded.maxlen += 3
+    if key is not None:
+        with _explicit_names_lock:
+            _explicit_names[key] = (name, previous, raw_attribute_limit)
         try:
             weakref.finalize(span, _clear_explicit_name, key)
         except TypeError:
