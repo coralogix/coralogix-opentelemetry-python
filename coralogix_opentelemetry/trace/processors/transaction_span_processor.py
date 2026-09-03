@@ -1335,6 +1335,21 @@ class TransactionSpanProcessor(SpanProcessor):
             self_duration_hist=self._self_duration_hist,
             max_enriched_spans=self._max_transaction_spans,
         )
+        annotated = [
+            copy_with_attributes(
+                span,
+                dict(span.attributes or {}),
+                max_attributes=membership_snapshot[
+                    span.context.span_id
+                ].raw_attribute_limit,
+            )
+            if span.context is not None
+            and span.context.span_id in membership_snapshot
+            and membership_snapshot[span.context.span_id].raw_attribute_limit
+            is not None
+            else span
+            for span in annotated
+        ]
 
         try:
             self._export_spans(annotated)
