@@ -47,6 +47,7 @@ from coralogix_opentelemetry.trace.processors.holdback_scheduler import (
 from coralogix_opentelemetry.trace.processors.span_copy import copy_with_attributes
 from coralogix_opentelemetry.trace.processors.start_new_transaction import (
     explicit_transaction_name,
+    explicit_transaction_previous_attributes,
 )
 from coralogix_opentelemetry.trace.processors.transaction_extract import (
     extract_completed_local_transactions,
@@ -438,6 +439,7 @@ class TransactionSpanProcessor(SpanProcessor):
         attrs = span.attributes or {}
         preset = attrs.get(CoralogixAttributes.TRANSACTION_IDENTIFIER)
         explicit_name = explicit_transaction_name(span)
+        explicit_previous_attrs = explicit_transaction_previous_attributes(span)
         trace_id = span.context.trace_id
         with self._lock:
             member = self._membership.get((trace_id, span.context.span_id))
@@ -454,6 +456,7 @@ class TransactionSpanProcessor(SpanProcessor):
                 )
             if member is not None and explicit_name is not None:
                 member.helper_added = True
+                member.helper_previous_attributes = explicit_previous_attrs
             if (
                 member is not None
                 and member.is_root
@@ -666,12 +669,19 @@ class TransactionSpanProcessor(SpanProcessor):
             if member is not None and member.root_flag_added:
                 attrs.pop(CoralogixAttributes.TRANSACTION_ROOT, None)
             if helper_added:
+                previous_attrs = (
+                    member.helper_previous_attributes
+                    if member is not None
+                    and member.helper_previous_attributes is not None
+                    else explicit_transaction_previous_attributes(span)
+                )
                 for key in (
                     CoralogixAttributes.TRANSACTION_IDENTIFIER,
                     CoralogixAttributes.TRANSACTION_ROOT,
                     CoralogixAttributes.TRANSACTION_EXPLICIT,
                 ):
                     attrs.pop(key, None)
+                attrs.update(previous_attrs)  # type: ignore[arg-type]
             raw.append(
                 copy_with_attributes(
                     span,

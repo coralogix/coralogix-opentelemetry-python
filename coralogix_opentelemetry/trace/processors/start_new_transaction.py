@@ -14,9 +14,12 @@ from typing import Dict, Optional, Tuple
 
 from coralogix_opentelemetry.trace.common import CoralogixAttributes
 from opentelemetry.trace import Span
+from opentelemetry.util.types import AttributeValue
 
 
-_explicit_names: Dict[Tuple[int, int], str] = {}
+_explicit_names: Dict[
+    Tuple[int, int], Tuple[str, Dict[CoralogixAttributes, AttributeValue]]
+] = {}
 _explicit_names_lock = threading.Lock()
 
 
@@ -40,14 +43,36 @@ def explicit_transaction_name(span: object) -> Optional[str]:
     if key is None:
         return None
     with _explicit_names_lock:
-        return _explicit_names.get(key)
+        state = _explicit_names.get(key)
+        return state[0] if state is not None else None
+
+
+def explicit_transaction_previous_attributes(
+    span: object,
+) -> Dict[CoralogixAttributes, AttributeValue]:
+    key = _span_key(span)
+    if key is None:
+        return {}
+    with _explicit_names_lock:
+        state = _explicit_names.get(key)
+        return dict(state[1]) if state is not None else {}
 
 
 def start_new_transaction(span: Span, name: str) -> Span:
+    attrs = getattr(span, "attributes", None) or {}
+    previous = {
+        key: attrs[key]
+        for key in (
+            CoralogixAttributes.TRANSACTION_IDENTIFIER,
+            CoralogixAttributes.TRANSACTION_ROOT,
+            CoralogixAttributes.TRANSACTION_EXPLICIT,
+        )
+        if key in attrs
+    }
     key = _span_key(span)
     if key is not None:
         with _explicit_names_lock:
-            _explicit_names[key] = name
+            _explicit_names[key] = (name, previous)
         try:
             weakref.finalize(span, _clear_explicit_name, key)
         except TypeError:

@@ -41,6 +41,9 @@ class TransactionMembership:
     # start_new_transaction() stores its name outside span attributes; retain
     # that provenance through delayed raw export.
     helper_added: bool = False
+    helper_previous_attributes: Optional[
+        Dict[CoralogixAttributes, AttributeValue]
+    ] = None
 
 
 def starts_new_transaction(
