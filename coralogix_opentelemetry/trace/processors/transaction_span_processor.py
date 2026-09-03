@@ -123,6 +123,7 @@ class TransactionSpanProcessor(SpanProcessor):
         self._pending_passthrough_cleanup: Dict[int, int] = {}
         self._live_parents: Dict[int, Dict[int, int]] = {}
         self._membership: Dict[Tuple[int, int], TransactionMembership] = {}
+        self._root_memberships_by_trace: Dict[int, Set[int]] = {}
         # Batches extracted but not yet accept/abandon-finished, per TraceID.
         # Side tables must outlive the first queued batch when several share a
         # TraceID (nested + outer extracted together).
@@ -183,6 +184,7 @@ class TransactionSpanProcessor(SpanProcessor):
         self._pending_passthrough_cleanup.clear()
         self._live_parents.clear()
         self._membership.clear()
+        self._root_memberships_by_trace.clear()
         self._pending_completions.clear()
         self._pending_nested_completions.clear()
         self._inflight_batches_by_trace.clear()
@@ -316,6 +318,7 @@ class TransactionSpanProcessor(SpanProcessor):
                     or parent_transaction_from_attrs(parent_span),
                     start_name=start_name,
                 )
+                self._root_memberships_by_trace.setdefault(trace_id, set()).add(span_id)
             else:
                 root_span_id = (
                     parent_member.root_span_id
@@ -343,6 +346,9 @@ class TransactionSpanProcessor(SpanProcessor):
                 ):
                     parent_member.is_root = True
                     parent_member.root_span_id = parent_id
+                    self._root_memberships_by_trace.setdefault(trace_id, set()).add(
+                        parent_id
+                    )
                     if explicit_transaction_override(parent_span):
                         parent_preset = parent_transaction_from_attrs(parent_span)
                         if parent_preset is not None:
@@ -386,6 +392,9 @@ class TransactionSpanProcessor(SpanProcessor):
                 # Dynamic root (e.g. start_new_transaction on an INTERNAL child).
                 member.is_root = True
                 member.root_span_id = span.context.span_id
+                self._root_memberships_by_trace.setdefault(trace_id, set()).add(
+                    span.context.span_id
+                )
             if member is not None and member.is_root and preset is not None:
                 if explicit_transaction_override(span):
                     member.override_name = str(preset)
@@ -604,7 +613,13 @@ class TransactionSpanProcessor(SpanProcessor):
     def _forget_span_locked(self, trace_id: int, span_id: int) -> None:
         """Drop side-table rows for a span that will not be exported."""
         span_key = (trace_id, span_id)
-        self._membership.pop(span_key, None)
+        member = self._membership.pop(span_key, None)
+        if member is not None and member.is_root:
+            roots = self._root_memberships_by_trace.get(trace_id)
+            if roots is not None:
+                roots.discard(span_id)
+                if not roots:
+                    self._root_memberships_by_trace.pop(trace_id, None)
         self._child_intervals.pop(span_key, None)
         self._child_covered_ns.pop(span_key, None)
         self._live_child_starts.pop(span_key, None)
@@ -693,6 +708,7 @@ class TransactionSpanProcessor(SpanProcessor):
                     continue
                 self._deferred_finalize.append(payload)
             self._idle.notify_all()
+        self._retry_deferred_batches()
         for batch in overflow:
             _LOG.error(
                 "TransactionSpanProcessor deferred finalize full "
@@ -891,6 +907,7 @@ class TransactionSpanProcessor(SpanProcessor):
                 self._child_covered_ns.clear()
                 self._live_child_starts.clear()
                 self._membership.clear()
+                self._root_memberships_by_trace.clear()
                 self._inflight_batches_by_trace.clear()
                 self._passthrough_traces.clear()
                 self._pending_passthrough_cleanup.clear()
@@ -1063,11 +1080,7 @@ class TransactionSpanProcessor(SpanProcessor):
         if not buffer:
             return []
         live = self._live_parents.get(trace_id, {})
-        root_span_ids = {
-            span_id
-            for (member_trace_id, span_id), member in self._membership.items()
-            if member_trace_id == trace_id and member.is_root
-        }
+        root_span_ids = self._root_memberships_by_trace.get(trace_id, set())
         batches, remaining = extract_completed_local_transactions(
             buffer=buffer,
             live=live,
