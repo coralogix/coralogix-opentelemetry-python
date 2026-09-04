@@ -3,4 +3,5 @@ max-line-length = 150
 extend-ignore = E203,N805
 exclude =
     venv/
+    .venv/
     **/__init__.py F401

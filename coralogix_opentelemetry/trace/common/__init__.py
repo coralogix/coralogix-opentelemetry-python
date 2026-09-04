@@ -9,6 +9,8 @@ class CoralogixAttributes(str, Enum):
     TRANSACTION_IDENTIFIER = "cgx.transaction"
     DISTRIBUTED_TRANSACTION_IDENTIFIER = "cgx.transaction.distributed"
     TRANSACTION_ROOT = "cgx.transaction.root"
+    # Marks an application start_new_transaction() override (not a sampler echo).
+    TRANSACTION_EXPLICIT = "cgx.transaction.explicit"
 
 
 class CoralogixTraceState:
