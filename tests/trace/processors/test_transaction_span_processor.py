@@ -2012,10 +2012,7 @@ def test_trace_limit_rejection_does_not_retain_trace_ids() -> None:
     rejected[0].end()
     assert provider.force_flush() is True
     exported = next(span for span in exporter.spans if span.name == "rejected-0")
-    assert not any(
-        str(key).startswith("cgx.transaction._passthrough.")
-        for key in (exported.attributes or {})
-    )
+    assert "cgx.transaction._passthrough" not in (exported.attributes or {})
     assert rejected[0].get_span_context().trace_state.get("cgx-passthrough") is None
     retained.end()
     provider.shutdown()  # type: ignore[no-untyped-call]
@@ -2048,10 +2045,52 @@ def test_trace_limit_markers_are_isolated_between_processors() -> None:
         assert CoralogixAttributes.TRANSACTION_IDENTIFIER not in (
             exported.attributes or {}
         )
-        assert not any(
-            str(key).startswith("cgx.transaction._passthrough.")
-            for key in (exported.attributes or {})
+        assert "cgx.transaction._passthrough" not in (exported.attributes or {})
+    provider.shutdown()  # type: ignore[no-untyped-call]
+
+
+def test_trace_limit_marker_survives_application_attribute_churn() -> None:
+    exporter = ListSpanExporter()
+    provider = TracerProvider(span_limits=SpanLimits(max_attributes=1))
+    provider.add_span_processor(
+        TransactionSpanProcessor(exporter, completion_holdback_millis=0, max_traces=1)
+    )
+    tracer = provider.get_tracer("test")
+
+    retained = tracer.start_span("retained", kind=SpanKind.SERVER)
+    rejected = tracer.start_span("rejected", kind=SpanKind.SERVER)
+    rejected.set_attribute("first", "value")
+    rejected.set_attribute("second", "value")
+    rejected.end()
+    retained.end()
+    assert provider.force_flush() is True
+    exported = next(span for span in exporter.spans if span.name == "rejected")
+    assert CoralogixAttributes.TRANSACTION_IDENTIFIER not in (exported.attributes or {})
+    assert SELF_DURATION_ATTRIBUTE not in (exported.attributes or {})
+    provider.shutdown()  # type: ignore[no-untyped-call]
+
+
+def test_raw_trace_limit_export_strips_sibling_processor_root_marker() -> None:
+    raw_exporter = ListSpanExporter()
+    enriched_exporter = ListSpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(
+        TransactionSpanProcessor(
+            raw_exporter, completion_holdback_millis=0, max_traces=1
         )
+    )
+    provider.add_span_processor(
+        TransactionSpanProcessor(enriched_exporter, completion_holdback_millis=0)
+    )
+    tracer = provider.get_tracer("test")
+
+    retained = tracer.start_span("retained", kind=SpanKind.SERVER)
+    rejected = tracer.start_span("rejected", kind=SpanKind.SERVER)
+    rejected.end()
+    retained.end()
+    assert provider.force_flush() is True
+    raw = next(span for span in raw_exporter.spans if span.name == "rejected")
+    assert CoralogixAttributes.TRANSACTION_ROOT not in (raw.attributes or {})
     provider.shutdown()  # type: ignore[no-untyped-call]
 
 
