@@ -1987,6 +1987,32 @@ def test_processor_uses_configured_trace_limit() -> None:
     provider.shutdown()  # type: ignore[no-untyped-call]
 
 
+def test_trace_limit_rejection_does_not_retain_trace_ids() -> None:
+    exporter = ListSpanExporter()
+    processor = TransactionSpanProcessor(
+        exporter, completion_holdback_millis=0, max_traces=1
+    )
+    provider = TracerProvider()
+    provider.add_span_processor(processor)
+    tracer = provider.get_tracer("test")
+
+    retained = tracer.start_span("retained", kind=SpanKind.SERVER)
+    rejected = [
+        tracer.start_span("rejected-{}".format(index), kind=SpanKind.SERVER)
+        for index in range(1000)
+    ]
+    with processor._lock:
+        assert set(processor._live_parents) == {retained.get_span_context().trace_id}
+        assert not processor._passthrough_traces
+        assert not processor._passthrough_live_counts
+
+    # Keeping these spans active proves capacity rejection retains no per-trace
+    # processor state, even when the rejected trace count is large.
+    assert len(rejected) == 1000
+    retained.end()
+    provider.shutdown()  # type: ignore[no-untyped-call]
+
+
 def test_processor_records_self_duration_for_all_130_spans() -> None:
     reader = InMemoryMetricReader()
     meter_provider = MeterProvider(metric_readers=[reader])
@@ -2097,6 +2123,41 @@ def test_processor_restarts_workers_after_fork() -> None:
         os.close(write_fd)
         os._exit(0)
     os.close(write_fd)
+    assert os.read(read_fd, 1) == b"1"
+    os.close(read_fd)
+    assert os.waitpid(pid, 0)[1] == 0
+    provider.shutdown()  # type: ignore[no-untyped-call]
+
+
+def test_processor_recreates_module_locks_after_fork() -> None:
+    if not hasattr(os, "fork"):
+        return
+    from coralogix_opentelemetry.trace.processors import start_new_transaction as helper
+    from coralogix_opentelemetry.trace.processors import transaction_naming
+
+    explicit_lock = helper.__globals__["_explicit_names_lock"]
+    root_lock = transaction_naming._processor_root_markers_lock
+    explicit_lock.acquire()
+    root_lock.acquire()
+    read_fd, write_fd = os.pipe()
+    exporter = ListSpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(
+        TransactionSpanProcessor(exporter, completion_holdback_millis=0)
+    )
+    tracer = provider.get_tracer("test")
+    pid = os.fork()
+    if pid == 0:
+        os.close(read_fd)
+        span = tracer.start_span("child", kind=SpanKind.SERVER)
+        helper(span, "named")
+        span.end()
+        os.write(write_fd, b"1")
+        os.close(write_fd)
+        os._exit(0)
+    os.close(write_fd)
+    explicit_lock.release()
+    root_lock.release()
     assert os.read(read_fd, 1) == b"1"
     os.close(read_fd)
     assert os.waitpid(pid, 0)[1] == 0

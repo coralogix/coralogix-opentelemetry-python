@@ -29,6 +29,13 @@ _explicit_names: Dict[
 _explicit_names_lock = threading.Lock()
 
 
+def restart_after_fork() -> None:
+    """Discard parent-only explicit-name state in a fork child."""
+    global _explicit_names, _explicit_names_lock
+    _explicit_names = {}
+    _explicit_names_lock = threading.Lock()
+
+
 def _span_key(span: object) -> Optional[Tuple[int, int]]:
     context = getattr(span, "context", None)
     if context is None:
