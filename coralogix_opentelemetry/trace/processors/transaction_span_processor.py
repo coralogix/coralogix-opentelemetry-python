@@ -49,6 +49,7 @@ from coralogix_opentelemetry.trace.processors.start_new_transaction import (
     explicit_transaction_attribute_limit,
     explicit_transaction_name,
     explicit_transaction_previous_attributes,
+    restart_after_fork as restart_explicit_transaction_state_after_fork,
 )
 from coralogix_opentelemetry.trace.processors.transaction_extract import (
     extract_completed_local_transactions,
@@ -68,6 +69,7 @@ from coralogix_opentelemetry.trace.processors.transaction_naming import (
     parent_transaction_from_attrs,
     parent_transaction_from_tracestate,
     preset_transaction_name,
+    restart_after_fork as restart_transaction_naming_state_after_fork,
     starts_new_transaction,
 )
 from opentelemetry.context import (
@@ -80,7 +82,7 @@ from opentelemetry.context import (
 from opentelemetry.metrics import Histogram, MeterProvider
 from opentelemetry.sdk.trace import BoundedAttributes, ReadableSpan, Span, SpanProcessor
 from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
-from opentelemetry.trace import get_current_span
+from opentelemetry.trace import SpanContext, get_current_span
 
 _LOG = logging.getLogger(__name__)
 
@@ -92,6 +94,7 @@ _HOLD_PASSTHROUGH = "passthrough"
 DEFAULT_MAX_FINALIZE_QUEUE = 256
 # Cap batches retained across timed-out force_flush calls (same order as the queue).
 DEFAULT_MAX_DEFERRED_FINALIZE = DEFAULT_MAX_FINALIZE_QUEUE
+_RAW_PASSTHROUGH_TRACESTATE_KEY = "cgx-passthrough"
 
 
 def _restart_processor_after_fork(
@@ -114,6 +117,34 @@ def _copy_with_original_attribute_limit(
     if transaction is not None:
         attrs[CoralogixAttributes.TRANSACTION_IDENTIFIER] = transaction
     return copy_with_attributes(span, attrs, max_attributes=max_attributes)
+
+
+def _is_stateless_raw_passthrough(span: object) -> bool:
+    context = getattr(span, "context", None)
+    if context is None:
+        context = getattr(span, "get_span_context", lambda: None)()
+    return bool(
+        context is not None
+        and getattr(context, "trace_state", None) is not None
+        and context.trace_state.get(_RAW_PASSTHROUGH_TRACESTATE_KEY) == "1"
+    )
+
+
+def _mark_stateless_raw_passthrough(span: object) -> None:
+    """Keep max-trace rejection on the span, never in a trace-ID side table."""
+    context = getattr(span, "context", None)
+    if context is None:
+        return
+    trace_state = context.trace_state.add(_RAW_PASSTHROUGH_TRACESTATE_KEY, "1")
+    if trace_state == context.trace_state:
+        return
+    span._context = SpanContext(  # type: ignore[attr-defined]
+        context.trace_id,
+        context.span_id,
+        context.is_remote,
+        context.trace_flags,
+        trace_state,
+    )
 
 
 class TransactionSpanProcessor(SpanProcessor):
@@ -200,6 +231,8 @@ class TransactionSpanProcessor(SpanProcessor):
 
     def _restart_after_fork(self) -> None:
         """Discard parent-only pending work and recreate child worker state."""
+        restart_explicit_transaction_state_after_fork()
+        restart_transaction_naming_state_after_fork()
         self._lock = threading.Lock()
         self._export_lock = threading.Lock()
         self._idle = threading.Condition(self._lock)
@@ -244,6 +277,9 @@ class TransactionSpanProcessor(SpanProcessor):
             return
 
         parent_span = get_current_span(parent_context)
+        if _is_stateless_raw_passthrough(parent_span):
+            _mark_stateless_raw_passthrough(span)
+            return
         parent_id = 0
         if span.parent is not None and span.parent.is_valid:
             parent_id = span.parent.span_id
@@ -298,8 +334,7 @@ class TransactionSpanProcessor(SpanProcessor):
                 )
                 >= self._max_traces
             ):
-                self._passthrough_traces.add(trace_id)
-                self._passthrough_live_counts[trace_id] = 1
+                _mark_stateless_raw_passthrough(span)
                 return
             parent_has_local = (
                 parent_member is not None
@@ -537,7 +572,10 @@ class TransactionSpanProcessor(SpanProcessor):
             )
             if self._stopped and not tracked:
                 return
-            if trace_id in self._passthrough_traces:
+            if _is_stateless_raw_passthrough(span):
+                raw_batches = [[span]]
+                self._schedule_raw_batch_locked(raw_batches[0])
+            elif trace_id in self._passthrough_traces:
                 remaining = self._passthrough_live_counts.get(trace_id, 0) - 1
                 if remaining <= 0:
                     self._passthrough_live_counts.pop(trace_id, None)
@@ -644,6 +682,7 @@ class TransactionSpanProcessor(SpanProcessor):
                 next_raw_batches = self._advance_raw_export_chain_locked(batch)
                 if (
                     trace_id is not None
+                    and trace_id in self._passthrough_traces
                     and not self._live_parents.get(trace_id)
                     and not self._passthrough_live_counts.get(trace_id)
                     and trace_id not in self._inflight_batches_by_trace
@@ -871,6 +910,7 @@ class TransactionSpanProcessor(SpanProcessor):
             trace_id = self._batch_trace_id(batch)
             if (
                 trace_id is not None
+                and trace_id in self._passthrough_traces
                 and not self._live_parents.get(trace_id)
                 and not self._passthrough_live_counts.get(trace_id)
                 and trace_id not in self._inflight_batches_by_trace

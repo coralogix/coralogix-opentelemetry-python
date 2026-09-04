@@ -31,6 +31,13 @@ _processor_root_markers: Dict[Tuple[int, int], Optional[int]] = {}
 _processor_root_markers_lock = threading.Lock()
 
 
+def restart_after_fork() -> None:
+    """Discard parent-only root markers in a fork child."""
+    global _processor_root_markers, _processor_root_markers_lock
+    _processor_root_markers = {}
+    _processor_root_markers_lock = threading.Lock()
+
+
 def _span_key(span: object) -> Optional[Tuple[int, int]]:
     context = getattr(span, "context", None)
     if context is None:
