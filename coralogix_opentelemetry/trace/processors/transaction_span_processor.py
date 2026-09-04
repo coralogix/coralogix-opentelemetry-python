@@ -95,7 +95,7 @@ _HOLD_PASSTHROUGH = "passthrough"
 DEFAULT_MAX_FINALIZE_QUEUE = 256
 # Cap batches retained across timed-out force_flush calls (same order as the queue).
 DEFAULT_MAX_DEFERRED_FINALIZE = DEFAULT_MAX_FINALIZE_QUEUE
-_RAW_PASSTHROUGH_ATTRIBUTE = "cgx.transaction._passthrough"
+_RAW_PASSTHROUGH_ATTRIBUTE_PREFIX = "cgx.transaction._passthrough."
 
 
 def _restart_processor_after_fork(
@@ -140,7 +140,9 @@ class TransactionSpanProcessor(SpanProcessor):
             max_transaction_spans
         )
         self._max_traces = resolve_max_traces(max_traces)
-        self._raw_passthrough_token = uuid.uuid4().hex
+        self._raw_passthrough_attribute = (
+            _RAW_PASSTHROUGH_ATTRIBUTE_PREFIX + uuid.uuid4().hex
+        )
         self._lock = threading.Lock()
         self._export_lock = threading.Lock()
         self._buffers: Dict[int, List[ReadableSpan]] = {}
@@ -705,7 +707,11 @@ class TransactionSpanProcessor(SpanProcessor):
             member = self._membership.get((span.context.trace_id, span.context.span_id))
             if self._is_stateless_raw_passthrough(span):
                 attrs = dict(span.attributes or {})
-                attrs.pop(_RAW_PASSTHROUGH_ATTRIBUTE, None)
+                attrs = {
+                    key: value
+                    for key, value in attrs.items()
+                    if not str(key).startswith(_RAW_PASSTHROUGH_ATTRIBUTE_PREFIX)
+                }
                 bounded = getattr(span, "_attributes", None)
                 max_attributes = (
                     max(0, bounded.maxlen - 1)
@@ -754,14 +760,14 @@ class TransactionSpanProcessor(SpanProcessor):
 
     def _is_stateless_raw_passthrough(self, span: object) -> bool:
         attrs = getattr(span, "attributes", None) or {}
-        return attrs.get(_RAW_PASSTHROUGH_ATTRIBUTE) == self._raw_passthrough_token
+        return attrs.get(self._raw_passthrough_attribute) is True
 
     def _mark_stateless_raw_passthrough(self, span: Span) -> None:
         """Mark a rejected span locally without retaining its trace ID."""
         bounded = getattr(span, "_attributes", None)
         if isinstance(bounded, BoundedAttributes) and bounded.maxlen is not None:
             bounded.maxlen += 1
-        span.set_attribute(_RAW_PASSTHROUGH_ATTRIBUTE, self._raw_passthrough_token)
+        span.set_attribute(self._raw_passthrough_attribute, True)
 
     def _add_child_interval_locked(
         self, trace_id: int, parent_id: int, start: int, end: int
