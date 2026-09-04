@@ -548,7 +548,7 @@ class TransactionSpanProcessor(SpanProcessor):
             if self._stopped and not tracked:
                 return
             if self._is_stateless_raw_passthrough(span):
-                raw_batches = [[span]]
+                raw_batches = [self._strip_processor_root_flags_locked([span])]
                 self._schedule_raw_batch_locked(raw_batches[0])
             elif trace_id in self._passthrough_traces:
                 remaining = self._passthrough_live_counts.get(trace_id, 0) - 1
@@ -706,13 +706,24 @@ class TransactionSpanProcessor(SpanProcessor):
             member = self._membership.get((span.context.trace_id, span.context.span_id))
             if self._is_stateless_raw_passthrough(span):
                 attrs = dict(span.attributes or {})
-                if has_processor_root_marker(span):
+                root_marker = has_processor_root_marker(span)
+                if root_marker:
                     attrs.pop(CoralogixAttributes.TRANSACTION_ROOT, None)
-                bounded = getattr(span, "_attributes", None)
+                helper_added = explicit_transaction_name(span) is not None
+                if helper_added:
+                    previous_attrs = explicit_transaction_previous_attributes(span)
+                    for key in (
+                        CoralogixAttributes.TRANSACTION_IDENTIFIER,
+                        CoralogixAttributes.TRANSACTION_ROOT,
+                        CoralogixAttributes.TRANSACTION_EXPLICIT,
+                    ):
+                        attrs.pop(key, None)
+                    attrs.update(previous_attrs)  # type: ignore[arg-type]
                 max_attributes = (
-                    max(0, bounded.maxlen - 1)
-                    if isinstance(bounded, BoundedAttributes)
-                    and bounded.maxlen is not None
+                    explicit_transaction_attribute_limit(span)
+                    if helper_added
+                    else processor_root_attribute_limit(span)
+                    if root_marker
                     else None
                 )
                 raw.append(
