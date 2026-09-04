@@ -169,6 +169,7 @@ class TransactionSpanProcessor(SpanProcessor):
         self._live_child_starts: Dict[Tuple[int, int], Dict[int, int]] = {}
         self._pending_completions: Dict[int, int] = {}
         self._pending_nested_completions: Dict[int, int] = {}
+        self._pending_nested_roots: Dict[int, Set[int]] = {}
         self._holdback = HoldbackScheduler()
         # Holdback deadlines must not wait on exporters; finalize/export runs here.
         # Bound the queue so a stalled exporter drops overflow instead of OOM.
@@ -228,6 +229,7 @@ class TransactionSpanProcessor(SpanProcessor):
         self._root_memberships_by_trace.clear()
         self._pending_completions.clear()
         self._pending_nested_completions.clear()
+        self._pending_nested_roots.clear()
         self._inflight_batches_by_trace.clear()
         self._child_intervals.clear()
         self._live_child_starts.clear()
@@ -440,7 +442,7 @@ class TransactionSpanProcessor(SpanProcessor):
             if (
                 parent_member is not None
                 and parent_member.root_span_id
-                not in self._live_parents.get(trace_id, {})
+                in self._pending_nested_roots.get(trace_id, set())
             ):
                 self._cancel_pending_nested_completion_locked(trace_id)
             live = self._live_parents.setdefault(trace_id, {})
@@ -1223,6 +1225,7 @@ class TransactionSpanProcessor(SpanProcessor):
             self._holdback.cancel((_HOLD_IDLE, trace_id))
 
     def _cancel_pending_nested_completion_locked(self, trace_id: int) -> None:
+        self._pending_nested_roots.pop(trace_id, None)
         if self._pending_nested_completions.pop(trace_id, None) is not None:
             self._holdback.cancel((_HOLD_NESTED, trace_id))
 
@@ -1338,6 +1341,20 @@ class TransactionSpanProcessor(SpanProcessor):
                 trace_id, flush_leftover=False
             )
 
+        nested_roots = {
+            span.context.span_id
+            for batch in extract_completed_local_transactions(
+                buffer=buffer,
+                live=live,
+                flush_leftover=False,
+                root_span_ids=self._root_memberships_by_trace.get(trace_id),
+            )[0]
+            for span in batch
+            if span.context is not None
+            and self._membership.get((trace_id, span.context.span_id)) is not None
+            and self._membership[(trace_id, span.context.span_id)].is_root
+        }
+
         token = 0
 
         def _fire() -> None:
@@ -1346,6 +1363,7 @@ class TransactionSpanProcessor(SpanProcessor):
                 if self._pending_nested_completions.get(trace_id) != token:
                     return
                 self._pending_nested_completions.pop(trace_id, None)
+                self._pending_nested_roots.pop(trace_id, None)
                 if self._exporter_shutdown:
                     return
                 if self._live_parents.get(trace_id):
@@ -1370,6 +1388,7 @@ class TransactionSpanProcessor(SpanProcessor):
             _fire,
         )
         self._pending_nested_completions[trace_id] = token
+        self._pending_nested_roots[trace_id] = nested_roots
         return []
 
     def _extract_completed_local_transactions_locked(
