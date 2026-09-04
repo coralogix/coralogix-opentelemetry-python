@@ -2012,9 +2012,46 @@ def test_trace_limit_rejection_does_not_retain_trace_ids() -> None:
     rejected[0].end()
     assert provider.force_flush() is True
     exported = next(span for span in exporter.spans if span.name == "rejected-0")
-    assert "cgx.transaction._passthrough" not in (exported.attributes or {})
+    assert not any(
+        str(key).startswith("cgx.transaction._passthrough.")
+        for key in (exported.attributes or {})
+    )
     assert rejected[0].get_span_context().trace_state.get("cgx-passthrough") is None
     retained.end()
+    provider.shutdown()  # type: ignore[no-untyped-call]
+
+
+def test_trace_limit_markers_are_isolated_between_processors() -> None:
+    first_exporter = ListSpanExporter()
+    second_exporter = ListSpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(
+        TransactionSpanProcessor(
+            first_exporter, completion_holdback_millis=0, max_traces=1
+        )
+    )
+    provider.add_span_processor(
+        TransactionSpanProcessor(
+            second_exporter, completion_holdback_millis=0, max_traces=1
+        )
+    )
+    tracer = provider.get_tracer("test")
+
+    retained = tracer.start_span("retained", kind=SpanKind.SERVER)
+    rejected = tracer.start_span("rejected", kind=SpanKind.SERVER)
+    rejected.end()
+    retained.end()
+    assert provider.force_flush() is True
+
+    for exporter in (first_exporter, second_exporter):
+        exported = next(span for span in exporter.spans if span.name == "rejected")
+        assert CoralogixAttributes.TRANSACTION_IDENTIFIER not in (
+            exported.attributes or {}
+        )
+        assert not any(
+            str(key).startswith("cgx.transaction._passthrough.")
+            for key in (exported.attributes or {})
+        )
     provider.shutdown()  # type: ignore[no-untyped-call]
 
 
