@@ -437,7 +437,12 @@ class TransactionSpanProcessor(SpanProcessor):
                 )
 
             self._cancel_pending_completion_locked(trace_id)
-            self._cancel_pending_nested_completion_locked(trace_id)
+            if (
+                parent_member is not None
+                and parent_member.root_span_id
+                not in self._live_parents.get(trace_id, {})
+            ):
+                self._cancel_pending_nested_completion_locked(trace_id)
             live = self._live_parents.setdefault(trace_id, {})
             live[span_id] = parent_id
             tracked_span_count = self._tracked_span_counts.get(trace_id, 0) + 1
