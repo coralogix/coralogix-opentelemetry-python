@@ -297,6 +297,7 @@ class TransactionSpanProcessor(SpanProcessor):
                 trace_id in self._live_parents
                 or trace_id in self._buffers
                 or trace_id in self._inflight_batches_by_trace
+                or trace_id in self._passthrough_traces
             )
             if (
                 self._max_traces > 0
@@ -306,8 +307,8 @@ class TransactionSpanProcessor(SpanProcessor):
                         set(self._live_parents)
                         | set(self._buffers)
                         | set(self._inflight_batches_by_trace)
+                        | self._passthrough_traces
                     )
-                    - self._passthrough_traces
                 )
                 >= self._max_traces
             ):
@@ -439,11 +440,12 @@ class TransactionSpanProcessor(SpanProcessor):
                 )
 
             self._cancel_pending_completion_locked(trace_id)
-            if (
+            resets_nested_holdback = (
                 parent_member is not None
                 and parent_member.root_span_id
                 in self._pending_nested_roots.get(trace_id, set())
-            ):
+            )
+            if resets_nested_holdback:
                 self._cancel_pending_nested_completion_locked(trace_id)
             live = self._live_parents.setdefault(trace_id, {})
             live[span_id] = parent_id
@@ -453,6 +455,8 @@ class TransactionSpanProcessor(SpanProcessor):
                 self._live_child_starts.setdefault((trace_id, parent_id), {})[
                     span_id
                 ] = int(span.start_time or 0)
+            if resets_nested_holdback:
+                self._schedule_nested_completion_locked(trace_id)
             if (
                 self._max_transaction_spans > 0
                 and tracked_span_count > self._max_transaction_spans
