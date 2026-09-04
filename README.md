@@ -35,7 +35,7 @@ trace.set_tracer_provider(provider)
 | Option | Type | Default | Env var | Meaning |
 |---|---|---|---|---|
 | `completion_holdback_millis` | int | `100` | `OTEL_CX_TRANSACTION_COMPLETION_HOLDBACK_MILLIS` | After the last live span on a TraceID ends, wait so fire-and-forget children can join. `0` = finalize immediately. Negative → default |
-| `max_transaction_spans` | int | `256` | `CORALOGIX_MAX_SPANS_PER_TRACE` | Maximum spans to buffer and enrich per trace. On the next span, export the whole trace raw. `0` = raw passthrough |
+| `max_transaction_spans` | int | `256` | `CORALOGIX_MAX_SPANS_PER_TRACE` | Maximum spans to buffer and enrich per trace. On the next span, export the whole trace raw. `0` = unlimited |
 | `max_traces` | int | `0` | `CORALOGIX_MAX_TRANSACTION_TRACES` | Maximum transactions retained in memory while their spans are still live or awaiting completion. Once full, newly seen transactions pass through raw until buffered transactions finish. `0` = unlimited |
 | `meter_provider` | MeterProvider | global | — | MeterProvider for the self-duration histogram |
 

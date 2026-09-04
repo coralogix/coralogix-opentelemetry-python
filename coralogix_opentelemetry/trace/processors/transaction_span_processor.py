@@ -435,7 +435,10 @@ class TransactionSpanProcessor(SpanProcessor):
                 self._live_child_starts.setdefault((trace_id, parent_id), {})[
                     span_id
                 ] = int(span.start_time or 0)
-            if tracked_span_count > self._max_transaction_spans:
+            if (
+                self._max_transaction_spans > 0
+                and tracked_span_count > self._max_transaction_spans
+            ):
                 self._cancel_pending_completion_locked(trace_id)
                 self._cancel_pending_nested_completion_locked(trace_id)
                 self._passthrough_traces.add(trace_id)
@@ -574,7 +577,10 @@ class TransactionSpanProcessor(SpanProcessor):
                     if not live:
                         self._live_parents.pop(trace_id, None)
 
-                if len(self._buffers[trace_id]) > self._max_transaction_spans:
+                if (
+                    self._max_transaction_spans > 0
+                    and len(self._buffers[trace_id]) > self._max_transaction_spans
+                ):
                     self._cancel_pending_completion_locked(trace_id)
                     self._cancel_pending_nested_completion_locked(trace_id)
                     self._passthrough_traces.add(trace_id)
@@ -1342,7 +1348,7 @@ class TransactionSpanProcessor(SpanProcessor):
             child_intervals=interval_snapshot,
             membership=membership_snapshot,
             self_duration_hist=self._self_duration_hist,
-            max_enriched_spans=self._max_transaction_spans,
+            max_enriched_spans=self._max_transaction_spans or None,
         )
         annotated = [
             _copy_with_original_attribute_limit(

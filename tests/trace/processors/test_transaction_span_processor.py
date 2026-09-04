@@ -478,7 +478,7 @@ def test_257th_ended_span_flushes_trace_raw_and_enables_passthrough() -> None:
     meter_provider.shutdown()
 
 
-def test_raw_passthrough_preserves_sampler_root_flag() -> None:
+def test_zero_transaction_span_limit_is_unlimited() -> None:
     from coralogix_opentelemetry.trace.samplers import CoralogixTransactionSampler
 
     exporter = ListSpanExporter()
@@ -488,13 +488,21 @@ def test_raw_passthrough_preserves_sampler_root_flag() -> None:
             exporter, completion_holdback_millis=0, max_transaction_spans=0
         )
     )
-    provider.get_tracer("test").start_span("root", kind=SpanKind.SERVER).end()
+    tracer = provider.get_tracer("test")
+    root = tracer.start_span("root", kind=SpanKind.SERVER)
+    context = trace.set_span_in_context(root)
+    for index in range(256):
+        tracer.start_span("child-{}".format(index), context=context).end()
+    root.end()
 
     assert provider.force_flush() is True
-    attrs = exporter.spans[0].attributes or {}
-    assert attrs[CoralogixAttributes.TRANSACTION_ROOT] is True
-    assert attrs[CoralogixAttributes.TRANSACTION_IDENTIFIER] == "root"
-    assert SELF_DURATION_ATTRIBUTE not in attrs
+    assert len(exporter.spans) == 257
+    assert all(
+        (span.attributes or {}).get(CoralogixAttributes.TRANSACTION_IDENTIFIER)
+        == "root"
+        and SELF_DURATION_ATTRIBUTE in (span.attributes or {})
+        for span in exporter.spans
+    )
     provider.shutdown()  # type: ignore[no-untyped-call]
 
 
@@ -503,15 +511,23 @@ def test_raw_passthrough_restores_attribute_evicted_by_processor_root_flag() -> 
     provider = TracerProvider(span_limits=SpanLimits(max_attributes=1))
     provider.add_span_processor(
         TransactionSpanProcessor(
-            exporter, completion_holdback_millis=0, max_transaction_spans=0
+            exporter, completion_holdback_millis=0, max_transaction_spans=1
         )
     )
-    provider.get_tracer("test").start_span(
+    root = provider.get_tracer("test").start_span(
         "root", kind=SpanKind.SERVER, attributes={"application.attribute": "value"}
+    )
+    provider.get_tracer("test").start_span(
+        "child", context=trace.set_span_in_context(root)
     ).end()
+    root.end()
 
     assert provider.force_flush() is True
-    attrs = exporter.spans[0].attributes or {}
+    attrs = next(
+        exported.attributes or {}
+        for exported in exporter.spans
+        if exported.name == "root"
+    )
     assert attrs["application.attribute"] == "value"
     assert CoralogixAttributes.TRANSACTION_ROOT not in attrs
     provider.shutdown()  # type: ignore[no-untyped-call]
@@ -522,17 +538,24 @@ def test_raw_passthrough_keeps_attributes_added_after_start() -> None:
     provider = TracerProvider(span_limits=SpanLimits(max_attributes=3))
     provider.add_span_processor(
         TransactionSpanProcessor(
-            exporter, completion_holdback_millis=0, max_transaction_spans=0
+            exporter, completion_holdback_millis=0, max_transaction_spans=1
         )
     )
     span = provider.get_tracer("test").start_span(
         "root", kind=SpanKind.SERVER, attributes={"application.attribute": "value"}
     )
     span.set_attribute("http.route", "/orders")
+    provider.get_tracer("test").start_span(
+        "child", context=trace.set_span_in_context(span)
+    ).end()
     span.end()
 
     assert provider.force_flush() is True
-    attrs = exporter.spans[0].attributes or {}
+    attrs = next(
+        exported.attributes or {}
+        for exported in exporter.spans
+        if exported.name == "root"
+    )
     assert attrs["application.attribute"] == "value"
     assert attrs["http.route"] == "/orders"
     assert CoralogixAttributes.TRANSACTION_ROOT not in attrs
@@ -544,7 +567,7 @@ def test_raw_passthrough_strips_start_new_transaction_metadata() -> None:
     provider = TracerProvider()
     provider.add_span_processor(
         TransactionSpanProcessor(
-            exporter, completion_holdback_millis=0, max_transaction_spans=0
+            exporter, completion_holdback_millis=0, max_transaction_spans=1
         )
     )
     tracer = provider.get_tracer("test")
@@ -575,7 +598,7 @@ def test_raw_passthrough_restores_original_attributes_after_repeated_helper_call
     provider = TracerProvider(span_limits=SpanLimits(max_attributes=1))
     provider.add_span_processor(
         TransactionSpanProcessor(
-            exporter, completion_holdback_millis=0, max_transaction_spans=0
+            exporter, completion_holdback_millis=0, max_transaction_spans=1
         )
     )
     tracer = provider.get_tracer("test")
@@ -604,11 +627,14 @@ def test_raw_passthrough_does_not_restore_processor_root_from_helper() -> None:
     provider = TracerProvider()
     provider.add_span_processor(
         TransactionSpanProcessor(
-            exporter, completion_holdback_millis=0, max_transaction_spans=0
+            exporter, completion_holdback_millis=0, max_transaction_spans=1
         )
     )
     root = provider.get_tracer("test").start_span("root", kind=SpanKind.SERVER)
     start_new_transaction(root, "custom")
+    provider.get_tracer("test").start_span(
+        "child", context=trace.set_span_in_context(root)
+    ).end()
     root.end()
 
     assert provider.force_flush() is True
@@ -734,7 +760,7 @@ def test_raw_export_does_not_block_span_end() -> None:
 
     exporter = BlockingExporter()
     processor = TransactionSpanProcessor(
-        exporter, completion_holdback_millis=0, max_transaction_spans=0
+        exporter, completion_holdback_millis=0, max_transaction_spans=1
     )
     provider = TracerProvider()
     provider.add_span_processor(processor)
@@ -1906,7 +1932,7 @@ def test_raw_coalescing_is_bounded_during_exporter_stall(
 
     exporter = BlockingExporter()
     processor = TransactionSpanProcessor(
-        exporter, completion_holdback_millis=0, max_transaction_spans=0
+        exporter, completion_holdback_millis=0, max_transaction_spans=1
     )
     provider = TracerProvider()
     provider.add_span_processor(processor)
