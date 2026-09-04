@@ -2067,6 +2067,7 @@ def test_trace_limit_marker_survives_application_attribute_churn() -> None:
     exported = next(span for span in exporter.spans if span.name == "rejected")
     assert CoralogixAttributes.TRANSACTION_IDENTIFIER not in (exported.attributes or {})
     assert SELF_DURATION_ATTRIBUTE not in (exported.attributes or {})
+    assert exported.attributes["second"] == "value"
     provider.shutdown()  # type: ignore[no-untyped-call]
 
 
@@ -2091,6 +2092,34 @@ def test_raw_trace_limit_export_strips_sibling_processor_root_marker() -> None:
     assert provider.force_flush() is True
     raw = next(span for span in raw_exporter.spans if span.name == "rejected")
     assert CoralogixAttributes.TRANSACTION_ROOT not in (raw.attributes or {})
+    provider.shutdown()  # type: ignore[no-untyped-call]
+
+
+def test_raw_trace_limit_export_restores_helper_attributes() -> None:
+    exporter = ListSpanExporter()
+    provider = TracerProvider(span_limits=SpanLimits(max_attributes=1))
+    provider.add_span_processor(
+        TransactionSpanProcessor(exporter, completion_holdback_millis=0, max_traces=1)
+    )
+    tracer = provider.get_tracer("test")
+
+    retained = tracer.start_span("retained", kind=SpanKind.SERVER)
+    rejected = tracer.start_span("rejected", kind=SpanKind.SERVER)
+    rejected.set_attribute("application", "value")
+    start_new_transaction(rejected, "named")
+    rejected.end()
+    retained.end()
+    assert provider.force_flush() is True
+    exported = next(span for span in exporter.spans if span.name == "rejected")
+    assert exported.attributes["application"] == "value"
+    assert all(
+        key not in (exported.attributes or {})
+        for key in (
+            CoralogixAttributes.TRANSACTION_IDENTIFIER,
+            CoralogixAttributes.TRANSACTION_ROOT,
+            CoralogixAttributes.TRANSACTION_EXPLICIT,
+        )
+    )
     provider.shutdown()  # type: ignore[no-untyped-call]
 
 
