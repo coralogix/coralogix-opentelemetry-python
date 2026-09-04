@@ -32,6 +32,7 @@ import os
 import queue
 import threading
 import time
+import uuid
 import weakref
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
@@ -82,7 +83,7 @@ from opentelemetry.context import (
 from opentelemetry.metrics import Histogram, MeterProvider
 from opentelemetry.sdk.trace import BoundedAttributes, ReadableSpan, Span, SpanProcessor
 from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
-from opentelemetry.trace import SpanContext, get_current_span
+from opentelemetry.trace import get_current_span
 
 _LOG = logging.getLogger(__name__)
 
@@ -94,7 +95,7 @@ _HOLD_PASSTHROUGH = "passthrough"
 DEFAULT_MAX_FINALIZE_QUEUE = 256
 # Cap batches retained across timed-out force_flush calls (same order as the queue).
 DEFAULT_MAX_DEFERRED_FINALIZE = DEFAULT_MAX_FINALIZE_QUEUE
-_RAW_PASSTHROUGH_TRACESTATE_KEY = "cgx-passthrough"
+_RAW_PASSTHROUGH_ATTRIBUTE = "cgx.transaction._passthrough"
 
 
 def _restart_processor_after_fork(
@@ -119,34 +120,6 @@ def _copy_with_original_attribute_limit(
     return copy_with_attributes(span, attrs, max_attributes=max_attributes)
 
 
-def _is_stateless_raw_passthrough(span: object) -> bool:
-    context = getattr(span, "context", None)
-    if context is None:
-        context = getattr(span, "get_span_context", lambda: None)()
-    return bool(
-        context is not None
-        and getattr(context, "trace_state", None) is not None
-        and context.trace_state.get(_RAW_PASSTHROUGH_TRACESTATE_KEY) == "1"
-    )
-
-
-def _mark_stateless_raw_passthrough(span: object) -> None:
-    """Keep max-trace rejection on the span, never in a trace-ID side table."""
-    context = getattr(span, "context", None)
-    if context is None:
-        return
-    trace_state = context.trace_state.add(_RAW_PASSTHROUGH_TRACESTATE_KEY, "1")
-    if trace_state == context.trace_state:
-        return
-    span._context = SpanContext(  # type: ignore[attr-defined]
-        context.trace_id,
-        context.span_id,
-        context.is_remote,
-        context.trace_flags,
-        trace_state,
-    )
-
-
 class TransactionSpanProcessor(SpanProcessor):
     """Full transaction tagging + conditional self-duration + full export."""
 
@@ -167,6 +140,7 @@ class TransactionSpanProcessor(SpanProcessor):
             max_transaction_spans
         )
         self._max_traces = resolve_max_traces(max_traces)
+        self._raw_passthrough_token = uuid.uuid4().hex
         self._lock = threading.Lock()
         self._export_lock = threading.Lock()
         self._buffers: Dict[int, List[ReadableSpan]] = {}
@@ -277,8 +251,8 @@ class TransactionSpanProcessor(SpanProcessor):
             return
 
         parent_span = get_current_span(parent_context)
-        if _is_stateless_raw_passthrough(parent_span):
-            _mark_stateless_raw_passthrough(span)
+        if self._is_stateless_raw_passthrough(parent_span):
+            self._mark_stateless_raw_passthrough(span)
             return
         parent_id = 0
         if span.parent is not None and span.parent.is_valid:
@@ -334,7 +308,7 @@ class TransactionSpanProcessor(SpanProcessor):
                 )
                 >= self._max_traces
             ):
-                _mark_stateless_raw_passthrough(span)
+                self._mark_stateless_raw_passthrough(span)
                 return
             parent_has_local = (
                 parent_member is not None
@@ -572,7 +546,7 @@ class TransactionSpanProcessor(SpanProcessor):
             )
             if self._stopped and not tracked:
                 return
-            if _is_stateless_raw_passthrough(span):
+            if self._is_stateless_raw_passthrough(span):
                 raw_batches = [[span]]
                 self._schedule_raw_batch_locked(raw_batches[0])
             elif trace_id in self._passthrough_traces:
@@ -729,6 +703,20 @@ class TransactionSpanProcessor(SpanProcessor):
                 raw.append(span)
                 continue
             member = self._membership.get((span.context.trace_id, span.context.span_id))
+            if self._is_stateless_raw_passthrough(span):
+                attrs = dict(span.attributes or {})
+                attrs.pop(_RAW_PASSTHROUGH_ATTRIBUTE, None)
+                bounded = getattr(span, "_attributes", None)
+                max_attributes = (
+                    max(0, bounded.maxlen - 1)
+                    if isinstance(bounded, BoundedAttributes)
+                    and bounded.maxlen is not None
+                    else None
+                )
+                raw.append(
+                    copy_with_attributes(span, attrs, max_attributes=max_attributes)
+                )
+                continue
             helper_added = bool(
                 (member is not None and member.helper_added)
                 or explicit_transaction_name(span) is not None
@@ -763,6 +751,17 @@ class TransactionSpanProcessor(SpanProcessor):
                 )
             )
         return raw
+
+    def _is_stateless_raw_passthrough(self, span: object) -> bool:
+        attrs = getattr(span, "attributes", None) or {}
+        return attrs.get(_RAW_PASSTHROUGH_ATTRIBUTE) == self._raw_passthrough_token
+
+    def _mark_stateless_raw_passthrough(self, span: Span) -> None:
+        """Mark a rejected span locally without retaining its trace ID."""
+        bounded = getattr(span, "_attributes", None)
+        if isinstance(bounded, BoundedAttributes) and bounded.maxlen is not None:
+            bounded.maxlen += 1
+        span.set_attribute(_RAW_PASSTHROUGH_ATTRIBUTE, self._raw_passthrough_token)
 
     def _add_child_interval_locked(
         self, trace_id: int, parent_id: int, start: int, end: int

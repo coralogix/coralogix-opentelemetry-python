@@ -2009,6 +2009,11 @@ def test_trace_limit_rejection_does_not_retain_trace_ids() -> None:
     # Keeping these spans active proves capacity rejection retains no per-trace
     # processor state, even when the rejected trace count is large.
     assert len(rejected) == 1000
+    rejected[0].end()
+    assert provider.force_flush() is True
+    exported = next(span for span in exporter.spans if span.name == "rejected-0")
+    assert "cgx.transaction._passthrough" not in (exported.attributes or {})
+    assert rejected[0].get_span_context().trace_state.get("cgx-passthrough") is None
     retained.end()
     provider.shutdown()  # type: ignore[no-untyped-call]
 
