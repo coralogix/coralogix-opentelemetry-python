@@ -70,3 +70,30 @@ wins over the root’s final span name.
 Self-duration is the span’s wall duration minus time covered by direct children.
 Child intervals are clamped to the parent and merged so overlapping children are
 not double-subtracted.
+
+## Benchmark
+
+To help users estimate resource usage, we ran this benchmark. The first table processes 10,000 traces at each depth from 8 to 2,048 spans to show the impact of increasingly deep transactions. The second table processes traces with a depth of 1,000 spans at increasing trace counts to show the effect of transaction volume.
+
+### 10000 traces by depth
+
+| Depth | Traces | RSS base MiB | RSS peak MiB | RSS delta MiB | Spans/s |
+|---:|---:|---:|---:|---:|---:|
+|  8  |  10000  | 24.80 | 34.60 | 9.80 | 27013.20 |
+|  16  |  10000  | 24.80 | 36.70 | 11.90 | 28127.70 |
+|  32  |  10000  | 24.50 | 36.00 | 11.50 | 25983.00 |
+|  64  |  10000  | 25.00 | 31.60 | 6.70 | 21062.30 |
+|  128  |  10000  | 24.70 | 30.20 | 5.50 | 14107.20 |
+|  256  |  10000  | 24.60 | 33.50 | 8.90 | 8738.00 |
+|  512  |  10000  | 24.60 | 35.10 | 10.50 | 72827.70 |
+|  1024  |  10000  | 24.60 | 34.70 | 10.10 | 80321.10 |
+|  2048  |  10000  | 24.80 | 40.10 | 15.30 | 86220.70 |
+
+### Depth 1000 by trace count
+
+| Depth | Traces | RSS base MiB | RSS peak MiB | RSS delta MiB | Spans/s |
+|---:|---:|---:|---:|---:|---:|
+|  1000  |  100  | 24.50 | 32.50 | 8.00 | 81080.20 |
+|  1000  |  1000  | 24.40 | 33.80 | 9.40 | 81081.70 |
+|  1000  |  10000  | 24.70 | 36.30 | 11.60 | 81337.00 |
+|  1000  |  100000  | 24.40 | 38.00 | 13.60 | 82765.80 |
