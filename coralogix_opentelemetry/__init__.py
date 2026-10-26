@@ -1,1 +1,1 @@
-from . import trace
+from . import logs, trace

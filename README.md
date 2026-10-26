@@ -70,3 +70,50 @@ wins over the root’s final span name.
 Self-duration is the span’s wall duration minus time covered by direct children.
 Child intervals are clamped to the parent and merged so overlapping children are
 not double-subtracted.
+
+## Source context lines for error logs
+
+`ContextLinesProcessor` is an OpenTelemetry `LogRecordProcessor`. For every log record that carries a Python `exception.stacktrace`, it reads the source files of the in-app frames and sets `cx.exception.context_lines`: a JSON string with the lines around each frame (`pre_context`, `context_line`, `post_context`). It never raises and never modifies the stacktrace.
+
+It must be registered **before** the processor that exports, in a `LoggerProvider` that receives your error logs. `SimpleLogRecordProcessor` exports inside its own call, and `BatchLogRecordProcessor` may export from a worker thread before a later processor runs.
+
+```python
+import traceback
+
+from opentelemetry.sdk._logs import LoggerProvider
+from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
+from opentelemetry.exporter.otlp.proto.grpc._log_exporter import OTLPLogExporter
+
+from coralogix_opentelemetry.logs import ContextLinesProcessor
+
+provider = LoggerProvider()
+provider.add_log_record_processor(ContextLinesProcessor())
+provider.add_log_record_processor(BatchLogRecordProcessor(OTLPLogExporter(endpoint="<your-endpoint>")))
+
+try:
+    handle_request()
+except Exception as err:
+    provider.get_logger("errors").emit(
+        body=str(err),
+        attributes={"exception.stacktrace": traceback.format_exc()},
+    )
+```
+
+The `emit(body=..., attributes=...)` form needs opentelemetry-sdk 1.39 or newer; older SDKs take a `LogRecord` instead. The processor works with both.
+
+Each element of the attribute is one frame:
+
+```json
+{
+  "index": 0,
+  "filename": "/app/handler.py",
+  "function": "handle",
+  "lineno": 42,
+  "in_app": true,
+  "pre_context": ["..."],
+  "context_line": "    raise ValueError(reason)",
+  "post_context": ["..."]
+}
+```
+
+`index` is the frame's 0-based position among all `File "...", line N` lines of the stacktrace, including third-party frames and chained exceptions. Only absolute paths outside `site-packages` / `dist-packages` are kept, files over 1 MiB are skipped, and lines over 150 characters end in `{snip}`. At most 50 frames and 32 KiB are emitted; when the limit is hit the outermost frames are dropped first.
